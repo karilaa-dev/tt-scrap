@@ -22,9 +22,6 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     tt_scrap_api_key: SecretStr = Field(min_length=16)
-    cache_encryption_key: SecretStr
-    redis_url: SecretStr = SecretStr("redis://:redis@127.0.0.1:6380/0")
-
     rapidapi_key: SecretStr = SecretStr("")
     ytdlp_cookies: str = ""
 
@@ -42,6 +39,7 @@ class Settings(BaseSettings):
     instagram_retry_delay_seconds: float = Field(default=0.5, ge=0, le=30)
 
     cache_ttl_seconds: int = Field(default=600, ge=30, le=86_400)
+    cache_max_entries: int = Field(default=10_000, ge=100, le=1_000_000)
     extraction_concurrency: int = Field(default=32, ge=1, le=512)
     download_concurrency: int = Field(default=64, ge=1, le=1024)
     slideshow_concurrency: int = Field(default=8, ge=1, le=64)
@@ -52,17 +50,6 @@ class Settings(BaseSettings):
     max_asset_bytes: int = Field(default=0, ge=0)
     max_video_duration: int = Field(default=0, ge=0)
     upstream_download_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
-
-    @field_validator("cache_encryption_key")
-    @classmethod
-    def validate_fernet_key(cls, value: SecretStr) -> SecretStr:
-        from cryptography.fernet import Fernet
-
-        try:
-            Fernet(value.get_secret_value().encode())
-        except (TypeError, ValueError) as exc:
-            raise ValueError("CACHE_ENCRYPTION_KEY must be a valid Fernet key") from exc
-        return value
 
     @field_validator("log_level")
     @classmethod

@@ -6,7 +6,11 @@ from httpx import Response
 
 from tt_scrap.errors import NetworkError
 from tt_scrap.media import AssetDownloader
-from tt_scrap.media.downloader import detect_content_type, filename_for_type
+from tt_scrap.media.downloader import (
+    _close_curl_response,
+    detect_content_type,
+    filename_for_type,
+)
 from tt_scrap.models import AssetFetchContext
 from tt_scrap.proxy import ProxyManager
 
@@ -15,6 +19,29 @@ def test_content_type_detection_and_filename() -> None:
     assert detect_content_type(b"\xff\xd8\xffpayload", None) == "image/jpeg"
     assert detect_content_type(b"\x00\x00\x00\x18ftypisom", "video/mp4") == "video/mp4"
     assert filename_for_type("asset.bin", "image/jpeg") == "asset.jpg"
+
+
+@pytest.mark.asyncio
+async def test_curl_stream_cleanup_aborts_and_awaits_once() -> None:
+    class QuitSignal:
+        called = False
+
+        def set(self) -> None:
+            self.called = True
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.quit_now = QuitSignal()
+            self.closed = 0
+
+        async def aclose(self) -> None:
+            self.closed += 1
+
+    response = FakeResponse()
+    await _close_curl_response(response)  # type: ignore[arg-type]
+
+    assert response.quit_now.called
+    assert response.closed == 1
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import io
 
-import fakeredis.aioredis
 import httpx
 import pytest
 
@@ -30,8 +29,7 @@ class FakeDownloader:
 
 @pytest.mark.asyncio
 async def test_health_auth_validation_and_asset_delivery(settings) -> None:
-    redis = fakeredis.aioredis.FakeRedis()
-    app = create_app(settings, redis_client=redis)
+    app = create_app(settings)
     async with app.router.lifespan_context(app):
         original = app.state.asset_downloader
         await original.close()
@@ -79,8 +77,7 @@ async def test_health_auth_validation_and_asset_delivery(settings) -> None:
 
 @pytest.mark.asyncio
 async def test_expired_asset_has_stable_error(settings) -> None:
-    redis = fakeredis.aioredis.FakeRedis()
-    app = create_app(settings, redis_client=redis)
+    app = create_app(settings)
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -93,7 +90,7 @@ async def test_expired_asset_has_stable_error(settings) -> None:
 
 
 def test_openapi_has_expected_contract(settings) -> None:
-    app = create_app(settings, redis_client=fakeredis.aioredis.FakeRedis())
+    app = create_app(settings)
     schema = app.openapi()
     assert "/v1/tiktok/extractions" in schema["paths"]
     assert "/v1/tiktok/music" in schema["paths"]

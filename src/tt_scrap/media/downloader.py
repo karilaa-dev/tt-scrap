@@ -16,6 +16,7 @@ from typing import BinaryIO, cast
 import httpx
 from curl_cffi import CurlError
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
+from curl_cffi.requests.models import Response as CurlResponse
 
 from ..config import Settings
 from ..errors import AssetTooLargeError, NetworkError, UpstreamTimeoutError
@@ -77,6 +78,13 @@ def filename_for_type(filename: str, content_type: str) -> str:
 
 class _RetryableDownload(Exception):
     pass
+
+
+async def _close_curl_response(response: CurlResponse) -> None:
+    """Stop an unfinished stream and let its task release the curl handle once."""
+    if response.quit_now is not None:
+        response.quit_now.set()
+    await response.aclose()
 
 
 class AssetDownloader:
@@ -266,7 +274,7 @@ class AssetDownloader:
                 length = curl_response.headers.get("content-length")
             finally:
                 if curl_response is not None:
-                    curl_response.close()
+                    await _close_curl_response(curl_response)
         else:
             async with self._http.stream("GET", upstream_url, headers=headers) as http_response:
                 if http_response.status_code not in {200, 206}:

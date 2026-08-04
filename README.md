@@ -1,249 +1,104 @@
 # tt-scrap
 
-`tt-scrap` is a standalone authenticated REST API for extracting TikTok and
-Instagram metadata and media without exposing upstream CDN URLs. It supports
-TikTok videos, photo slideshows, cover art, and music, plus Instagram videos,
-images, and mixed carousels.
+An authenticated FastAPI service that extracts TikTok and Instagram metadata
+and serves their media through opaque, short-lived asset URLs.
 
-The extraction implementation is derived from `karilaa-dev/tt-bot` main commit
-`9263c3dbf30240478bff7a1a861655850105d232`. The incomplete
-`extract-tiktok-media-scraper` prototype was used as reference only.
+Supported content:
 
-## Architecture
+- TikTok videos, slideshows, covers, and music
+- Instagram reels, images, and mixed carousels
+- TikTok short links, cookies, sticky proxies, rotation, and staged retries
 
-1. A platform extraction endpoint validates the source URL and extracts
-   normalized metadata.
-2. TikTok uses a sticky proxy across URL resolution and yt-dlp extraction,
-   rotating only when a retryable step fails. Chrome 120 TLS impersonation and
-   a matching user agent are preserved from `tt-bot`.
-3. Upstream URLs, cookies, referer data, and the proxy slot are encrypted into a
-   dedicated Redis instance with a short TTL. Public responses contain only
-   opaque `tt-scrap` asset URLs.
-4. An authenticated asset request downloads the upstream file into an ephemeral
-   spool. The service verifies length, computes SHA-256, retries safely, and only
-   then streams the completed file to the caller.
-5. Media bytes and request history are never persisted. Redis persistence is
-   disabled and no Redis volume is used.
+The extraction code is derived from `karilaa-dev/tt-bot` main commit
+`9263c3dbf30240478bff7a1a861655850105d232` under CC BY-NC 4.0.
 
-The default profile allows 32 concurrent metadata extractions and 64 asset
-downloads. Run one Uvicorn process per service instance and scale instances
-against the shared ephemeral Redis service when needed.
+## Start locally
 
-## Local setup with uv
-
-Requirements: Python 3.13 and `uv`. Install `redis-server` as well if the local
-launcher should manage its own ephemeral Redis process:
-
-```bash
-# Debian/Ubuntu
-sudo apt-get install redis-server
-
-# macOS
-brew install redis
-```
-
-Set up and start the complete service without Docker:
+Requirements: Python 3.13 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 cp .env.example .env
-# Fill in the API key, Fernet key, Redis password, and RapidAPI key.
-# cookies.txt and proxies.txt are already the default ignored host paths.
+# Set TT_SCRAP_API_KEY and RAPIDAPI_KEY in .env.
 uv sync --locked
-uv run tt-scrap-local
-```
-
-`tt-scrap-local` binds the API to `127.0.0.1:8000`. If `REDIS_URL` is already
-reachable, it uses that server. Otherwise, it starts a process-owned Redis on
-the loopback port from `REDIS_URL` (6380 by default), with RDB and AOF disabled,
-stores its password in a mode-0600 temporary configuration file, and removes
-all Redis state when the API exits. Stop both cleanly with `Ctrl+C`.
-
-To expose the API on another interface or use an independently managed Redis:
-
-```bash
-# Local Redis must already be running; the launcher will not create it.
-uv run tt-scrap-local --no-start-redis --host 0.0.0.0 --port 8000
-
-# Equivalent direct production entry point for a process supervisor/systemd.
 uv run tt-scrap
 ```
 
-For a production host, run a dedicated Redis/Valkey-compatible service with
-persistence disabled, set its authenticated URL in `REDIS_URL`, and supervise
-`uv run tt-scrap`. Place a TLS reverse proxy in front if the API is reachable
-outside a private network.
+The API listens on `http://127.0.0.1:8000`. Check it with:
 
-When developing beside an existing `tt-bot` checkout, provision a new ignored
-API/cache configuration and copy only its RapidAPI, cookie, and proxy inputs:
+```bash
+curl http://127.0.0.1:8000/health/ready
+```
+
+To prepare `.env`, cookies, and proxies from a nearby `tt-bot` checkout:
 
 ```bash
 uv run python scripts/bootstrap_local_env.py /path/to/tt-bot
 ```
 
-Generate local secrets with:
+## Configuration
 
-```bash
-openssl rand -hex 32
-uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-```
+The complete list and defaults are in `.env.example`. The important settings
+are:
 
-`YTDLP_COOKIES` points to a Netscape-format cookie file. Cookies are optional
-for ordinary public posts but needed for some age-restricted TikTok posts.
-`PROXY_FILE` contains one `http://`, `https://`, or `socks5://` proxy per line.
-Credentials are URL-encoded internally and always redacted from logs.
+| Variable | Purpose |
+| --- | --- |
+| `TT_SCRAP_API_KEY` | Bearer token required by every `/v1/` endpoint |
+| `RAPIDAPI_KEY` | Instagram RapidAPI credential |
+| `YTDLP_COOKIES` | Optional Netscape cookie file for restricted TikToks |
+| `PROXY_FILE` | Optional file containing one proxy URL per line |
+| `PROXY_DATA_ONLY` | Bypass proxies for media downloads when `true` |
+| `CACHE_TTL_SECONDS` | Lifetime of metadata and asset tokens; default 600 |
+| `CACHE_MAX_ENTRIES` | Maximum in-memory cache entries; default 10,000 |
+| `MAX_VIDEO_DURATION` | Maximum duration in seconds; zero disables it |
+| `MAX_ASSET_BYTES` | Maximum downloaded size; zero disables it |
 
-## Optional Docker Compose
+The cache is bounded and exists only in the API process. It stores normalized
+metadata and upstream fetch context, never media bytes or request history. All
+entries and asset tokens disappear on restart. Run exactly one Uvicorn worker;
+multiple workers would not share tokens.
 
-```bash
-cp .env.example .env
-# Place ignored cookies.txt and proxies.txt files beside docker-compose.yml.
-docker compose up --build -d
-curl http://127.0.0.1:8000/health/ready
-```
+Keep `.env`, `cookies.txt`, and `proxies.txt` private. Signed URLs, credentials,
+cookies, and proxy passwords are redacted from logs.
 
-Redis is private to the Compose network, password protected, and starts with
-both RDB snapshots and AOF disabled. The API image runs as an unprivileged user.
+## API
 
-## Authentication
-
-Every `/v1/` route requires:
+Every `/v1/` request needs:
 
 ```http
 Authorization: Bearer <TT_SCRAP_API_KEY>
 ```
 
-`/health/live`, `/health/ready`, `/docs`, and `/openapi.json` are public. The
-OpenAPI schema describes normalized responses only; raw TikTok and RapidAPI
-payloads are intentionally unavailable.
+Health endpoints and API documentation at `/docs` are public.
 
-## API
-
-### TikTok video or slideshow
+### Extract TikTok media
 
 ```bash
-curl -sS http://127.0.0.1:8000/v1/tiktok/extractions \
+curl http://127.0.0.1:8000/v1/tiktok/extractions \
   -H "Authorization: Bearer $TT_SCRAP_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://www.tiktok.com/@creator/video/123","refresh":false}'
 ```
 
-Example shape:
-
-```json
-{
-  "extraction_id": "uuid",
-  "platform": "tiktok",
-  "source_id": "123",
-  "source_url": "https://www.tiktok.com/@creator/video/123",
-  "resolved_url": "https://www.tiktok.com/@creator/video/123",
-  "content_type": "video",
-  "cover": {
-    "asset_id": "uuid",
-    "kind": "cover",
-    "position": 0,
-    "download_url": "/v1/assets/opaque-cover-token",
-    "filename": "123_cover.jpg",
-    "content_type": null,
-    "expires_at": "2026-08-04T12:10:00Z"
-  },
-  "width": 1080,
-  "height": 1920,
-  "duration_seconds": 15,
-  "likes": 100,
-  "views": 1000,
-  "media": [{
-    "asset_id": "uuid",
-    "kind": "video",
-    "position": 0,
-    "download_url": "/v1/assets/opaque-video-token",
-    "filename": "123.mp4",
-    "content_type": "video/mp4",
-    "expires_at": "2026-08-04T12:10:00Z"
-  }],
-  "music": {
-    "title": "Sound",
-    "author": "Creator",
-    "duration_seconds": 15,
-    "cover": null
-  },
-  "expires_at": "2026-08-04T12:10:00Z"
-}
-```
-
-Set `refresh` to `true` to bypass a successful metadata cache entry. The old
-asset tokens remain valid only until their original expiry.
-
-### TikTok music
+### Extract TikTok music
 
 ```bash
-curl -sS http://127.0.0.1:8000/v1/tiktok/music \
+curl http://127.0.0.1:8000/v1/tiktok/music \
   -H "Authorization: Bearer $TT_SCRAP_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"video_id":123}'
 ```
 
-This performs a fresh metadata extraction when it is not already cached and
-returns separate authenticated audio and cover assets.
-
-```json
-{
-  "extraction_id": "uuid",
-  "platform": "tiktok",
-  "source_id": "123",
-  "title": "Sound",
-  "author": "Creator",
-  "duration_seconds": 15,
-  "cover": null,
-  "audio": {
-    "asset_id": "uuid",
-    "kind": "audio",
-    "position": 0,
-    "download_url": "/v1/assets/opaque-audio-token",
-    "filename": "123.mp3",
-    "content_type": "audio/mpeg",
-    "expires_at": "2026-08-04T12:10:00Z"
-  },
-  "expires_at": "2026-08-04T12:10:00Z"
-}
-```
-
-### Instagram media
+### Extract Instagram media
 
 ```bash
-curl -sS http://127.0.0.1:8000/v1/instagram/extractions \
+curl http://127.0.0.1:8000/v1/instagram/extractions \
   -H "Authorization: Bearer $TT_SCRAP_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://www.instagram.com/reel/SHORTCODE/","refresh":false}'
 ```
 
-The response `content_type` is `video`, `image`, or `carousel`. `media` preserves
-the RapidAPI order and each entry identifies whether it is an image or video,
-its optional quality, download asset, and optional thumbnail asset.
-
-```json
-{
-  "extraction_id": "uuid",
-  "platform": "instagram",
-  "source_url": "https://www.instagram.com/p/SHORTCODE/",
-  "content_type": "image",
-  "media": [{
-    "position": 0,
-    "media_type": "image",
-    "quality": "1080p",
-    "asset": {
-      "asset_id": "uuid",
-      "kind": "image",
-      "position": 0,
-      "download_url": "/v1/assets/opaque-image-token",
-      "filename": "instagram_1.jpg",
-      "content_type": null,
-      "expires_at": "2026-08-04T12:10:00Z"
-    },
-    "thumbnail": null
-  }],
-  "expires_at": "2026-08-04T12:10:00Z"
-}
-```
+Extraction responses contain normalized metadata and asset paths such as
+`/v1/assets/opaque-token`; upstream CDN URLs are never returned.
 
 ### Download an asset
 
@@ -253,14 +108,11 @@ curl -fL http://127.0.0.1:8000/v1/assets/OPAQUE_TOKEN \
   --output media.bin
 ```
 
-Successful asset responses include `Content-Length`, `Content-Type`,
-`Content-Disposition`, `ETag`, and `X-Content-SHA256`. Tokens are reusable for
-the configured TTL, but every request performs a new upstream download; media
-bytes are not retained after the response completes.
+The service downloads into an ephemeral spool, validates the result, and then
+responds with content length, MIME type, filename, ETag, and SHA-256 headers.
+Media bytes are discarded after the response.
 
-## Errors
-
-All service errors use one shape:
+Errors use a stable envelope:
 
 ```json
 {
@@ -272,78 +124,41 @@ All service errors use one shape:
 }
 ```
 
-The response and every log entry include the same request ID. Stable error
-codes distinguish authentication, validation, deleted/private content, rate
-limits, region blocks, configured limits, cache failures, expired assets,
-network failures, and timeouts.
+## Retries and proxies
 
-## Retry and proxy behavior
+TikTok URL resolution, metadata extraction, and asset download each have their
+own three-attempt retry loop. A proxy stays sticky during a request flow and
+rotates after retryable failures. Permanent deleted, private, and region-blocked
+results fail immediately.
 
-TikTok has three independent configurable stages, each defaulting to three
-attempts: short-link resolution, yt-dlp metadata extraction, and asset download.
-The initial proxy remains sticky across stages and rotates on retry. Deleted,
-private, and region-blocked results fail immediately. `PROXY_DATA_ONLY=true`
-uses proxies for TikTok data extraction but downloads media directly.
+Instagram RapidAPI requests and CDN downloads are direct by default. Network
+errors, rate limits, and server failures are retried; definitive missing/private
+responses are not.
 
-Instagram keeps the current `tt-bot` behavior: RapidAPI and CDN calls are direct.
-Not-found responses are permanent; network failures, 429s, and 5xx responses are
-retried. All timeout, attempt, and delay values are configurable in `.env`.
-
-## Development and tests
+## Tests
 
 ```bash
 uv run ruff format --check src tests scripts
 uv run ruff check src tests scripts
 uv run mypy src/tt_scrap
 uv run pytest -m "not live" --cov=tt_scrap
-docker build -t tt-scrap:test .
 ```
 
-The deterministic suite mocks third-party HTTP and yt-dlp data and exercises a
-real-compatible async Redis API through an ephemeral fake. Live tests are kept
-outside CI because posts disappear and RapidAPI calls may be billed.
-
-With a server running, provide any currently valid fixture URLs and run:
+Live tests are opt-in because posts can disappear and RapidAPI calls may be
+billed. Set the `LIVE_TIKTOK_*` and `LIVE_INSTAGRAM_*` URLs documented by
+`scripts/live_smoke.py`, start the API, then run:
 
 ```bash
-export TT_SCRAP_API_KEY=...
-export LIVE_TIKTOK_VIDEO_URL=...
-export LIVE_TIKTOK_SHORT_URL=...
-export LIVE_TIKTOK_SLIDESHOW_URL=...
-export LIVE_TIKTOK_AGE_URL=...            # optional/best effort
-export LIVE_INSTAGRAM_VIDEO_URL=...
-export LIVE_INSTAGRAM_IMAGE_URL=...
-export LIVE_INSTAGRAM_CAROUSEL_URL=...
 uv run python scripts/live_smoke.py
 ```
 
-The initial `v0.1.0` validation on 2026-08-04 used these public fixtures:
+## Optional Docker image
 
-- TikTok video: `https://www.tiktok.com/@patroxofficial/video/6742501081818877190`
-- TikTok short URL: `https://vm.tiktok.com/ZGd9EGcY2/`
-- TikTok six-image slideshow: `https://www.tiktok.com/@discoverflagstaff/photo/7629036826480741663`
-- Instagram reel: `https://www.instagram.com/reel/DbAqmKPIaY5/`
-- Instagram image: `https://www.instagram.com/p/DZu8trmR89Y/`
-- Instagram carousel: `https://www.instagram.com/p/DZ0eE3Yk8pG/`
-
-Every returned video, image, cover, thumbnail, and audio asset passed MIME,
-non-empty length, and SHA-256 verification through `/v1/assets`. These fixtures
-are illustrative and can disappear. No stable, currently accessible
-age-restricted TikTok post could be discovered for this release; cookie-file
-loading, yt-dlp injection, per-asset cookie extraction, encryption, and log
-redaction are covered deterministically.
-
-Run a cached metadata concurrency check with:
+Docker is not required. If desired, the Compose file runs the same single API
+process with no additional services:
 
 ```bash
-uv run python scripts/benchmark.py 'https://www.tiktok.com/@creator/video/123'
+docker compose up --build -d
 ```
 
-## Later `tt-bot` integration
-
-The bot should retain source URL detection and Telegram presentation logic. Its
-TikTok and Instagram clients can become thin HTTP adapters that call the
-platform-specific extraction endpoints, map stable error codes to localized
-messages, and download each returned `tt-scrap` asset with the bearer token.
-The bot should no longer import yt-dlp, curl-cffi, cookies, proxies, or RapidAPI
-configuration after that migration.
+Published images are available at `ghcr.io/karilaa-dev/tt-scrap`.

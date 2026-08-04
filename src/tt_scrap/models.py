@@ -1,4 +1,4 @@
-"""Public API and encrypted cache models."""
+"""Public API and internal asset-context models."""
 
 from __future__ import annotations
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 
-import fakeredis.aioredis
 import pytest
 
 from tt_scrap.cache import CacheStore
@@ -10,29 +9,22 @@ from tt_scrap.errors import AssetExpiredError
 from tt_scrap.models import AssetFetchContext
 
 
-@pytest.mark.asyncio
-async def test_asset_context_is_encrypted_and_expires(settings) -> None:
-    redis = fakeredis.aioredis.FakeRedis()
-    cache = CacheStore(
-        redis,
-        settings.cache_encryption_key.get_secret_value(),
-        ttl_seconds=1,
-    )
-    context = AssetFetchContext(
+def context(name: str) -> AssetFetchContext:
+    return AssetFetchContext(
         platform="tiktok",
-        upstream_url="https://secret.cdn.test/video?signature=private",
-        filename="video.mp4",
+        upstream_url=f"https://cdn.test/{name}",
+        filename=f"{name}.mp4",
         kind="video",
-        cookies={"sessionid": "secret-cookie"},
-        proxy_slot=2,
     )
-    token = await cache.store_asset(context)
-    raw = await redis.get(cache._asset_key(token))
 
-    assert raw is not None
-    assert b"secret.cdn.test" not in raw
-    assert b"secret-cookie" not in raw
-    assert await cache.get_asset(token) == context
+
+@pytest.mark.asyncio
+async def test_asset_context_expires() -> None:
+    cache = CacheStore(ttl_seconds=1, max_entries=10)
+    asset = context("video")
+    token = await cache.store_asset(asset)
+
+    assert await cache.get_asset(token) == asset
 
     await asyncio.sleep(1.05)
     with pytest.raises(AssetExpiredError):
@@ -40,9 +32,24 @@ async def test_asset_context_is_encrypted_and_expires(settings) -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalid_encrypted_asset_is_rejected(settings) -> None:
-    redis = fakeredis.aioredis.FakeRedis()
-    cache = CacheStore(redis, settings.cache_encryption_key.get_secret_value(), ttl_seconds=30)
-    await redis.set(cache._asset_key("bad"), b"not-fernet", ex=30)
+async def test_cache_is_bounded_and_evicts_oldest_entry() -> None:
+    cache = CacheStore(ttl_seconds=30, max_entries=2)
+    first = await cache.store_asset(context("first"))
+    second = await cache.store_asset(context("second"))
+    third = await cache.store_asset(context("third"))
+
     with pytest.raises(AssetExpiredError):
-        await cache.get_asset("bad")
+        await cache.get_asset(first)
+    assert await cache.get_asset(second) == context("second")
+    assert await cache.get_asset(third) == context("third")
+
+
+@pytest.mark.asyncio
+async def test_close_discards_all_entries() -> None:
+    cache = CacheStore(ttl_seconds=30, max_entries=10)
+    token = await cache.store_asset(context("video"))
+
+    await cache.close()
+
+    with pytest.raises(AssetExpiredError):
+        await cache.get_asset(token)

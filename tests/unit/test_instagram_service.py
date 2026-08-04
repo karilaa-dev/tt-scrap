@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fakeredis.aioredis
 import pytest
 import respx
 from httpx import Response
@@ -13,12 +12,7 @@ API_URL = "https://instagram-downloader-download-instagram-stories-videos4.p.rap
 
 
 def make_service(settings) -> InstagramService:
-    redis = fakeredis.aioredis.FakeRedis()
-    cache = CacheStore(
-        redis,
-        settings.cache_encryption_key.get_secret_value(),
-        settings.cache_ttl_seconds,
-    )
+    cache = CacheStore(settings.cache_ttl_seconds, settings.cache_max_entries)
     return InstagramService(settings, cache)
 
 

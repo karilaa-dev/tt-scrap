@@ -17,5 +17,4 @@ async def live() -> LiveResponse:
 async def ready(request: Request) -> ReadyResponse:
     if not request.app.state.settings.rapidapi_key.get_secret_value():
         raise ConfigurationError("RAPIDAPI_KEY is not configured")
-    await request.app.state.cache.ping()
     return ReadyResponse()

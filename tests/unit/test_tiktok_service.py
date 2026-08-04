@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import fakeredis.aioredis
 import pytest
 
 from tt_scrap.assets import AssetFactory
@@ -47,12 +46,7 @@ class FakeAdapter:
 
 
 def make_service(settings, payload: dict[str, Any]):
-    redis = fakeredis.aioredis.FakeRedis()
-    cache = CacheStore(
-        redis,
-        settings.cache_encryption_key.get_secret_value(),
-        settings.cache_ttl_seconds,
-    )
+    cache = CacheStore(settings.cache_ttl_seconds, settings.cache_max_entries)
     service = object.__new__(TikTokService)
     service.settings = settings
     service.cache = cache

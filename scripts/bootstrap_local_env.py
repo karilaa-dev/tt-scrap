@@ -7,7 +7,6 @@ import secrets
 import shutil
 from pathlib import Path
 
-from cryptography.fernet import Fernet
 from dotenv import dotenv_values
 
 
@@ -20,12 +19,8 @@ def main() -> None:
     source = args.source.resolve()
     target = args.target.resolve()
     existing = dotenv_values(source / ".env")
-    redis_password = secrets.token_urlsafe(32)
     values = {
         "TT_SCRAP_API_KEY": secrets.token_urlsafe(32),
-        "CACHE_ENCRYPTION_KEY": Fernet.generate_key().decode(),
-        "REDIS_PASSWORD": redis_password,
-        "REDIS_URL": f"redis://:{redis_password}@127.0.0.1:6380/0",
         "RAPIDAPI_KEY": existing.get("RAPIDAPI_KEY", ""),
         "YTDLP_COOKIES": "cookies.txt",
         "PROXY_FILE": "proxies.txt",
@@ -36,6 +31,7 @@ def main() -> None:
         "DOWNLOAD_MAX_RETRIES": existing.get("DOWNLOAD_MAX_RETRIES", "3"),
         "MAX_VIDEO_DURATION": existing.get("MAX_VIDEO_DURATION", "0"),
         "CACHE_TTL_SECONDS": "600",
+        "CACHE_MAX_ENTRIES": "10000",
         "LOG_LEVEL": existing.get("LOG_LEVEL", "INFO"),
     }
     target.mkdir(parents=True, exist_ok=True)

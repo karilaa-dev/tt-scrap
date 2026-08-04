@@ -1,4 +1,4 @@
-"""Encrypted Redis cache."""
+"""Process-local TTL cache."""
 
 from .store import CacheStore
 

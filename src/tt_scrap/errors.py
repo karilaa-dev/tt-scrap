@@ -58,11 +58,6 @@ class UpstreamTimeoutError(ScraperError):
     status_code = 504
 
 
-class CacheUnavailableError(ScraperError):
-    code = "cache_unavailable"
-    status_code = 503
-
-
 class ConfigurationError(ScraperError):
     code = "service_not_configured"
     status_code = 503

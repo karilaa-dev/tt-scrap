@@ -10,7 +10,6 @@ from uuid import uuid4
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from redis.asyncio import Redis
 from starlette.responses import Response
 
 from .api.routes import assets, health, instagram, tiktok
@@ -32,23 +31,15 @@ def _error_response(status: int, code: str, message: str, request_id: str) -> JS
     return JSONResponse(status_code=status, content=payload.model_dump(mode="json"))
 
 
-def create_app(
-    settings: Settings | None = None,
-    *,
-    redis_client: Redis | None = None,
-) -> FastAPI:
+def create_app(settings: Settings | None = None) -> FastAPI:
     configured_settings = settings or get_settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         configure_logging(configured_settings.log_level)
-        redis = redis_client or Redis.from_url(
-            configured_settings.redis_url.get_secret_value(), decode_responses=False
-        )
         cache = CacheStore(
-            redis,
-            configured_settings.cache_encryption_key.get_secret_value(),
             configured_settings.cache_ttl_seconds,
+            configured_settings.cache_max_entries,
         )
         proxy_manager = ProxyManager(
             configured_settings.proxy_file,
@@ -60,7 +51,6 @@ def create_app(
         app.state.asset_downloader = AssetDownloader(configured_settings, proxy_manager)
         app.state.tiktok = TikTokService(configured_settings, cache, proxy_manager)
         app.state.instagram = InstagramService(configured_settings, cache)
-        await cache.ping()
         logger.info("tt-scrap started")
         try:
             yield
