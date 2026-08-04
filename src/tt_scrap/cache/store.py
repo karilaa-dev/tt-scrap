@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
-from collections.abc import Awaitable
-from typing import TypeVar, cast
+from typing import TypeVar
 
 from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel
@@ -35,8 +34,7 @@ class CacheStore:
 
     async def ping(self) -> bool:
         try:
-            operation = cast(Awaitable[bool], self._redis.ping())
-            return bool(await operation)
+            return bool(await self._redis.ping())
         except RedisError as exc:
             raise CacheUnavailableError("Redis is unavailable") from exc
 

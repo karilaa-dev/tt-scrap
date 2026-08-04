@@ -23,7 +23,7 @@ class Settings(BaseSettings):
 
     tt_scrap_api_key: SecretStr = Field(min_length=16)
     cache_encryption_key: SecretStr
-    redis_url: SecretStr = SecretStr("redis://:redis@redis:6379/0")
+    redis_url: SecretStr = SecretStr("redis://:redis@127.0.0.1:6380/0")
 
     rapidapi_key: SecretStr = SecretStr("")
     ytdlp_cookies: str = ""

@@ -25,7 +25,7 @@ def main() -> None:
         "TT_SCRAP_API_KEY": secrets.token_urlsafe(32),
         "CACHE_ENCRYPTION_KEY": Fernet.generate_key().decode(),
         "REDIS_PASSWORD": redis_password,
-        "REDIS_URL": f"redis://:{redis_password}@127.0.0.1:6379/0",
+        "REDIS_URL": f"redis://:{redis_password}@127.0.0.1:6380/0",
         "RAPIDAPI_KEY": existing.get("RAPIDAPI_KEY", ""),
         "YTDLP_COOKIES": "cookies.txt",
         "PROXY_FILE": "proxies.txt",

@@ -26,19 +26,52 @@ The extraction implementation is derived from `karilaa-dev/tt-bot` main commit
    disabled and no Redis volume is used.
 
 The default profile allows 32 concurrent metadata extractions and 64 asset
-downloads. Run one Uvicorn worker per container and scale containers
-horizontally against the shared ephemeral Redis instance.
+downloads. Run one Uvicorn process per service instance and scale instances
+against the shared ephemeral Redis service when needed.
 
 ## Local setup with uv
 
-Requirements: Python 3.13, `uv`, and Redis.
+Requirements: Python 3.13 and `uv`. Install `redis-server` as well if the local
+launcher should manage its own ephemeral Redis process:
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install redis-server
+
+# macOS
+brew install redis
+```
+
+Set up and start the complete service without Docker:
 
 ```bash
 cp .env.example .env
-# Fill in the API key, Fernet key, Redis password, RapidAPI key, and local paths.
-uv sync --locked --all-groups
-uv run uvicorn tt_scrap.main:app --host 0.0.0.0 --port 8000
+# Fill in the API key, Fernet key, Redis password, and RapidAPI key.
+# cookies.txt and proxies.txt are already the default ignored host paths.
+uv sync --locked
+uv run tt-scrap-local
 ```
+
+`tt-scrap-local` binds the API to `127.0.0.1:8000`. If `REDIS_URL` is already
+reachable, it uses that server. Otherwise, it starts a process-owned Redis on
+the loopback port from `REDIS_URL` (6380 by default), with RDB and AOF disabled,
+stores its password in a mode-0600 temporary configuration file, and removes
+all Redis state when the API exits. Stop both cleanly with `Ctrl+C`.
+
+To expose the API on another interface or use an independently managed Redis:
+
+```bash
+# Local Redis must already be running; the launcher will not create it.
+uv run tt-scrap-local --no-start-redis --host 0.0.0.0 --port 8000
+
+# Equivalent direct production entry point for a process supervisor/systemd.
+uv run tt-scrap
+```
+
+For a production host, run a dedicated Redis/Valkey-compatible service with
+persistence disabled, set its authenticated URL in `REDIS_URL`, and supervise
+`uv run tt-scrap`. Place a TLS reverse proxy in front if the API is reachable
+outside a private network.
 
 When developing beside an existing `tt-bot` checkout, provision a new ignored
 API/cache configuration and copy only its RapidAPI, cookie, and proxy inputs:
@@ -59,7 +92,7 @@ for ordinary public posts but needed for some age-restricted TikTok posts.
 `PROXY_FILE` contains one `http://`, `https://`, or `socks5://` proxy per line.
 Credentials are URL-encoded internally and always redacted from logs.
 
-## Docker Compose
+## Optional Docker Compose
 
 ```bash
 cp .env.example .env

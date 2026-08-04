@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       redis:
-        image: redis:8.2-alpine
+        image: redis:8.10.0-alpine
         ports:
           - 6379:6379
         options: >-
@@ -24,8 +24,8 @@ jobs:
     env:
       TEST_REDIS_URL: redis://127.0.0.1:6379/15
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9
         with:
           enable-cache: true
       - run: uv sync --locked --all-groups
@@ -37,9 +37,9 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: .
           push: false

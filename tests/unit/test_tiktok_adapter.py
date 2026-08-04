@@ -6,6 +6,7 @@ import pytest
 import respx
 import yt_dlp
 from httpx import Response
+from yt_dlp.networking._curlcffi import BROWSER_TARGETS
 
 from tt_scrap.errors import ContentDeletedError, InvalidLinkError
 from tt_scrap.platforms.tiktok.adapter import TikTokAdapter, YtdlpContext
@@ -33,6 +34,12 @@ def test_pinned_ytdlp_has_required_private_api() -> None:
     with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
         extractor = ydl.get_info_extractor("TikTok")
         assert hasattr(extractor, "_extract_web_data_and_status")
+    available_targets = {
+        target_name
+        for version_targets in BROWSER_TARGETS.values()
+        for target_name in version_targets
+    }
+    assert "chrome120" in available_targets
 
 
 @pytest.mark.asyncio
