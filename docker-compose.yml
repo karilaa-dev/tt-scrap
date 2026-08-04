@@ -1,0 +1,37 @@
+services:
+  tt-scrap:
+    build: .
+    image: ghcr.io/karilaa-dev/tt-scrap:latest
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      YTDLP_COOKIES: /run/secrets/cookies.txt
+      PROXY_FILE: /run/secrets/proxies.txt
+    volumes:
+      - ./cookies.txt:/run/secrets/cookies.txt:ro
+      - ./proxies.txt:/run/secrets/proxies.txt:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+  redis:
+    image: redis:8.2-alpine
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --requirepass
+      - ${REDIS_PASSWORD}
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
