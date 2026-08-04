@@ -6,7 +6,7 @@ readme = "README.md"
 license = { file = "LICENSE.md" }
 requires-python = "==3.13.*"
 dependencies = [
-    "cryptography>=46.0,<48.0",
+    "cryptography>=50.0.0,<51.0",
     "curl-cffi==0.13.0",
     "fastapi>=0.135.1,<0.136.0",
     "httpx>=0.28.1,<0.29.0",
