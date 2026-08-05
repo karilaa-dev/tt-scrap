@@ -14,7 +14,9 @@ The extraction code is derived from `karilaa-dev/tt-bot` main commit
 
 ## Start locally
 
-Requirements: Python 3.13 and [uv](https://docs.astral.sh/uv/).
+Requirements: Python 3.13, [uv](https://docs.astral.sh/uv/), and FFmpeg. FFmpeg is used
+only to stream-copy separate TikTok video and audio tracks into one MP4; it does not
+re-encode them. The Docker image installs FFmpeg automatically.
 
 ```bash
 cp .env.example .env

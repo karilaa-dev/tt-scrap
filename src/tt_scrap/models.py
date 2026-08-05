@@ -92,6 +92,13 @@ class InstagramExtractionResponse(BaseModel):
     expires_at: datetime
 
 
+class AuxiliaryAssetFetchContext(BaseModel):
+    upstream_url: str
+    alternate_upstream_urls: list[str] = Field(default_factory=list)
+    declared_content_type: str | None = None
+    cookies: dict[str, str] = Field(default_factory=dict)
+
+
 class AssetFetchContext(BaseModel):
     platform: Literal["tiktok", "instagram"]
     upstream_url: str
@@ -104,6 +111,7 @@ class AssetFetchContext(BaseModel):
     proxy_slot: int | None = None
     duration_seconds: int | None = None
     extraction_id: str | None = None
+    audio: AuxiliaryAssetFetchContext | None = None
 
 
 class ErrorDetail(BaseModel):

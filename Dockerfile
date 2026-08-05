@@ -14,7 +14,10 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-RUN groupadd --system --gid 10001 app \
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --home-dir /app app \
     && mkdir -p /app /tmp/tt-scrap \
     && chown -R app:app /app /tmp/tt-scrap

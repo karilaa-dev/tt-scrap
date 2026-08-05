@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from uuid import uuid4
@@ -13,6 +14,7 @@ from ...errors import ContentTooLongError, ExtractionError
 from ...models import (
     AssetDescriptor,
     AssetFetchContext,
+    AuxiliaryAssetFetchContext,
     TikTokExtractionResponse,
     TikTokMusicMetadata,
     TikTokMusicResponse,
@@ -29,15 +31,121 @@ def _first(value: Any) -> str | None:
     return None
 
 
-def extract_video_url(video: dict[str, Any]) -> str | None:
-    direct = _first(video.get("playAddr")) or _first(video.get("downloadAddr"))
-    if direct:
-        return direct
-    for bitrate in video.get("bitrateInfo", []):
-        direct = _first(bitrate.get("PlayAddr", {}).get("UrlList"))
-        if direct:
-            return direct
+@dataclass(frozen=True, slots=True)
+class VideoSource:
+    url: str
+    alternate_urls: list[str]
+    width: int | None = None
+    height: int | None = None
+    audio_url: str | None = None
+    alternate_audio_urls: list[str] | None = None
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _address_urls(address: Any) -> list[str]:
+    if isinstance(address, str):
+        return [address] if address else []
+    if isinstance(address, list):
+        return [item for item in address if isinstance(item, str) and item]
+    if not isinstance(address, dict):
+        return []
+    for key in ("UrlList", "urlList", "url_list"):
+        urls = address.get(key)
+        if isinstance(urls, list):
+            return [item for item in urls if isinstance(item, str) and item]
+    mirror_urls: list[str] = []
+    for key in (
+        "MainUrl",
+        "main_url",
+        "BackupUrl",
+        "backup_url",
+        "FallbackUrl",
+        "fallback_url",
+    ):
+        value = address.get(key)
+        if isinstance(value, str) and value:
+            mirror_urls.append(value)
+    if mirror_urls:
+        return mirror_urls
+    return [url for key in ("src", "url", "download") if (url := _first(address.get(key)))]
+
+
+_BEST_VIDEO_GEAR = "adapt_lowest_1080_1"
+_BEST_VIDEO_URL_TAG = "bytevc1_1080p"
+
+
+def _best_audio_source(video: dict[str, Any]) -> tuple[str, list[str]] | None:
+    tracks = video.get("bitrateAudioInfo") or video.get("bit_rate_audio_info") or []
+    candidates: list[tuple[tuple[int, int], list[str]]] = []
+    for track in tracks:
+        if not isinstance(track, dict):
+            continue
+        urls = _address_urls(track.get("UrlList") or track.get("url_list"))
+        if not urls:
+            continue
+        rank = (
+            _positive_int(track.get("Bitrate") or track.get("bit_rate")) or 0,
+            _positive_int(track.get("AudioQuality") or track.get("audio_quality")) or 0,
+        )
+        candidates.append((rank, urls))
+    if not candidates:
+        return None
+    urls = max(candidates, key=lambda candidate: candidate[0])[1]
+    return urls[0], urls[1:]
+
+
+def _regular_video_source(video: dict[str, Any]) -> VideoSource | None:
+    for key in ("playAddr", "downloadAddr"):
+        urls = _address_urls(video.get(key))
+        if urls:
+            return VideoSource(
+                url=urls[0],
+                alternate_urls=urls[1:],
+                width=_positive_int(video.get("width")),
+                height=_positive_int(video.get("height")),
+            )
     return None
+
+
+def select_video_source(video: dict[str, Any]) -> VideoSource | None:
+    for raw_bitrate in video.get("bitrateInfo", []):
+        if not isinstance(raw_bitrate, dict):
+            continue
+        address = raw_bitrate.get("PlayAddr") or raw_bitrate.get("play_addr")
+        if not isinstance(address, dict):
+            continue
+        gear_name = str(raw_bitrate.get("GearName") or raw_bitrate.get("gear_name") or "").lower()
+        url_key = str(address.get("UrlKey") or address.get("url_key") or "").lower()
+        if gear_name != _BEST_VIDEO_GEAR and _BEST_VIDEO_URL_TAG not in url_key:
+            continue
+        urls = _address_urls(address)
+        if not urls:
+            break
+        audio = _best_audio_source(video)
+        has_separate_audio = bool(video.get("bitrateAudioInfo") or video.get("bit_rate_audio_info"))
+        if has_separate_audio and not audio:
+            break
+        return VideoSource(
+            url=urls[0],
+            alternate_urls=urls[1:],
+            width=_positive_int(address.get("Width") or address.get("width")),
+            height=_positive_int(address.get("Height") or address.get("height")),
+            audio_url=audio[0] if audio else None,
+            alternate_audio_urls=audio[1] if audio else None,
+        )
+    return _regular_video_source(video)
+
+
+def extract_video_url(video: dict[str, Any]) -> str | None:
+    source = select_video_source(video)
+    return source.url if source else None
 
 
 class TikTokService:
@@ -69,7 +177,17 @@ class TikTokService:
         extraction_id: str,
         declared_content_type: str | None = None,
         duration: int | None = None,
+        audio_url: str | None = None,
+        alternate_audio_urls: list[str] | None = None,
     ) -> AssetDescriptor:
+        audio = None
+        if audio_url:
+            audio = AuxiliaryAssetFetchContext(
+                upstream_url=audio_url,
+                alternate_upstream_urls=alternate_audio_urls or [],
+                declared_content_type="audio/mp4",
+                cookies=context.cookies_for(audio_url),
+            )
         fetch = AssetFetchContext(
             platform="tiktok",
             upstream_url=url,
@@ -82,6 +200,7 @@ class TikTokService:
             proxy_slot=context.proxy_slot,
             duration_seconds=duration,
             extraction_id=extraction_id,
+            audio=audio,
         )
         return await self.assets.create(fetch, position=position, expires_at=expires_at)
 
@@ -156,8 +275,8 @@ class TikTokService:
             content_type: Literal["video", "slideshow"] = "slideshow"
         else:
             video = data.get("video") or {}
-            video_url = extract_video_url(video)
-            if not video_url:
+            video_source = select_video_source(video)
+            if not video_source:
                 raise ExtractionError("TikTok response has no video asset")
             duration = int(video["duration"]) if video.get("duration") else None
             if (
@@ -166,11 +285,12 @@ class TikTokService:
                 and duration > self.settings.max_video_duration
             ):
                 raise ContentTooLongError("TikTok video exceeds MAX_VIDEO_DURATION")
-            width = int(video["width"]) if video.get("width") else None
-            height = int(video["height"]) if video.get("height") else None
+            width = video_source.width
+            height = video_source.height
             media.append(
                 await self._asset(
-                    url=video_url,
+                    url=video_source.url,
+                    alternate_urls=video_source.alternate_urls,
                     context=context,
                     kind="video",
                     filename=f"{video_id}.mp4",
@@ -179,6 +299,8 @@ class TikTokService:
                     extraction_id=extraction_id,
                     declared_content_type="video/mp4",
                     duration=duration,
+                    audio_url=video_source.audio_url,
+                    alternate_audio_urls=video_source.alternate_audio_urls,
                 )
             )
             cover_url = _first(video.get("cover")) or _first(video.get("originCover"))

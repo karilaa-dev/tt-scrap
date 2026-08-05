@@ -6,7 +6,11 @@ import pytest
 
 from tt_scrap.assets import AssetFactory
 from tt_scrap.cache import CacheStore
-from tt_scrap.platforms.tiktok.service import TikTokService, extract_video_url
+from tt_scrap.platforms.tiktok.service import (
+    TikTokService,
+    extract_video_url,
+    select_video_source,
+)
 from tt_scrap.proxy import ProxyManager
 
 
@@ -58,10 +62,138 @@ def make_service(settings, payload: dict[str, Any]):
 
 def test_video_url_fallback() -> None:
     assert extract_video_url({"downloadAddr": "https://cdn/video"}) == "https://cdn/video"
-    assert (
-        extract_video_url({"bitrateInfo": [{"PlayAddr": {"UrlList": ["https://cdn/bitrate"]}}]})
-        == "https://cdn/bitrate"
+    assert extract_video_url({"playAddr": "https://cdn/play", "bitrateInfo": []}) == (
+        "https://cdn/play"
     )
+
+
+def test_video_source_selects_known_quality_tag_and_preserves_mirrors() -> None:
+    source = select_video_source(
+        {
+            "playAddr": "https://cdn/regular",
+            "width": 720,
+            "height": 1280,
+            "bitrateInfo": [
+                {
+                    "Bitrate": 2_500_000,
+                    "GearName": "normal_720_0",
+                    "PlayAddr": {
+                        "Width": 720,
+                        "Height": 1280,
+                        "UrlKey": "video_h264_720p_2500000",
+                        "UrlList": ["https://cdn/h264-1", "https://cdn/h264-2"],
+                    },
+                },
+                {
+                    "GearName": "adapt_lowest_1080_1",
+                    "PlayAddr": {
+                        "Width": 1080,
+                        "Height": 1920,
+                        "UrlKey": "video_bytevc1_1080p_1900000",
+                        "UrlList": ["https://cdn/hevc-1", "https://cdn/hevc-2"],
+                    },
+                },
+            ],
+        }
+    )
+
+    assert source is not None
+    assert source.url == "https://cdn/hevc-1"
+    assert source.alternate_urls == ["https://cdn/hevc-2"]
+    assert (source.width, source.height) == (1080, 1920)
+
+
+def test_video_source_falls_back_when_known_quality_tag_is_absent() -> None:
+    source = select_video_source(
+        {
+            "playAddr": "https://cdn/regular",
+            "bitrateInfo": [
+                {
+                    "GearName": "normal_720_0",
+                    "PlayAddr": {
+                        "Width": 720,
+                        "Height": 1280,
+                        "UrlList": ["https://cdn/720"],
+                    },
+                },
+                {
+                    "GearName": "some_other_1080",
+                    "PlayAddr": {
+                        "Width": 1080,
+                        "Height": 1920,
+                        "UrlKey": "video_h264_1080p_3000000",
+                        "UrlList": ["https://cdn/1080"],
+                    },
+                },
+            ],
+        }
+    )
+
+    assert source and source.url == "https://cdn/regular"
+
+
+def test_video_source_adds_highest_bitrate_adaptive_audio() -> None:
+    source = select_video_source(
+        {
+            "playAddr": "https://cdn/regular-with-audio",
+            "width": 720,
+            "height": 1280,
+            "bitrateAudioInfo": [
+                {
+                    "Bitrate": 64_000,
+                    "AudioQuality": 6,
+                    "UrlList": {"MainUrl": "https://cdn/audio-low"},
+                },
+                {
+                    "Bitrate": 96_000,
+                    "AudioQuality": 7,
+                    "UrlList": {
+                        "MainUrl": "https://cdn/audio-primary",
+                        "BackupUrl": "https://cdn/audio-backup",
+                    },
+                },
+            ],
+            "bitrateInfo": [
+                {
+                    "GearName": "adapt_lowest_1080_1",
+                    "PlayAddr": {
+                        "Width": 1080,
+                        "Height": 1920,
+                        "UrlList": ["https://cdn/silent-1080"],
+                    },
+                }
+            ],
+        }
+    )
+
+    assert source is not None
+    assert source.url == "https://cdn/silent-1080"
+    assert source.audio_url == "https://cdn/audio-primary"
+    assert source.alternate_audio_urls == ["https://cdn/audio-backup"]
+    assert (source.width, source.height) == (1080, 1920)
+
+
+def test_video_source_falls_back_when_adaptive_audio_is_missing() -> None:
+    source = select_video_source(
+        {
+            "playAddr": "https://cdn/regular-with-audio",
+            "width": 720,
+            "height": 1280,
+            "bitrateAudioInfo": [{"Bitrate": 96_000, "UrlList": {}}],
+            "bitrateInfo": [
+                {
+                    "GearName": "adapt_lowest_1080_1",
+                    "PlayAddr": {
+                        "Width": 1080,
+                        "Height": 1920,
+                        "UrlList": ["https://cdn/silent-1080"],
+                    },
+                }
+            ],
+        }
+    )
+
+    assert source and source.url == "https://cdn/regular-with-audio"
 
 
 @pytest.mark.asyncio
@@ -100,6 +232,53 @@ async def test_video_response_is_normalized_cached_and_closes_context(settings) 
     assert "cdn.test" not in response.model_dump_json()
     assert service.adapter.calls == 1
     assert service.adapter.contexts[0].closed
+
+
+@pytest.mark.asyncio
+async def test_video_response_uses_selected_quality_source(settings) -> None:
+    payload = {
+        "video": {
+            "playAddr": "https://video.cdn.test/regular",
+            "width": 720,
+            "height": 1280,
+            "duration": 15,
+            "bitrateAudioInfo": [
+                {
+                    "Bitrate": 96_000,
+                    "UrlList": {
+                        "MainUrl": "https://audio.cdn.test/best-primary",
+                        "BackupUrl": "https://audio.cdn.test/best-backup",
+                    },
+                }
+            ],
+            "bitrateInfo": [
+                {
+                    "GearName": "adapt_lowest_1080_1",
+                    "PlayAddr": {
+                        "Width": 1080,
+                        "Height": 1920,
+                        "UrlKey": "video_bytevc1_1080p_1900000",
+                        "UrlList": [
+                            "https://video.cdn.test/best-primary",
+                            "https://video.cdn.test/best-backup",
+                        ],
+                    },
+                }
+            ],
+        }
+    }
+    service, cache = make_service(settings, payload)
+
+    response = await service.extract_url("https://www.tiktok.com/@creator/video/123")
+    token = response.media[0].download_url.rsplit("/", 1)[-1]
+    context = await cache.get_asset(token)
+
+    assert (response.width, response.height) == (1080, 1920)
+    assert context.upstream_url == "https://video.cdn.test/best-primary"
+    assert context.alternate_upstream_urls == ["https://video.cdn.test/best-backup"]
+    assert context.audio is not None
+    assert context.audio.upstream_url == "https://audio.cdn.test/best-primary"
+    assert context.audio.alternate_upstream_urls == ["https://audio.cdn.test/best-backup"]
 
 
 @pytest.mark.asyncio

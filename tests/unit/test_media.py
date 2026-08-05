@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+from io import BytesIO
+
 import pytest
 import respx
 from httpx import Response
@@ -7,11 +10,12 @@ from httpx import Response
 from tt_scrap.errors import NetworkError
 from tt_scrap.media import AssetDownloader
 from tt_scrap.media.downloader import (
+    DownloadedAsset,
     _close_curl_response,
     detect_content_type,
     filename_for_type,
 )
-from tt_scrap.models import AssetFetchContext
+from tt_scrap.models import AssetFetchContext, AuxiliaryAssetFetchContext
 from tt_scrap.proxy import ProxyManager
 
 
@@ -128,6 +132,50 @@ async def test_asset_uses_encrypted_alternate_url_after_primary_expires(settings
         assert primary.call_count == 1
         assert alternate.call_count == 1
         assert result.file.read() == b"\xff\xd8\xffvalid"
+        result.file.close()
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+async def test_adaptive_video_and_audio_download_concurrently_then_remux(
+    settings, monkeypatch
+) -> None:
+    downloader = AssetDownloader(settings, ProxyManager())
+    calls: list[AssetFetchContext] = []
+    both_started = asyncio.Event()
+
+    async def fake_download_single(context: AssetFetchContext) -> DownloadedAsset:
+        calls.append(context)
+        if len(calls) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        payload = b"video" if context.kind == "video" else b"audio"
+        return DownloadedAsset(BytesIO(payload), len(payload), "input-digest", "video/mp4")
+
+    async def fake_remux(video, audio) -> DownloadedAsset:
+        assert video.read() == b"video"
+        assert audio.read() == b"audio"
+        return DownloadedAsset(BytesIO(b"muxed"), 5, "output-digest", "video/mp4")
+
+    monkeypatch.setattr(downloader, "_download_single", fake_download_single)
+    monkeypatch.setattr(downloader, "_remux_copy", fake_remux)
+    try:
+        result = await downloader.download(
+            AssetFetchContext(
+                platform="tiktok",
+                upstream_url="https://cdn.test/video",
+                filename="video.mp4",
+                kind="video",
+                audio=AuxiliaryAssetFetchContext(
+                    upstream_url="https://cdn.test/audio",
+                    declared_content_type="audio/mp4",
+                ),
+            )
+        )
+
+        assert {call.kind for call in calls} == {"video", "audio"}
+        assert result.file.read() == b"muxed"
         result.file.close()
     finally:
         await downloader.close()
