@@ -199,7 +199,9 @@ curl http://127.0.0.1:8000/v1/instagram/extractions \
 ```
 
 Extraction responses contain normalized metadata and asset paths such as
-`/v1/assets/opaque-token`; upstream CDN URLs are never returned.
+`/v1/assets/opaque-token`; upstream CDN URLs are never returned. A single media
+filename uses the Instagram post shortcode (for example, `DaJJCIVEn2n.mp4`), while
+carousel items add a stable one-based suffix such as `DaJJCIVEn2n_1.jpg`.
 
 ### Download an asset
 

@@ -47,6 +47,15 @@ def normalize_instagram_url(url: str) -> str:
     return f"https://www.instagram.com{parsed.path.rstrip('/')}/"
 
 
+def extract_instagram_media_id(url: str) -> str:
+    """Return the post shortcode or story ID used in an Instagram URL."""
+    validate_instagram_url(url)
+    path_parts = [part for part in urlparse(url).path.split("/") if part]
+    if path_parts[0].lower() == "stories" and len(path_parts) >= 3:
+        return path_parts[2]
+    return path_parts[1]
+
+
 class InstagramService:
     def __init__(self, settings: Settings, cache: CacheStore) -> None:
         self.settings = settings
@@ -110,6 +119,7 @@ class InstagramService:
         self, source_url: str, *, refresh: bool = False
     ) -> InstagramExtractionResponse:
         normalized_url = normalize_instagram_url(source_url)
+        media_id = extract_instagram_media_id(normalized_url)
         cache_key = self.cache.metadata_key("instagram", normalized_url)
         if not refresh:
             cached = await self.cache.get_model(cache_key, InstagramExtractionResponse)
@@ -123,18 +133,26 @@ class InstagramService:
         expires_at = self._expires_at()
         extraction_id = str(uuid4())
         media: list[InstagramMediaItem] = []
-        for position, raw in enumerate(raw_media):
+        usable_media: list[dict[str, Any]] = []
+        for raw in raw_media:
             if not isinstance(raw, dict) or not raw.get("url"):
                 continue
+            usable_media.append(raw)
+        if not usable_media:
+            raise ContentDeletedError("Instagram response contained no usable media")
+
+        is_carousel = len(usable_media) > 1
+        for position, raw in enumerate(usable_media):
             media_type: Literal["video", "image"] = (
                 "video" if raw.get("type") == "video" else "image"
             )
             extension = "mp4" if media_type == "video" else "jpg"
+            filename_stem = f"{media_id}_{position + 1}" if is_carousel else media_id
             asset = await self.assets.create(
                 AssetFetchContext(
                     platform="instagram",
                     upstream_url=str(raw["url"]),
-                    filename=f"instagram_{position + 1}.{extension}",
+                    filename=f"{filename_stem}.{extension}",
                     kind=media_type,
                     extraction_id=extraction_id,
                     declared_content_type=("video/mp4" if media_type == "video" else None),
@@ -148,7 +166,7 @@ class InstagramService:
                     AssetFetchContext(
                         platform="instagram",
                         upstream_url=str(raw["thumbnail"]),
-                        filename=f"instagram_{position + 1}_thumbnail.jpg",
+                        filename=f"{filename_stem}_thumbnail.jpg",
                         kind="thumbnail",
                         extraction_id=extraction_id,
                     ),
@@ -164,8 +182,6 @@ class InstagramService:
                     thumbnail=thumbnail,
                 )
             )
-        if not media:
-            raise ContentDeletedError("Instagram response contained no usable media")
         if len(media) > 1:
             content_type: Literal["video", "image", "carousel"] = "carousel"
         else:
