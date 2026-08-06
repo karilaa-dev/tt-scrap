@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, BinaryIO
 
 import aiohttp
 
 from ..config import Settings
 from ..errors import ConfigurationError, TelegramNetworkError, TelegramTimeoutError
+from ..logging import elapsed_ms, log_event
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +56,35 @@ def _form_value(value: Any) -> str:
     return str(value)
 
 
+def _file_size(file: BinaryIO) -> int | None:
+    try:
+        position = file.tell()
+        file.seek(0, 2)
+        size = file.tell()
+        file.seek(position)
+        return size
+    except (OSError, ValueError):
+        return None
+
+
+def _telegram_error_details(body: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    details: dict[str, Any] = {}
+    if isinstance(value.get("error_code"), int):
+        details["telegram_error_code"] = value["error_code"]
+    if isinstance(value.get("description"), str):
+        details["telegram_description"] = value["description"][:500]
+    parameters = value.get("parameters")
+    if isinstance(parameters, dict) and isinstance(parameters.get("retry_after"), int):
+        details["telegram_retry_after"] = parameters["retry_after"]
+    return details
+
+
 class TelegramClient:
     def __init__(self, settings: Settings) -> None:
         self._token = settings.telegram_bot_token.get_secret_value()
@@ -83,6 +117,13 @@ class TelegramClient:
     ) -> TelegramCallResponse:
         if not self._token:
             raise ConfigurationError("Telegram delivery is not configured")
+        started_at = perf_counter()
+        upload_sizes = [_file_size(upload.file) for upload in uploads]
+        upload_bytes = (
+            sum(size for size in upload_sizes if size is not None)
+            if all(size is not None for size in upload_sizes)
+            else None
+        )
         form = aiohttp.FormData(quote_fields=False)
         for name, value in fields.items():
             if value is not None:
@@ -100,15 +141,54 @@ class TelegramClient:
         try:
             async with self._session.post(url, data=form) as response:
                 body = await response.read()
-                return TelegramCallResponse(
+                result = TelegramCallResponse(
                     method=method,
                     status_code=response.status,
                     body=body,
                     content_type=response.headers.get("Content-Type", "application/json"),
                 )
+                log_event(
+                    logger,
+                    "telegram.api_call.completed",
+                    level=logging.INFO if result.ok else logging.WARNING,
+                    message="Telegram API upload completed",
+                    telegram_method=method,
+                    status_code=response.status,
+                    success=result.ok,
+                    upload_count=len(uploads),
+                    upload_bytes=upload_bytes,
+                    response_bytes=len(body),
+                    elapsed_ms=elapsed_ms(started_at),
+                    **(_telegram_error_details(body) if not result.ok else {}),
+                )
+                return result
         except TimeoutError as exc:
+            log_event(
+                logger,
+                "telegram.api_call.failed",
+                level=logging.WARNING,
+                message="Telegram API upload timed out",
+                telegram_method=method,
+                success=False,
+                upload_count=len(uploads),
+                upload_bytes=upload_bytes,
+                elapsed_ms=elapsed_ms(started_at),
+                error_type=type(exc).__name__,
+            )
             raise TelegramTimeoutError("Telegram upload timed out") from exc
         except aiohttp.ClientError as exc:
+            log_event(
+                logger,
+                "telegram.api_call.failed",
+                level=logging.WARNING,
+                message="Telegram API upload failed before a response",
+                telegram_method=method,
+                success=False,
+                upload_count=len(uploads),
+                upload_bytes=upload_bytes,
+                elapsed_ms=elapsed_ms(started_at),
+                error_type=type(exc).__name__,
+            )
             raise TelegramNetworkError("Telegram upload failed before a response") from exc
 
     async def close(self) -> None:

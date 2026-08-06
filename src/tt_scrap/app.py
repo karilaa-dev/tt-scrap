@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from time import perf_counter
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -16,7 +17,7 @@ from .api.routes import assets, health, instagram, tiktok
 from .cache import CacheStore
 from .config import Settings, get_settings
 from .errors import ScraperError
-from .logging import configure_logging, request_id_var
+from .logging import configure_logging, elapsed_ms, log_event, request_id_var
 from .media import AssetDownloader
 from .media.images import ImagePreparationService
 from .models import ErrorDetail, ErrorResponse
@@ -37,6 +38,8 @@ Use the origin that served this document as the API base URL. Every `/v1/*` requ
 requires `Authorization: Bearer <TT_SCRAP_API_KEY>`. `/openapi.json`, `/docs`, and
 health endpoints are public. API errors use `ErrorResponse`; keep `error.request_id`
 for diagnostics and branch on the stable `error.code` rather than message text.
+Every response also includes `X-Request-ID` and `Server-Timing: app;dur=<milliseconds>`;
+send a caller-generated `X-Request-ID` to correlate the response with server logs.
 
 ### TikTok information and downloads
 
@@ -178,20 +181,57 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def request_context(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
-        request_id = request.headers.get("X-Request-ID") or str(uuid4())
+        supplied_request_id = request.headers.get("X-Request-ID", "").strip()
+        request_id = supplied_request_id[:128] if supplied_request_id else str(uuid4())
         request.state.request_id = request_id
         token = request_id_var.set(request_id)
+        started_at = perf_counter()
+        status_code = 500
+        response_bytes: int | None = None
         try:
             response = await call_next(request)
+            status_code = response.status_code
+            elapsed = elapsed_ms(started_at)
             response.headers["X-Request-ID"] = request_id
+            response.headers["Server-Timing"] = f"app;dur={elapsed:.3f}"
+            content_length = response.headers.get("Content-Length")
+            if content_length and content_length.isdigit():
+                response_bytes = int(content_length)
             return response
         finally:
+            route = request.scope.get("route")
+            route_path = getattr(route, "path", None)
+            operation = getattr(route, "name", None)
+            if not isinstance(route_path, str):
+                route_path = request.url.path
+                if route_path.startswith("/v1/assets/"):
+                    route_path = "/v1/assets/{token}"
+                route_path = route_path[:256]
+            log_event(
+                logger,
+                "http.request.completed",
+                http_method=request.method,
+                path=route_path,
+                operation=operation if isinstance(operation, str) else None,
+                status_code=status_code,
+                response_bytes=response_bytes,
+                elapsed_ms=elapsed_ms(started_at),
+                success=status_code < 400,
+            )
             request_id_var.reset(token)
 
     @app.exception_handler(ScraperError)
     async def scraper_error_handler(request: Request, exc: ScraperError) -> JSONResponse:
         request_id = getattr(request.state, "request_id", "-")
-        logger.warning("Request failed with %s", exc.code)
+        log_event(
+            logger,
+            "http.request.error",
+            level=logging.WARNING,
+            message="Request failed with a known application error",
+            error_code=exc.code,
+            error_type=type(exc).__name__,
+            status_code=exc.status_code,
+        )
         return _error_response(exc.status_code, exc.code, str(exc), request_id)
 
     @app.exception_handler(RequestValidationError)
@@ -199,12 +239,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
         request_id = getattr(request.state, "request_id", "-")
+        log_event(
+            logger,
+            "http.request.validation_error",
+            level=logging.WARNING,
+            message="Request validation failed",
+            error_code="validation_error",
+            error_type=type(exc).__name__,
+            status_code=422,
+        )
         return _error_response(422, "validation_error", "Request validation failed", request_id)
 
     @app.exception_handler(Exception)
     async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
         request_id = getattr(request.state, "request_id", "-")
-        logger.exception("Unhandled request error")
+        logger.exception(
+            "Unhandled request error",
+            extra={
+                "event": "http.request.unhandled_error",
+                "error_code": "internal_error",
+                "error_type": type(exc).__name__,
+                "status_code": 500,
+            },
+        )
         return _error_response(500, "internal_error", "Internal server error", request_id)
 
     app.include_router(health.router)

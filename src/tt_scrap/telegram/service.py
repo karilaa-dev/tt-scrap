@@ -6,11 +6,13 @@ import asyncio
 import io
 import logging
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, BinaryIO, Literal
 
 from ..cache import CacheStore
 from ..config import Settings
 from ..errors import ConfigurationError, ExtractionError, TelegramParameterError
+from ..logging import elapsed_ms, log_event
 from ..media import AssetDownloader, DownloadedAsset, ImagePreparationService
 from ..media.downloader import filename_for_type
 from ..media.images import is_native_telegram_photo
@@ -142,13 +144,52 @@ class TelegramDeliveryService:
     async def deliver(self, request: TikTokTelegramDeliveryRequest) -> TelegramDeliveryOutcome:
         if not self._client.configured:
             raise ConfigurationError("Telegram delivery is not configured")
-        async with self._pipeline_limit:
-            if request.delivery == "audio":
-                return await self._deliver_audio(request)
-            extraction = await self._resolve_extraction(request)
-            if extraction.content_type == "slideshow":
-                return await self._deliver_slideshow(request, extraction)
-            return await self._deliver_video(request, extraction)
+        started_at = perf_counter()
+        source_kind = next(
+            name
+            for name in ("extraction_id", "url", "video_id")
+            if getattr(request.source, name) is not None
+        )
+        try:
+            async with self._pipeline_limit:
+                queue_wait = elapsed_ms(started_at)
+                if request.delivery == "audio":
+                    outcome = await self._deliver_audio(request)
+                else:
+                    extraction = await self._resolve_extraction(request)
+                    if extraction.content_type == "slideshow":
+                        outcome = await self._deliver_slideshow(request, extraction)
+                    else:
+                        outcome = await self._deliver_video(request, extraction)
+        except Exception as exc:
+            log_event(
+                logger,
+                "telegram.delivery.failed",
+                level=logging.WARNING,
+                message="TikTok Telegram delivery failed",
+                platform="tiktok",
+                delivery=request.delivery,
+                source_kind=source_kind,
+                elapsed_ms=elapsed_ms(started_at),
+                error_type=type(exc).__name__,
+                success=False,
+            )
+            raise
+        log_event(
+            logger,
+            "telegram.delivery.completed",
+            message="TikTok Telegram delivery completed",
+            platform="tiktok",
+            delivery=request.delivery,
+            source_kind=source_kind,
+            queue_wait_ms=queue_wait,
+            call_count=len(outcome.calls),
+            status_code=outcome.calls[-1].status_code if outcome.calls else None,
+            elapsed_ms=elapsed_ms(started_at),
+            success=bool(outcome.calls)
+            and all(200 <= call.status_code < 300 for call in outcome.calls),
+        )
+        return outcome
 
     async def deliver_instagram(
         self, request: InstagramTelegramDeliveryRequest
@@ -157,11 +198,45 @@ class TelegramDeliveryService:
             raise ConfigurationError("Telegram delivery is not configured")
         if self._instagram is None:
             raise ConfigurationError("Instagram delivery is not configured")
-        async with self._pipeline_limit:
-            extraction = await self._resolve_instagram_extraction(request)
-            if len(extraction.media) == 1:
-                return await self._deliver_instagram_single(request, extraction.media[0])
-            return await self._deliver_instagram_carousel(request, extraction)
+        started_at = perf_counter()
+        source_kind = "extraction_id" if request.source.extraction_id is not None else "url"
+        try:
+            async with self._pipeline_limit:
+                queue_wait = elapsed_ms(started_at)
+                extraction = await self._resolve_instagram_extraction(request)
+                if len(extraction.media) == 1:
+                    outcome = await self._deliver_instagram_single(request, extraction.media[0])
+                else:
+                    outcome = await self._deliver_instagram_carousel(request, extraction)
+        except Exception as exc:
+            log_event(
+                logger,
+                "telegram.delivery.failed",
+                level=logging.WARNING,
+                message="Instagram Telegram delivery failed",
+                platform="instagram",
+                delivery=request.delivery,
+                source_kind=source_kind,
+                elapsed_ms=elapsed_ms(started_at),
+                error_type=type(exc).__name__,
+                success=False,
+            )
+            raise
+        log_event(
+            logger,
+            "telegram.delivery.completed",
+            message="Instagram Telegram delivery completed",
+            platform="instagram",
+            delivery=request.delivery,
+            source_kind=source_kind,
+            queue_wait_ms=queue_wait,
+            call_count=len(outcome.calls),
+            status_code=outcome.calls[-1].status_code if outcome.calls else None,
+            elapsed_ms=elapsed_ms(started_at),
+            success=bool(outcome.calls)
+            and all(200 <= call.status_code < 300 for call in outcome.calls),
+        )
+        return outcome
 
     async def _resolve_extraction(
         self, request: TikTokTelegramDeliveryRequest
@@ -209,7 +284,14 @@ class TelegramDeliveryService:
             if isinstance(candidate, DownloadedAsset):
                 cover_result = candidate
             elif isinstance(candidate, BaseException):
-                logger.warning("Media cover download failed; Telegram will generate a preview")
+                log_event(
+                    logger,
+                    "telegram.thumbnail_download.failed",
+                    level=logging.WARNING,
+                    message="Media cover download failed; Telegram will generate a preview",
+                    error_type=type(candidate).__name__,
+                    success=False,
+                )
         return media_result, cover_result
 
     async def _thumbnail(
@@ -220,8 +302,15 @@ class TelegramDeliveryService:
         try:
             data = await self._images.read_file(cover.file)
             converted = await self._images.prepare_thumbnail(data, filename)
-        except Exception:
-            logger.warning("Media cover conversion failed; Telegram will generate a preview")
+        except Exception as exc:
+            log_event(
+                logger,
+                "telegram.thumbnail_preparation.failed",
+                level=logging.WARNING,
+                message="Media cover conversion failed; Telegram will generate a preview",
+                error_type=type(exc).__name__,
+                success=False,
+            )
             return None
         return io.BytesIO(converted.data), converted.filename
 
@@ -498,6 +587,7 @@ class TelegramDeliveryService:
             cover = item.thumbnail if not document and item.media_type == "video" else None
             return await self._download_with_cover(item.asset, cover)
 
+        download_started_at = perf_counter()
         download_outcomes = await asyncio.gather(
             *[download_item(item) for item in extraction.media],
             return_exceptions=True,
@@ -514,10 +604,37 @@ class TelegramDeliveryService:
                 media.file.close()
                 if thumbnail is not None:
                     thumbnail.file.close()
+            log_event(
+                logger,
+                "telegram.album_downloads.failed",
+                level=logging.WARNING,
+                message="Instagram carousel downloads failed",
+                platform="instagram",
+                delivery=request.delivery,
+                item_count=len(extraction.media),
+                elapsed_ms=elapsed_ms(download_started_at),
+                error_type=type(download_failure).__name__,
+                success=False,
+            )
             raise download_failure
+        log_event(
+            logger,
+            "telegram.album_downloads.completed",
+            message="Instagram carousel downloads completed",
+            platform="instagram",
+            delivery=request.delivery,
+            item_count=len(downloaded_items),
+            output_bytes=sum(
+                media.size + (thumbnail.size if thumbnail is not None else 0)
+                for media, thumbnail in downloaded_items
+            ),
+            elapsed_ms=elapsed_ms(download_started_at),
+            success=True,
+        )
 
         extra_files: list[BinaryIO] = []
         try:
+            preparation_started_at = perf_counter()
             preparation_outcomes = await asyncio.gather(
                 *[
                     self._prepare_instagram_item(
@@ -543,7 +660,30 @@ class TelegramDeliveryService:
                     prepared.append(preparation_outcome[0])
                     extra_files.extend(preparation_outcome[1])
             if preparation_failure is not None:
+                log_event(
+                    logger,
+                    "telegram.album_preparation.failed",
+                    level=logging.WARNING,
+                    message="Instagram carousel preparation failed",
+                    platform="instagram",
+                    delivery=request.delivery,
+                    item_count=len(extraction.media),
+                    elapsed_ms=elapsed_ms(preparation_started_at),
+                    error_type=type(preparation_failure).__name__,
+                    success=False,
+                )
                 raise preparation_failure
+            log_event(
+                logger,
+                "telegram.album_preparation.completed",
+                message="Instagram carousel preparation completed",
+                platform="instagram",
+                delivery=request.delivery,
+                item_count=len(prepared),
+                conversion_count=len(extra_files),
+                elapsed_ms=elapsed_ms(preparation_started_at),
+                success=True,
+            )
 
             item_fields = set(_ALBUM_CAPTION_FIELDS)
             if document:
@@ -570,7 +710,8 @@ class TelegramDeliveryService:
             )
 
             calls: list[TelegramCallResponse] = []
-            for batch_index, batch in enumerate(_album_batches(prepared)):
+            batches = _album_batches(prepared)
+            for batch_index, batch in enumerate(batches):
                 batch_fields = dict(fields)
                 if batch_index > 0:
                     batch_fields.pop("reply_parameters", None)
@@ -622,8 +763,23 @@ class TelegramDeliveryService:
                         )
                     media_payload.append(media_item)
                 batch_fields["media"] = media_payload
+                batch_started_at = perf_counter()
                 response = await self._client.call("sendMediaGroup", batch_fields, uploads)
                 calls.append(response)
+                log_event(
+                    logger,
+                    "telegram.album_batch.completed",
+                    level=logging.INFO if response.ok else logging.WARNING,
+                    message="Instagram Telegram album batch completed",
+                    platform="instagram",
+                    delivery=request.delivery,
+                    batch_index=batch_index + 1,
+                    batch_count=len(batches),
+                    item_count=len(batch),
+                    status_code=response.status_code,
+                    elapsed_ms=elapsed_ms(batch_started_at),
+                    success=response.ok,
+                )
                 if not response.ok:
                     break
             return TelegramDeliveryOutcome(calls)
@@ -662,15 +818,40 @@ class TelegramDeliveryService:
         self, request: TikTokTelegramDeliveryRequest, extraction: TikTokExtractionResponse
     ) -> TelegramDeliveryOutcome:
         fields = self._fields(request.telegram, _MEDIA_GROUP_FIELDS)
+        download_started_at = perf_counter()
         tasks = [asyncio.create_task(self._download(item)) for item in extraction.media]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         downloaded = [item for item in results if isinstance(item, DownloadedAsset)]
         failures = [item for item in results if isinstance(item, BaseException)]
         if failures:
             _close_files([item.file for item in downloaded])
+            log_event(
+                logger,
+                "telegram.album_downloads.failed",
+                level=logging.WARNING,
+                message="TikTok slideshow downloads failed",
+                platform="tiktok",
+                delivery=request.delivery,
+                item_count=len(extraction.media),
+                elapsed_ms=elapsed_ms(download_started_at),
+                error_type=type(failures[0]).__name__,
+                success=False,
+            )
             raise failures[0]
+        log_event(
+            logger,
+            "telegram.album_downloads.completed",
+            message="TikTok slideshow downloads completed",
+            platform="tiktok",
+            delivery=request.delivery,
+            item_count=len(downloaded),
+            output_bytes=sum(item.size for item in downloaded),
+            elapsed_ms=elapsed_ms(download_started_at),
+            success=True,
+        )
         converted_files: list[BinaryIO] = []
         try:
+            preparation_started_at = perf_counter()
             prepared_outcomes = await asyncio.gather(
                 *[
                     self._prepare_slideshow_item(
@@ -692,8 +873,31 @@ class TelegramDeliveryService:
                     if outcome[1] is not None:
                         converted_files.append(outcome[1])
             if preparation_failure is not None:
+                log_event(
+                    logger,
+                    "telegram.album_preparation.failed",
+                    level=logging.WARNING,
+                    message="TikTok slideshow preparation failed",
+                    platform="tiktok",
+                    delivery=request.delivery,
+                    item_count=len(extraction.media),
+                    elapsed_ms=elapsed_ms(preparation_started_at),
+                    error_type=type(preparation_failure).__name__,
+                    success=False,
+                )
                 raise preparation_failure
             prepared = [item[0] for item in prepared_results]
+            log_event(
+                logger,
+                "telegram.album_preparation.completed",
+                message="TikTok slideshow preparation completed",
+                platform="tiktok",
+                delivery=request.delivery,
+                item_count=len(prepared),
+                conversion_count=len(converted_files),
+                elapsed_ms=elapsed_ms(preparation_started_at),
+                success=True,
+            )
             if len(prepared) == 1:
                 item = prepared[0]
                 if request.delivery == "document":
@@ -716,7 +920,8 @@ class TelegramDeliveryService:
                 return TelegramDeliveryOutcome([response])
 
             calls: list[TelegramCallResponse] = []
-            for batch_index, batch in enumerate(_album_batches(prepared)):
+            batches = _album_batches(prepared)
+            for batch_index, batch in enumerate(batches):
                 batch_fields = dict(fields)
                 if batch_index > 0:
                     batch_fields.pop("reply_parameters", None)
@@ -735,8 +940,23 @@ class TelegramDeliveryService:
                         TelegramUpload(attach_name, item.file, item.filename, item.content_type)
                     )
                 batch_fields["media"] = media
+                batch_started_at = perf_counter()
                 response = await self._client.call("sendMediaGroup", batch_fields, uploads)
                 calls.append(response)
+                log_event(
+                    logger,
+                    "telegram.album_batch.completed",
+                    level=logging.INFO if response.ok else logging.WARNING,
+                    message="TikTok Telegram album batch completed",
+                    platform="tiktok",
+                    delivery=request.delivery,
+                    batch_index=batch_index + 1,
+                    batch_count=len(batches),
+                    item_count=len(batch),
+                    status_code=response.status_code,
+                    elapsed_ms=elapsed_ms(batch_started_at),
+                    success=response.ok,
+                )
                 if not response.ok:
                     break
             return TelegramDeliveryOutcome(calls)

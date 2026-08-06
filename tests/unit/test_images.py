@@ -10,6 +10,7 @@ from pillow_heif import from_pillow
 from tt_scrap.media.images import (
     ImagePreparationService,
     detect_image_format,
+    image_worker_count,
     is_native_telegram_photo,
 )
 
@@ -35,6 +36,21 @@ def test_detects_supported_and_conversion_formats() -> None:
     assert is_native_telegram_photo(b"\xff\xd8\xffpayload")
     assert not is_native_telegram_photo(b"\x00\x00\x00\x18ftypheicpayload")
     assert not is_native_telegram_photo(b"RIFFxxxxWEBPVP8X\x00\x00\x00\x00\x02animated")
+
+
+@pytest.mark.parametrize(
+    ("configured_workers", "available_cpus", "expected"),
+    [
+        (0, 8, 7),
+        (0, 1, 1),
+        (4, 8, 4),
+        (16, 8, 7),
+    ],
+)
+def test_image_worker_count_reserves_one_cpu(
+    configured_workers: int, available_cpus: int, expected: int
+) -> None:
+    assert image_worker_count(configured_workers, available_cpus) == expected
 
 
 @pytest.mark.asyncio

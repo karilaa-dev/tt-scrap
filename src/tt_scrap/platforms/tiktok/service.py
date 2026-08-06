@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from time import perf_counter
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -16,6 +18,7 @@ from ...assets import AssetFactory
 from ...cache import CacheStore
 from ...config import Settings
 from ...errors import ContentTooLongError, ExtractionError, ExtractionExpiredError
+from ...logging import elapsed_ms, log_event
 from ...models import (
     AssetDescriptor,
     AssetFetchContext,
@@ -26,6 +29,8 @@ from ...models import (
 )
 from ...proxy import ProxyManager, ProxySession
 from .adapter import TikTokAdapter, YtdlpContext, validate_tiktok_url
+
+logger = logging.getLogger(__name__)
 
 
 def _first(value: Any) -> str | None:
@@ -310,6 +315,32 @@ class TikTokService:
     def _expires_at(self) -> datetime:
         return datetime.now(UTC) + timedelta(seconds=self.settings.cache_ttl_seconds)
 
+    @staticmethod
+    def _log_extraction(
+        response: TikTokExtractionResponse,
+        started_at: float,
+        *,
+        cache_hit: bool,
+        cache_scope: str | None = None,
+    ) -> None:
+        log_event(
+            logger,
+            "tiktok.extraction.completed",
+            message=(
+                "TikTok extraction served from cache"
+                if cache_hit
+                else "TikTok extraction completed"
+            ),
+            platform="tiktok",
+            source_id=response.source_id,
+            cache_hit=cache_hit,
+            cache_scope=cache_scope,
+            media_count=len(response.media),
+            media_type=response.content_type,
+            elapsed_ms=elapsed_ms(started_at),
+            success=True,
+        )
+
     async def _asset(
         self,
         *,
@@ -353,18 +384,26 @@ class TikTokService:
     async def extract_url(
         self, source_url: str, *, refresh: bool = False
     ) -> TikTokExtractionResponse:
+        started_at = perf_counter()
         source_url = source_url.strip()
         validate_tiktok_url(source_url)
         url_cache_key = self.cache.metadata_key("tiktok-url", source_url)
         if not refresh:
             cached = await self.cache.get_model(url_cache_key, TikTokExtractionResponse)
             if cached:
+                self._log_extraction(cached, started_at, cache_hit=True, cache_scope="url")
                 return cached
 
         async with self._key_lock(url_cache_key):
             if not refresh:
                 cached = await self.cache.get_model(url_cache_key, TikTokExtractionResponse)
                 if cached:
+                    self._log_extraction(
+                        cached,
+                        started_at,
+                        cache_hit=True,
+                        cache_scope="url_coalesced",
+                    )
                     return cached
 
             proxy_session = ProxySession(self.proxy_manager)
@@ -384,6 +423,12 @@ class TikTokService:
                         response,
                         ttl_seconds=remaining_ttl,
                     )
+                    self._log_extraction(
+                        response,
+                        started_at,
+                        cache_hit=True,
+                        cache_scope="video_id",
+                    )
                     return response
 
             async with self._key_lock(video_cache_key):
@@ -399,6 +444,12 @@ class TikTokService:
                             url_cache_key,
                             response,
                             ttl_seconds=remaining_ttl,
+                        )
+                        self._log_extraction(
+                            response,
+                            started_at,
+                            cache_hit=True,
+                            cache_scope="video_id_coalesced",
                         )
                         return response
 
@@ -418,21 +469,59 @@ class TikTokService:
                     response,
                     ttl_seconds=ttl,
                 )
+                self._log_extraction(response, started_at, cache_hit=False)
                 return response
 
     async def get_extraction(self, extraction_id: str) -> TikTokExtractionResponse:
+        started_at = perf_counter()
         cached = await self.cache.get_model(
             self.cache.metadata_key("tiktok-extraction", extraction_id),
             TikTokExtractionResponse,
         )
         if cached is None:
+            log_event(
+                logger,
+                "tiktok.extraction_cache.lookup",
+                level=logging.WARNING,
+                message="TikTok extraction cache lookup missed",
+                platform="tiktok",
+                cache_hit=False,
+                cache_scope="extraction_id",
+                elapsed_ms=elapsed_ms(started_at),
+                success=False,
+            )
             raise ExtractionExpiredError("TikTok extraction was not found or has expired")
+        log_event(
+            logger,
+            "tiktok.extraction_cache.lookup",
+            message="TikTok extraction cache lookup completed",
+            platform="tiktok",
+            source_id=cached.source_id,
+            cache_hit=True,
+            cache_scope="extraction_id",
+            media_count=len(cached.media),
+            elapsed_ms=elapsed_ms(started_at),
+            success=True,
+        )
         return cached
 
     async def get_cached_video(self, video_id: int | str) -> TikTokExtractionResponse | None:
-        return await self.cache.get_model(
+        started_at = perf_counter()
+        cached = await self.cache.get_model(
             self.cache.metadata_key("tiktok", str(video_id)), TikTokExtractionResponse
         )
+        log_event(
+            logger,
+            "tiktok.video_cache.lookup",
+            message="TikTok video cache lookup completed",
+            platform="tiktok",
+            source_id=str(video_id),
+            cache_hit=cached is not None,
+            cache_scope="video_id",
+            elapsed_ms=elapsed_ms(started_at),
+            success=True,
+        )
+        return cached
 
     async def _build_video_response(
         self,
@@ -480,6 +569,7 @@ class TikTokService:
             content_type: Literal["video", "slideshow"] = "slideshow"
         else:
             video = data.get("video") or {}
+            selection_started_at = perf_counter()
             video_source = select_video_source(video)
             if not video_source:
                 raise ExtractionError("TikTok response has no video asset")
@@ -492,6 +582,18 @@ class TikTokService:
                 raise ContentTooLongError("TikTok video exceeds MAX_VIDEO_DURATION")
             width = video_source.width
             height = video_source.height
+            log_event(
+                logger,
+                "tiktok.video_selection.completed",
+                message="TikTok video quality selection completed",
+                platform="tiktok",
+                source_id=video_id,
+                width=width,
+                height=height,
+                uses_separate_audio=video_source.audio_url is not None,
+                elapsed_ms=elapsed_ms(selection_started_at),
+                success=True,
+            )
             media.append(
                 await self._asset(
                     url=video_source.url,
@@ -583,16 +685,39 @@ class TikTokService:
         )
 
     async def extract_music(self, video_id: int, *, refresh: bool = False) -> TikTokMusicResponse:
+        started_at = perf_counter()
         identity = str(video_id)
         cache_key = self.cache.metadata_key("tiktok-music", identity)
         if not refresh:
             cached = await self.cache.get_model(cache_key, TikTokMusicResponse)
             if cached:
+                log_event(
+                    logger,
+                    "tiktok.music_extraction.completed",
+                    message="TikTok music extraction served from cache",
+                    platform="tiktok",
+                    source_id=identity,
+                    cache_hit=True,
+                    cache_scope="video_id",
+                    elapsed_ms=elapsed_ms(started_at),
+                    success=True,
+                )
                 return cached
         async with self._key_lock(cache_key):
             if not refresh:
                 cached = await self.cache.get_model(cache_key, TikTokMusicResponse)
                 if cached:
+                    log_event(
+                        logger,
+                        "tiktok.music_extraction.completed",
+                        message="TikTok music extraction served from coalesced cache",
+                        platform="tiktok",
+                        source_id=identity,
+                        cache_hit=True,
+                        cache_scope="video_id_coalesced",
+                        elapsed_ms=elapsed_ms(started_at),
+                        success=True,
+                    )
                     return cached
             proxy_session = ProxySession(self.proxy_manager)
             url = f"https://www.tiktok.com/@_/video/{video_id}"
@@ -643,6 +768,16 @@ class TikTokService:
                 cache_key,
                 response,
                 ttl_seconds=self.settings.tiktok_info_cache_ttl_seconds,
+            )
+            log_event(
+                logger,
+                "tiktok.music_extraction.completed",
+                message="TikTok music extraction completed",
+                platform="tiktok",
+                source_id=identity,
+                cache_hit=False,
+                elapsed_ms=elapsed_ms(started_at),
+                success=True,
             )
             return response
 

@@ -8,6 +8,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -25,7 +26,8 @@ from ...errors import (
     RegionBlockedError,
     ScraperError,
 )
-from ...proxy import ProxyManager, ProxySession, strip_proxy_auth
+from ...logging import elapsed_ms, log_event
+from ...proxy import ProxyManager, ProxySession
 
 logger = logging.getLogger(__name__)
 
@@ -103,12 +105,23 @@ class TikTokAdapter:
                 logger.warning("Configured yt-dlp cookie file does not exist")
 
     async def resolve_url(self, url: str, proxy_session: ProxySession) -> str:
+        started_at = perf_counter()
         validate_tiktok_url(url)
         short = any(part in url for part in ("vm.tiktok.com", "vt.tiktok.com", "/t/"))
         if not short:
+            log_event(
+                logger,
+                "tiktok.url_resolution.completed",
+                message="TikTok URL did not require redirect resolution",
+                platform="tiktok",
+                fast_path=True,
+                elapsed_ms=elapsed_ms(started_at),
+                success=True,
+            )
             return url
         last_error: Exception | None = None
         for attempt in range(1, self.settings.url_resolve_max_retries + 1):
+            attempt_started_at = perf_counter()
             choice = proxy_session.get()
             try:
                 if choice.url:
@@ -121,17 +134,36 @@ class TikTokAdapter:
                         resolved = await self._follow_tiktok_redirects(client, url)
                 else:
                     resolved = await self._follow_tiktok_redirects(self._http, url)
+                log_event(
+                    logger,
+                    "tiktok.url_resolution.completed",
+                    message="TikTok short URL resolution completed",
+                    platform="tiktok",
+                    fast_path=False,
+                    attempt=attempt,
+                    proxy_used=choice.url is not None,
+                    elapsed_ms=elapsed_ms(started_at),
+                    success=True,
+                )
                 return resolved
             except (httpx.HTTPError, InvalidLinkError) as exc:
                 last_error = exc
-                if attempt < self.settings.url_resolve_max_retries:
+                retrying = attempt < self.settings.url_resolve_max_retries
+                log_event(
+                    logger,
+                    "tiktok.url_resolution.failed",
+                    level=logging.WARNING,
+                    message="TikTok short URL resolution failed",
+                    platform="tiktok",
+                    attempt=attempt,
+                    proxy_used=choice.url is not None,
+                    elapsed_ms=elapsed_ms(attempt_started_at),
+                    error_type=type(exc).__name__,
+                    retrying=retrying,
+                    success=False,
+                )
+                if retrying:
                     proxy_session.rotate()
-                    logger.warning(
-                        "TikTok URL resolution attempt %d/%d failed via %s",
-                        attempt,
-                        self.settings.url_resolve_max_retries,
-                        strip_proxy_auth(choice.url),
-                    )
         raise InvalidLinkError("Invalid or expired TikTok link") from last_error
 
     @staticmethod
@@ -214,10 +246,13 @@ class TikTokAdapter:
     async def extract(
         self, url: str, video_id: str, proxy_session: ProxySession
     ) -> tuple[dict[str, Any], YtdlpContext]:
+        started_at = perf_counter()
         async with self._semaphore:
+            queue_wait = elapsed_ms(started_at)
             last_status: str | None = None
             last_error: Exception | None = None
             for attempt in range(1, self.settings.video_info_max_retries + 1):
+                attempt_started_at = perf_counter()
                 choice = proxy_session.get()
                 context: YtdlpContext | None = None
                 try:
@@ -238,26 +273,66 @@ class TikTokAdapter:
                     if status == "region":
                         raise RegionBlockedError("TikTok content is region blocked")
                     if data is not None and context is not None and status in (None, "ok", 0):
+                        log_event(
+                            logger,
+                            "tiktok.metadata.completed",
+                            message="TikTok metadata extraction completed",
+                            platform="tiktok",
+                            source_id=video_id,
+                            attempt=attempt,
+                            proxy_used=choice.url is not None,
+                            queue_wait_ms=queue_wait,
+                            elapsed_ms=elapsed_ms(started_at),
+                            success=True,
+                        )
                         return data, context
                     if context:
                         context.close()
                     last_error = ExtractionError(f"TikTok extraction status: {status}")
-                except (ContentDeletedError, ContentPrivateError, RegionBlockedError):
+                except (
+                    ContentDeletedError,
+                    ContentPrivateError,
+                    RegionBlockedError,
+                ) as exc:
                     if context:
                         context.close()
+                    log_event(
+                        logger,
+                        "tiktok.metadata.failed",
+                        level=logging.WARNING,
+                        message="TikTok metadata extraction returned a permanent content error",
+                        platform="tiktok",
+                        source_id=video_id,
+                        attempt=attempt,
+                        proxy_used=choice.url is not None,
+                        queue_wait_ms=queue_wait,
+                        elapsed_ms=elapsed_ms(started_at),
+                        error_type=type(exc).__name__,
+                        retrying=False,
+                        success=False,
+                    )
                     raise
                 except Exception as exc:
                     if context:
                         context.close()
                     last_error = exc
-                if attempt < self.settings.video_info_max_retries:
+                retrying = attempt < self.settings.video_info_max_retries
+                log_event(
+                    logger,
+                    "tiktok.metadata.failed",
+                    level=logging.WARNING,
+                    message="TikTok metadata extraction attempt failed",
+                    platform="tiktok",
+                    source_id=video_id,
+                    attempt=attempt,
+                    proxy_used=choice.url is not None,
+                    elapsed_ms=elapsed_ms(attempt_started_at),
+                    error_type=type(last_error).__name__,
+                    retrying=retrying,
+                    success=False,
+                )
+                if retrying:
                     proxy_session.rotate()
-                    logger.warning(
-                        "TikTok metadata attempt %d/%d failed via %s",
-                        attempt,
-                        self.settings.video_info_max_retries,
-                        strip_proxy_auth(choice.url),
-                    )
             if last_status == "rate_limit":
                 raise RateLimitError("TikTok rate limit exceeded") from last_error
             if isinstance(last_error, ScraperError):

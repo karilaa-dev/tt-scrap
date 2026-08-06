@@ -11,6 +11,7 @@ import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from time import perf_counter
 from typing import BinaryIO, cast
 
 import httpx
@@ -20,8 +21,9 @@ from curl_cffi.requests.models import Response as CurlResponse
 
 from ..config import Settings
 from ..errors import AssetTooLargeError, NetworkError, UpstreamTimeoutError
+from ..logging import elapsed_ms, log_event
 from ..models import AssetFetchContext
-from ..proxy import ProxyChoice, ProxyManager, strip_proxy_auth
+from ..proxy import ProxyChoice, ProxyManager
 
 logger = logging.getLogger(__name__)
 # A CDN 404 can mean a stale signed variant or a region-specific edge miss even
@@ -166,10 +168,44 @@ class AssetDownloader:
     async def download(
         self, context: AssetFetchContext, *, compute_sha256: bool = True
     ) -> DownloadedAsset:
-        async with self._semaphore, self._group_limit(context.extraction_id):
-            if context.audio:
-                return await self._download_and_remux(context, compute_sha256=compute_sha256)
-            return await self._download_single(context, compute_sha256=compute_sha256)
+        started_at = perf_counter()
+        try:
+            async with self._semaphore, self._group_limit(context.extraction_id):
+                queue_wait = elapsed_ms(started_at)
+                if context.audio:
+                    result = await self._download_and_remux(context, compute_sha256=compute_sha256)
+                else:
+                    result = await self._download_single(context, compute_sha256=compute_sha256)
+        except Exception as exc:
+            log_event(
+                logger,
+                "media.asset.failed",
+                level=logging.WARNING,
+                message="Media asset preparation failed",
+                platform=context.platform,
+                media_type=context.kind,
+                uses_separate_audio=context.audio is not None,
+                compute_sha256=compute_sha256,
+                elapsed_ms=elapsed_ms(started_at),
+                error_type=type(exc).__name__,
+                success=False,
+            )
+            raise
+        log_event(
+            logger,
+            "media.asset.completed",
+            message="Media asset prepared",
+            platform=context.platform,
+            media_type=context.kind,
+            uses_separate_audio=context.audio is not None,
+            compute_sha256=compute_sha256,
+            queue_wait_ms=queue_wait,
+            output_bytes=result.size,
+            content_type=result.content_type,
+            elapsed_ms=elapsed_ms(started_at),
+            success=True,
+        )
+        return result
 
     async def _download_single(
         self, context: AssetFetchContext, *, compute_sha256: bool = True
@@ -178,6 +214,7 @@ class AssetDownloader:
         last_error: Exception | None = None
         upstream_urls = [context.upstream_url, *context.alternate_upstream_urls]
         for attempt in range(1, self.settings.download_max_retries + 1):
+            attempt_started_at = perf_counter()
             spool = tempfile.SpooledTemporaryFile(
                 max_size=self.settings.spool_threshold_bytes, mode="w+b"
             )
@@ -197,13 +234,28 @@ class AssetDownloader:
                         f"Truncated asset: expected {expected_length} bytes, got {size}"
                     )
                 spool.seek(0)
-                return DownloadedAsset(
+                content_type = detect_content_type(prefix, declared)
+                result = DownloadedAsset(
                     file=binary_spool,
                     size=size,
                     sha256=digest,
-                    content_type=detect_content_type(prefix, declared),
+                    content_type=content_type,
                     declared_content_type=declared,
                 )
+                log_event(
+                    logger,
+                    "media.upstream_download.completed",
+                    message="Upstream media download completed",
+                    platform=context.platform,
+                    media_type=context.kind,
+                    attempt=attempt,
+                    proxy_used=proxy.url is not None,
+                    output_bytes=size,
+                    content_type=content_type,
+                    elapsed_ms=elapsed_ms(attempt_started_at),
+                    success=True,
+                )
+                return result
             except AssetTooLargeError:
                 spool.close()
                 raise
@@ -212,11 +264,19 @@ class AssetDownloader:
                 if len(upstream_urls) > 1 and attempt < self.settings.download_max_retries:
                     last_error = exc
                 else:
-                    logger.warning(
-                        "Asset download rejected by upstream on attempt %d/%d: %s",
-                        attempt,
-                        self.settings.download_max_retries,
-                        exc,
+                    log_event(
+                        logger,
+                        "media.upstream_download.failed",
+                        level=logging.WARNING,
+                        message="Upstream rejected the media download",
+                        platform=context.platform,
+                        media_type=context.kind,
+                        attempt=attempt,
+                        proxy_used=proxy.url is not None,
+                        elapsed_ms=elapsed_ms(attempt_started_at),
+                        error_type=type(exc).__name__,
+                        retrying=False,
+                        success=False,
                     )
                     raise
             except (TimeoutError, httpx.TimeoutException) as exc:
@@ -230,15 +290,35 @@ class AssetDownloader:
                     proxy = self.proxy_manager.rotate(proxy)
                 delay = self.settings.download_retry_base_delay * (2 ** (attempt - 1))
                 delay += random.random() * delay * 0.1
-                logger.warning(
-                    "Asset attempt %d/%d failed via %s (%s: %s); retrying",
-                    attempt,
-                    self.settings.download_max_retries,
-                    strip_proxy_auth(proxy.url),
-                    type(last_error).__name__,
-                    last_error,
+                log_event(
+                    logger,
+                    "media.upstream_download.failed",
+                    level=logging.WARNING,
+                    message="Upstream media download failed; retrying",
+                    platform=context.platform,
+                    media_type=context.kind,
+                    attempt=attempt,
+                    proxy_used=proxy.url is not None,
+                    elapsed_ms=elapsed_ms(attempt_started_at),
+                    error_type=type(last_error).__name__,
+                    retrying=True,
+                    success=False,
                 )
                 await asyncio.sleep(delay)
+        log_event(
+            logger,
+            "media.upstream_download.failed",
+            level=logging.WARNING,
+            message="Upstream media download exhausted its attempts",
+            platform=context.platform,
+            media_type=context.kind,
+            attempt=self.settings.download_max_retries,
+            proxy_used=proxy.url is not None,
+            elapsed_ms=elapsed_ms(attempt_started_at),
+            error_type=type(last_error).__name__,
+            retrying=False,
+            success=False,
+        )
         if isinstance(last_error, (TimeoutError, httpx.TimeoutException)):
             raise UpstreamTimeoutError("Asset download timed out") from last_error
         raise NetworkError(
@@ -268,25 +348,70 @@ class AssetDownloader:
             asyncio.create_task(self._download_single(video_context, compute_sha256=False)),
             asyncio.create_task(self._download_single(audio_context, compute_sha256=False)),
         ]
+        download_started_at = perf_counter()
         try:
             video_asset, audio_asset = await asyncio.gather(*tasks)
-        except BaseException:
+        except BaseException as exc:
             for task in tasks:
                 task.cancel()
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for result in results:
                 if isinstance(result, DownloadedAsset):
                     result.file.close()
+            if isinstance(exc, Exception):
+                log_event(
+                    logger,
+                    "media.separate_tracks.failed",
+                    level=logging.WARNING,
+                    message="Separate video and audio track downloads failed",
+                    platform=context.platform,
+                    elapsed_ms=elapsed_ms(download_started_at),
+                    error_type=type(exc).__name__,
+                    success=False,
+                )
             raise
+        log_event(
+            logger,
+            "media.separate_tracks.completed",
+            message="Separate video and audio tracks downloaded",
+            platform=context.platform,
+            output_bytes=video_asset.size + audio_asset.size,
+            elapsed_ms=elapsed_ms(download_started_at),
+            success=True,
+        )
         try:
             if (
                 self.settings.max_asset_bytes
                 and video_asset.size + audio_asset.size > self.settings.max_asset_bytes
             ):
                 raise AssetTooLargeError("Remuxed asset exceeds MAX_ASSET_BYTES")
-            return await self._remux_copy(
-                video_asset.file, audio_asset.file, compute_sha256=compute_sha256
+            remux_started_at = perf_counter()
+            try:
+                result = await self._remux_copy(
+                    video_asset.file, audio_asset.file, compute_sha256=compute_sha256
+                )
+            except Exception as exc:
+                log_event(
+                    logger,
+                    "media.remux.failed",
+                    level=logging.WARNING,
+                    message="FFmpeg stream-copy remux failed",
+                    platform=context.platform,
+                    elapsed_ms=elapsed_ms(remux_started_at),
+                    error_type=type(exc).__name__,
+                    success=False,
+                )
+                raise
+            log_event(
+                logger,
+                "media.remux.completed",
+                message="FFmpeg stream-copy remux completed",
+                platform=context.platform,
+                output_bytes=result.size,
+                elapsed_ms=elapsed_ms(remux_started_at),
+                success=True,
             )
+            return result
         finally:
             video_asset.file.close()
             audio_asset.file.close()
@@ -294,7 +419,15 @@ class AssetDownloader:
     async def _remux_copy(
         self, video: BinaryIO, audio: BinaryIO, *, compute_sha256: bool = True
     ) -> DownloadedAsset:
+        queue_started_at = perf_counter()
         async with self._remux_semaphore:
+            log_event(
+                logger,
+                "media.remux.queue_acquired",
+                message="FFmpeg remux worker acquired",
+                queue_wait_ms=elapsed_ms(queue_started_at),
+                success=True,
+            )
             output = tempfile.SpooledTemporaryFile(
                 max_size=self.settings.spool_threshold_bytes, mode="w+b"
             )

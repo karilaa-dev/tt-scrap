@@ -48,6 +48,7 @@ are:
 | Variable | Purpose |
 | --- | --- |
 | `TT_SCRAP_API_KEY` | Bearer token required by every `/v1/` endpoint |
+| `LOG_LEVEL` | JSON log verbosity; timing events are emitted at `INFO` |
 | `RAPIDAPI_KEY` | Instagram RapidAPI credential |
 | `YTDLP_COOKIES` | Optional Netscape cookie file for restricted TikToks |
 | `PROXY_FILE` | Optional file containing one proxy URL per line |
@@ -55,13 +56,17 @@ are:
 | `CACHE_TTL_SECONDS` | Lifetime of asset contexts and tokens; default 600 seconds |
 | `TIKTOK_INFO_CACHE_TTL_SECONDS` | Absolute lifetime of extraction metadata; default 60 seconds |
 | `CACHE_MAX_ENTRIES` | Maximum in-memory cache entries; default 10,000 |
-| `IMAGE_CONVERSION_WORKERS` | Persistent image-conversion processes; default 4, capped by CPU count |
+| `IMAGE_CONVERSION_WORKERS` | Image process cap; default 0 uses available CPU cores minus one |
 | `TELEGRAM_BOT_TOKEN` | Bot credential; an empty value disables direct delivery |
 | `TELEGRAM_API_BASE_URL` | Telegram Bot API base URL, including custom/local servers |
-| `TELEGRAM_UPLOAD_CONCURRENCY` | Maximum concurrent delivery pipelines; default 16 |
+| `TELEGRAM_UPLOAD_CONCURRENCY` | Maximum concurrent delivery pipelines; default 20 |
 | `TELEGRAM_UPLOAD_TIMEOUT_SECONDS` | Per Telegram upload timeout; default 600 seconds |
 | `MAX_VIDEO_DURATION` | Maximum duration in seconds; zero disables it |
 | `MAX_ASSET_BYTES` | Maximum downloaded size; zero disables it |
+
+`IMAGE_CONVERSION_WORKERS=0` is automatic: the service uses the logical CPUs
+available to its process minus one, with a minimum of one worker. A positive value
+sets a lower operator cap but cannot exceed that CPU-derived limit.
 
 The cache is bounded and exists only in the API process. It stores normalized
 metadata and upstream fetch context, never media bytes or request history. TikTok
@@ -226,6 +231,34 @@ Errors use a stable envelope:
   }
 }
 ```
+
+## Diagnostics and timing
+
+Every HTTP response includes `X-Request-ID` and a standard `Server-Timing` header,
+for example `Server-Timing: app;dur=1842.317`. The duration measures server work up
+to response streaming; it does not measure how long the caller takes to receive a
+streamed asset.
+
+At `LOG_LEVEL=INFO`, the service writes one JSON `http.request.completed` event for
+every request and correlated stage events for cache lookups, URL resolution,
+metadata APIs, upstream media downloads, image validation/conversion, separate-track
+downloads, FFmpeg stream-copy remuxing, album preparation, each Telegram API upload,
+and total Telegram delivery. Durations use `elapsed_ms`; bounded pools also report
+`queue_wait_ms`. Transfer events report byte counts without logging media URLs,
+credentials, cookies, captions, chat IDs, or request bodies.
+
+Use the response's request ID to inspect one complete operation:
+
+```bash
+docker compose logs --no-log-prefix tt-scrap \
+  | jq 'select(.request_id == "PASTE-X-REQUEST-ID")
+        | {event, elapsed_ms, queue_wait_ms, status_code, output_bytes}'
+```
+
+The largest `elapsed_ms` stage normally identifies the bottleneck. A large
+`queue_wait_ms` instead indicates that a configured concurrency pool is saturated.
+Telegram failures include its safe error code, description, and `retry_after` value
+when provided, but never log the bot-token URL or Telegram success payload.
 
 ## Retries and proxies
 

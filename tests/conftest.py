@@ -18,4 +18,5 @@ def settings() -> Settings:
         extraction_concurrency=2,
         download_concurrency=2,
         http_max_connections=4,
+        image_conversion_workers=1,
     )

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from datetime import UTC, datetime, timedelta
+from time import perf_counter
 from typing import Any, Literal
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -22,6 +24,7 @@ from ...errors import (
     NetworkError,
     RateLimitError,
 )
+from ...logging import elapsed_ms, log_event
 from ...models import (
     AssetFetchContext,
     InstagramExtractionResponse,
@@ -30,6 +33,8 @@ from ...models import (
 
 _PATH_RE = re.compile(r"^/(?:p|reels?|tv|stories)/[\w-]+", re.IGNORECASE)
 _RAPIDAPI_HOST = "instagram-downloader-download-instagram-stories-videos4.p.rapidapi.com"
+
+logger = logging.getLogger(__name__)
 
 
 def validate_instagram_url(url: str) -> None:
@@ -83,6 +88,8 @@ class InstagramService:
         last_status: int | None = None
         async with self._semaphore:
             for attempt in range(1, self.settings.instagram_max_attempts + 1):
+                attempt_started_at = perf_counter()
+                attempt_status: int | None = None
                 try:
                     response = await self._http.get(
                         f"https://{_RAPIDAPI_HOST}/convert",
@@ -93,6 +100,7 @@ class InstagramService:
                         },
                     )
                     last_status = response.status_code
+                    attempt_status = response.status_code
                     if response.status_code == 404:
                         raise ContentDeletedError("Instagram post was not found or is private")
                     if response.status_code == 429:
@@ -104,11 +112,58 @@ class InstagramService:
                     payload = response.json()
                     if not isinstance(payload, dict):
                         raise ExtractionError("Instagram API returned an invalid payload")
+                    log_event(
+                        logger,
+                        "instagram.upstream.completed",
+                        message="Instagram metadata request completed",
+                        attempt=attempt,
+                        status_code=response.status_code,
+                        elapsed_ms=elapsed_ms(attempt_started_at),
+                        success=True,
+                    )
                     return payload
-                except ContentDeletedError:
+                except ContentDeletedError as exc:
+                    log_event(
+                        logger,
+                        "instagram.upstream.failed",
+                        level=logging.WARNING,
+                        message="Instagram content was not available",
+                        attempt=attempt,
+                        status_code=attempt_status,
+                        elapsed_ms=elapsed_ms(attempt_started_at),
+                        error_type=type(exc).__name__,
+                        retrying=False,
+                        success=False,
+                    )
+                    raise
+                except ExtractionError as exc:
+                    log_event(
+                        logger,
+                        "instagram.upstream.failed",
+                        level=logging.WARNING,
+                        message="Instagram API returned an invalid payload",
+                        attempt=attempt,
+                        status_code=attempt_status,
+                        elapsed_ms=elapsed_ms(attempt_started_at),
+                        error_type=type(exc).__name__,
+                        retrying=False,
+                        success=False,
+                    )
                     raise
                 except (RateLimitError, NetworkError, httpx.HTTPError, ValueError) as exc:
                     last_error = exc
+                    log_event(
+                        logger,
+                        "instagram.upstream.failed",
+                        level=logging.WARNING,
+                        message="Instagram metadata request failed",
+                        attempt=attempt,
+                        status_code=attempt_status,
+                        elapsed_ms=elapsed_ms(attempt_started_at),
+                        error_type=type(exc).__name__,
+                        retrying=attempt < self.settings.instagram_max_attempts,
+                        success=False,
+                    )
                 if attempt < self.settings.instagram_max_attempts:
                     await asyncio.sleep(self.settings.instagram_retry_delay_seconds)
         if last_status == 429:
@@ -118,13 +173,27 @@ class InstagramService:
     async def extract_url(
         self, source_url: str, *, refresh: bool = False
     ) -> InstagramExtractionResponse:
+        started_at = perf_counter()
         normalized_url = normalize_instagram_url(source_url)
         media_id = extract_instagram_media_id(normalized_url)
         cache_key = self.cache.metadata_key("instagram", normalized_url)
         if not refresh:
             cached = await self.cache.get_model(cache_key, InstagramExtractionResponse)
             if cached:
-                return cached.model_copy(update={"source_url": source_url})
+                response = cached.model_copy(update={"source_url": source_url})
+                log_event(
+                    logger,
+                    "instagram.extraction.completed",
+                    message="Instagram extraction served from cache",
+                    platform="instagram",
+                    source_id=media_id,
+                    cache_hit=True,
+                    cache_scope="url",
+                    media_count=len(response.media),
+                    elapsed_ms=elapsed_ms(started_at),
+                    success=True,
+                )
+                return response
         payload = await self._rapidapi(normalized_url)
         raw_media = payload.get("media") or []
         if not isinstance(raw_media, list) or not raw_media:
@@ -198,15 +267,49 @@ class InstagramService:
             self.cache.metadata_key("instagram-extraction", extraction_id),
             response,
         )
+        log_event(
+            logger,
+            "instagram.extraction.completed",
+            message="Instagram extraction completed",
+            platform="instagram",
+            source_id=media_id,
+            cache_hit=False,
+            media_count=len(response.media),
+            elapsed_ms=elapsed_ms(started_at),
+            success=True,
+        )
         return response
 
     async def get_extraction(self, extraction_id: str) -> InstagramExtractionResponse:
+        started_at = perf_counter()
         cached = await self.cache.get_model(
             self.cache.metadata_key("instagram-extraction", extraction_id),
             InstagramExtractionResponse,
         )
         if cached is None:
+            log_event(
+                logger,
+                "instagram.extraction_cache.lookup",
+                level=logging.WARNING,
+                message="Instagram extraction cache lookup missed",
+                platform="instagram",
+                cache_hit=False,
+                cache_scope="extraction_id",
+                elapsed_ms=elapsed_ms(started_at),
+                success=False,
+            )
             raise ExtractionExpiredError("Instagram extraction was not found or has expired")
+        log_event(
+            logger,
+            "instagram.extraction_cache.lookup",
+            message="Instagram extraction cache lookup completed",
+            platform="instagram",
+            cache_hit=True,
+            cache_scope="extraction_id",
+            media_count=len(cached.media),
+            elapsed_ms=elapsed_ms(started_at),
+            success=True,
+        )
         return cached
 
     async def close(self) -> None:

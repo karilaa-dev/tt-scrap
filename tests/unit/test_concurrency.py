@@ -8,6 +8,7 @@ from typing import Any, BinaryIO
 
 import pytest
 
+from tt_scrap.config import Settings
 from tt_scrap.media import AssetDownloader
 from tt_scrap.models import AssetFetchContext
 from tt_scrap.platforms.tiktok.adapter import TikTokAdapter
@@ -17,6 +18,11 @@ from tt_scrap.proxy import ProxyManager, ProxySession
 class FakeContext:
     def close(self) -> None:
         return None
+
+
+def test_production_concurrency_defaults() -> None:
+    assert Settings.model_fields["telegram_upload_concurrency"].default == 20
+    assert Settings.model_fields["image_conversion_workers"].default == 0
 
 
 @pytest.mark.asyncio

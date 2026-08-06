@@ -54,9 +54,9 @@ class Settings(BaseSettings):
 
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_api_base_url: str = "https://api.telegram.org"
-    telegram_upload_concurrency: int = Field(default=16, ge=1, le=256)
+    telegram_upload_concurrency: int = Field(default=20, ge=1, le=256)
     telegram_upload_timeout_seconds: float = Field(default=600.0, gt=0, le=3_600)
-    image_conversion_workers: int = Field(default=4, ge=1, le=32)
+    image_conversion_workers: int = Field(default=0, ge=0, le=256)
 
     @field_validator("log_level")
     @classmethod

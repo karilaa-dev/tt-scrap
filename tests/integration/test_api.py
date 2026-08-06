@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 from pathlib import Path
 
 import httpx
@@ -77,6 +78,7 @@ async def test_health_auth_validation_and_asset_delivery(settings) -> None:
             )
 
         assert live.status_code == 200
+        assert live.headers["server-timing"].startswith("app;dur=")
         assert ready.status_code == 200
         assert openapi.status_code == 200
         assert openapi.json() == app.openapi()
@@ -98,14 +100,35 @@ async def test_health_auth_validation_and_asset_delivery(settings) -> None:
 async def test_expired_asset_has_stable_error(settings) -> None:
     app = create_app(settings)
     async with app.router.lifespan_context(app):
+        records: list[logging.LogRecord] = []
+
+        class RecordHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = RecordHandler()
+        app_logger = logging.getLogger("tt_scrap.app")
+        app_logger.addHandler(handler)
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            response = await client.get(
-                "/v1/assets/missing",
-                headers={"Authorization": "Bearer test-api-key-that-is-long-enough"},
-            )
+        try:
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.get(
+                    "/v1/assets/missing-secret-token",
+                    headers={"Authorization": "Bearer test-api-key-that-is-long-enough"},
+                )
+        finally:
+            app_logger.removeHandler(handler)
         assert response.status_code == 404
         assert response.json()["error"]["code"] == "asset_not_found_or_expired"
+        completed = next(
+            record
+            for record in records
+            if getattr(record, "event", None) == "http.request.completed"
+        )
+        assert completed.path == "/v1/assets/{token}"
+        assert completed.status_code == 404
+        assert completed.elapsed_ms >= 0
+        assert "missing-secret-token" not in completed.getMessage()
 
 
 def test_openapi_has_expected_contract(settings) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import math
 import multiprocessing
 import os
@@ -11,6 +12,7 @@ import signal
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from functools import partial
+from time import perf_counter
 from typing import BinaryIO, Literal
 
 from PIL import Image, ImageOps
@@ -18,6 +20,9 @@ from pillow_heif import register_heif_opener
 
 from ..config import Settings
 from ..errors import ImageConversionError
+from ..logging import elapsed_ms, log_event
+
+logger = logging.getLogger(__name__)
 
 ImageFormat = Literal[
     "jpeg",
@@ -254,18 +259,41 @@ def _native_photo_is_compliant_sync(
         file.seek(0)
 
 
+def image_worker_count(configured_workers: int, available_cpus: int | None = None) -> int:
+    """Reserve one available CPU while allowing an explicit lower worker cap."""
+    cpu_count = available_cpus if available_cpus is not None else os.process_cpu_count()
+    cpu_limit = max(1, (cpu_count or 1) - 1)
+    return cpu_limit if configured_workers == 0 else min(configured_workers, cpu_limit)
+
+
 class ImagePreparationService:
     def __init__(self, settings: Settings) -> None:
-        workers = min(settings.image_conversion_workers, os.cpu_count() or 1)
+        workers = image_worker_count(settings.image_conversion_workers)
         self._semaphore = asyncio.Semaphore(workers)
         self._executor = ProcessPoolExecutor(
             max_workers=workers,
             mp_context=multiprocessing.get_context("spawn"),
             initializer=_init_image_worker,
         )
+        log_event(
+            logger,
+            "image.worker_pool.started",
+            message="Image conversion worker pool started",
+            worker_count=workers,
+        )
 
     async def read_file(self, file: BinaryIO) -> bytes:
-        return await asyncio.to_thread(_read_file_sync, file)
+        started_at = perf_counter()
+        data = await asyncio.to_thread(_read_file_sync, file)
+        log_event(
+            logger,
+            "image.file_read.completed",
+            message="Image bytes read for preparation",
+            output_bytes=len(data),
+            elapsed_ms=elapsed_ms(started_at),
+            success=True,
+        )
+        return data
 
     async def native_photo_is_compliant(
         self,
@@ -274,36 +302,118 @@ class ImagePreparationService:
         detected_content_type: str,
         declared_content_type: str | None,
     ) -> bool:
-        return await asyncio.to_thread(
+        started_at = perf_counter()
+        compliant = await asyncio.to_thread(
             _native_photo_is_compliant_sync,
             file,
             size,
             detected_content_type,
             declared_content_type,
         )
+        log_event(
+            logger,
+            "image.native_validation.completed",
+            message="Native Telegram photo validation completed",
+            content_type=detected_content_type,
+            request_bytes=size,
+            compliant=compliant,
+            elapsed_ms=elapsed_ms(started_at),
+            success=True,
+        )
+        return compliant
 
     async def convert_photo(self, data: bytes, filename: str) -> ConvertedImage:
+        started_at = perf_counter()
         async with self._semaphore:
+            queue_wait = elapsed_ms(started_at)
             loop = asyncio.get_running_loop()
             try:
-                return await loop.run_in_executor(
+                result = await loop.run_in_executor(
                     self._executor, partial(_convert_photo_sync, data, filename)
                 )
             except (OSError, RuntimeError, ValueError) as exc:
+                log_event(
+                    logger,
+                    "image.photo_conversion.failed",
+                    level=logging.WARNING,
+                    message="Telegram photo conversion failed",
+                    request_bytes=len(data),
+                    queue_wait_ms=queue_wait,
+                    elapsed_ms=elapsed_ms(started_at),
+                    error_type=type(exc).__name__,
+                    success=False,
+                )
                 raise ImageConversionError("Telegram photo conversion failed") from exc
+        log_event(
+            logger,
+            "image.photo_conversion.completed",
+            message="Telegram photo conversion completed",
+            request_bytes=len(data),
+            output_bytes=len(result.data),
+            width=result.width,
+            height=result.height,
+            content_type=result.content_type,
+            fast_path=False,
+            queue_wait_ms=queue_wait,
+            elapsed_ms=elapsed_ms(started_at),
+            success=True,
+        )
+        return result
 
     async def prepare_thumbnail(self, data: bytes, filename: str) -> ConvertedImage:
+        started_at = perf_counter()
         verified = await asyncio.to_thread(_verified_jpeg_thumbnail, data, filename)
         if verified is not None:
+            log_event(
+                logger,
+                "image.thumbnail_preparation.completed",
+                message="Telegram thumbnail already compliant",
+                request_bytes=len(data),
+                output_bytes=len(verified.data),
+                width=verified.width,
+                height=verified.height,
+                content_type=verified.content_type,
+                fast_path=True,
+                elapsed_ms=elapsed_ms(started_at),
+                success=True,
+            )
             return verified
+        queue_started_at = perf_counter()
         async with self._semaphore:
+            queue_wait = elapsed_ms(queue_started_at)
             loop = asyncio.get_running_loop()
             try:
-                return await loop.run_in_executor(
+                result = await loop.run_in_executor(
                     self._executor, partial(_thumbnail_sync, data, filename)
                 )
             except (OSError, RuntimeError, ValueError) as exc:
+                log_event(
+                    logger,
+                    "image.thumbnail_preparation.failed",
+                    level=logging.WARNING,
+                    message="Telegram thumbnail conversion failed",
+                    request_bytes=len(data),
+                    queue_wait_ms=queue_wait,
+                    elapsed_ms=elapsed_ms(started_at),
+                    error_type=type(exc).__name__,
+                    success=False,
+                )
                 raise ImageConversionError("Telegram thumbnail conversion failed") from exc
+        log_event(
+            logger,
+            "image.thumbnail_preparation.completed",
+            message="Telegram thumbnail conversion completed",
+            request_bytes=len(data),
+            output_bytes=len(result.data),
+            width=result.width,
+            height=result.height,
+            content_type=result.content_type,
+            fast_path=False,
+            queue_wait_ms=queue_wait,
+            elapsed_ms=elapsed_ms(started_at),
+            success=True,
+        )
+        return result
 
     async def close(self) -> None:
         await asyncio.to_thread(self._executor.shutdown, wait=True, cancel_futures=True)

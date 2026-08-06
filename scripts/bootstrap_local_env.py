@@ -33,10 +33,10 @@ def main() -> None:
         "CACHE_TTL_SECONDS": "600",
         "CACHE_MAX_ENTRIES": "10000",
         "TIKTOK_INFO_CACHE_TTL_SECONDS": "60",
-        "IMAGE_CONVERSION_WORKERS": "4",
+        "IMAGE_CONVERSION_WORKERS": "0",
         "TELEGRAM_BOT_TOKEN": existing.get("BOT_TOKEN", ""),
         "TELEGRAM_API_BASE_URL": existing.get("TG_SERVER", "https://api.telegram.org"),
-        "TELEGRAM_UPLOAD_CONCURRENCY": "16",
+        "TELEGRAM_UPLOAD_CONCURRENCY": "20",
         "TELEGRAM_UPLOAD_TIMEOUT_SECONDS": "600",
         "LOG_LEVEL": existing.get("LOG_LEVEL", "INFO"),
     }
