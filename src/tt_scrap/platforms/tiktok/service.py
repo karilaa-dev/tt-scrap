@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import math
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -10,7 +15,7 @@ from uuid import uuid4
 from ...assets import AssetFactory
 from ...cache import CacheStore
 from ...config import Settings
-from ...errors import ContentTooLongError, ExtractionError
+from ...errors import ContentTooLongError, ExtractionError, ExtractionExpiredError
 from ...models import (
     AssetDescriptor,
     AssetFetchContext,
@@ -20,7 +25,7 @@ from ...models import (
     TikTokMusicResponse,
 )
 from ...proxy import ProxyManager, ProxySession
-from .adapter import TikTokAdapter, YtdlpContext
+from .adapter import TikTokAdapter, YtdlpContext, validate_tiktok_url
 
 
 def _first(value: Any) -> str | None:
@@ -39,6 +44,15 @@ class VideoSource:
     height: int | None = None
     audio_url: str | None = None
     alternate_audio_urls: list[str] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _BitrateVideoCandidate:
+    source: VideoSource
+    mvmaf: float | None
+    known_quality: bool
+    quality_type: int
+    bitrate: int
 
 
 def _positive_int(value: Any) -> int | None:
@@ -114,7 +128,64 @@ def _regular_video_source(video: dict[str, Any]) -> VideoSource | None:
     return None
 
 
+def _pixel_area(source: VideoSource | None) -> int:
+    if source is None or source.width is None or source.height is None:
+        return 0
+    return source.width * source.height
+
+
+def _mvmaf_score(raw_bitrate: dict[str, Any], source: VideoSource) -> float | None:
+    """Return TikTok's precomputed original-reference score for this resolution."""
+    payload = raw_bitrate.get("MVMAF")
+    if payload is None:
+        payload = raw_bitrate.get("mvmaf")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if not isinstance(payload, dict):
+        return None
+
+    version = payload.get("v2.0")
+    if not isinstance(version, dict):
+        version = payload
+    scores = version.get("ori")
+    if not isinstance(scores, dict):
+        # Some responses omit the original-reference branch. srv1 remains a
+        # useful precomputed perceptual score and is preferable to bitrate.
+        scores = version.get("srv1")
+    if not isinstance(scores, dict):
+        return None
+
+    parsed_scores: dict[int, float] = {}
+    for raw_target, raw_score in scores.items():
+        target = str(raw_target).lower()
+        if not target.startswith("v"):
+            continue
+        try:
+            target_pixels = int(target[1:])
+            score = float(raw_score)
+        except (TypeError, ValueError):
+            continue
+        if target_pixels > 0 and math.isfinite(score):
+            parsed_scores[target_pixels] = score
+    if not parsed_scores or source.width is None or source.height is None:
+        return None
+
+    short_edge = min(source.width, source.height)
+    closest_target = min(
+        parsed_scores,
+        key=lambda target: (abs(target - short_edge), -target),
+    )
+    return parsed_scores[closest_target]
+
+
 def select_video_source(video: dict[str, Any]) -> VideoSource | None:
+    regular = _regular_video_source(video)
+    audio = _best_audio_source(video)
+    has_separate_audio = bool(video.get("bitrateAudioInfo") or video.get("bit_rate_audio_info"))
+    candidates: list[_BitrateVideoCandidate] = []
     for raw_bitrate in video.get("bitrateInfo", []):
         if not isinstance(raw_bitrate, dict):
             continue
@@ -123,24 +194,69 @@ def select_video_source(video: dict[str, Any]) -> VideoSource | None:
             continue
         gear_name = str(raw_bitrate.get("GearName") or raw_bitrate.get("gear_name") or "").lower()
         url_key = str(address.get("UrlKey") or address.get("url_key") or "").lower()
-        if gear_name != _BEST_VIDEO_GEAR and _BEST_VIDEO_URL_TAG not in url_key:
-            continue
         urls = _address_urls(address)
         if not urls:
-            break
-        audio = _best_audio_source(video)
-        has_separate_audio = bool(video.get("bitrateAudioInfo") or video.get("bit_rate_audio_info"))
-        if has_separate_audio and not audio:
-            break
-        return VideoSource(
+            continue
+        known_muxed = gear_name.startswith("normal_")
+        # An adaptive file accompanied by malformed separate-audio metadata is
+        # not a complete delivery candidate. A normal_* representation is a
+        # known muxed file and remains usable without the separate track.
+        if has_separate_audio and not known_muxed and not audio:
+            continue
+        needs_separate_audio = has_separate_audio and not known_muxed
+        source = VideoSource(
             url=urls[0],
             alternate_urls=urls[1:],
             width=_positive_int(address.get("Width") or address.get("width")),
             height=_positive_int(address.get("Height") or address.get("height")),
-            audio_url=audio[0] if audio else None,
-            alternate_audio_urls=audio[1] if audio else None,
+            audio_url=audio[0] if audio and needs_separate_audio else None,
+            alternate_audio_urls=audio[1] if audio and needs_separate_audio else None,
         )
-    return _regular_video_source(video)
+        candidates.append(
+            _BitrateVideoCandidate(
+                source=source,
+                mvmaf=_mvmaf_score(raw_bitrate, source),
+                known_quality=(gear_name == _BEST_VIDEO_GEAR or _BEST_VIDEO_URL_TAG in url_key),
+                quality_type=(
+                    _positive_int(raw_bitrate.get("QualityType") or raw_bitrate.get("quality_type"))
+                    or 10_000
+                ),
+                bitrate=(
+                    _positive_int(raw_bitrate.get("Bitrate") or raw_bitrate.get("bit_rate")) or 0
+                ),
+            )
+        )
+
+    if not candidates:
+        return regular
+    maximum_candidate_area = max(_pixel_area(candidate.source) for candidate in candidates)
+    regular_area = _pixel_area(regular)
+    if regular is not None and regular_area > maximum_candidate_area:
+        return regular
+    maximum_resolution = [
+        candidate
+        for candidate in candidates
+        if _pixel_area(candidate.source) == maximum_candidate_area
+    ]
+    # The top-level playAddr has no per-option MVMAF metadata. Retain it as the
+    # same-resolution fallback only when TikTok supplied no usable MVMAF score.
+    if (
+        regular is not None
+        and regular_area == maximum_candidate_area
+        and not any(candidate.mvmaf is not None for candidate in maximum_resolution)
+    ):
+        return regular
+    selected = max(
+        maximum_resolution,
+        key=lambda candidate: (
+            candidate.mvmaf is not None,
+            candidate.mvmaf if candidate.mvmaf is not None else -math.inf,
+            candidate.known_quality,
+            -candidate.quality_type,
+            candidate.bitrate,
+        ),
+    )
+    return selected.source
 
 
 def extract_video_url(video: dict[str, Any]) -> str | None:
@@ -160,6 +276,36 @@ class TikTokService:
         self.assets = AssetFactory(cache)
         self.adapter = TikTokAdapter(settings, proxy_manager)
         self.proxy_manager = proxy_manager
+        self._key_lock_guard = asyncio.Lock()
+        self._key_locks: dict[str, tuple[asyncio.Lock, int]] = {}
+
+    def _ensure_key_locks(self) -> None:
+        # A few unit tests construct the service without __init__ to inject a
+        # fake adapter. Keep the synchronization state lazy for those callers.
+        if not hasattr(self, "_key_lock_guard"):
+            self._key_lock_guard = asyncio.Lock()
+            self._key_locks = {}
+
+    @asynccontextmanager
+    async def _key_lock(self, key: str) -> AsyncIterator[None]:
+        self._ensure_key_locks()
+        async with self._key_lock_guard:
+            lock, users = self._key_locks.get(key, (asyncio.Lock(), 0))
+            self._key_locks[key] = (lock, users + 1)
+        acquired = False
+        try:
+            await lock.acquire()
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                lock.release()
+            async with self._key_lock_guard:
+                current, users = self._key_locks[key]
+                if users == 1:
+                    del self._key_locks[key]
+                else:
+                    self._key_locks[key] = (current, users - 1)
 
     def _expires_at(self) -> datetime:
         return datetime.now(UTC) + timedelta(seconds=self.settings.cache_ttl_seconds)
@@ -207,27 +353,86 @@ class TikTokService:
     async def extract_url(
         self, source_url: str, *, refresh: bool = False
     ) -> TikTokExtractionResponse:
-        proxy_session = ProxySession(self.proxy_manager)
-        resolved_url = await self.adapter.resolve_url(source_url, proxy_session)
-        video_id = self.adapter.extract_id(resolved_url)
-        cache_key = self.cache.metadata_key("tiktok", video_id)
+        source_url = source_url.strip()
+        validate_tiktok_url(source_url)
+        url_cache_key = self.cache.metadata_key("tiktok-url", source_url)
         if not refresh:
-            cached = await self.cache.get_model(cache_key, TikTokExtractionResponse)
+            cached = await self.cache.get_model(url_cache_key, TikTokExtractionResponse)
             if cached:
-                return cached.model_copy(
-                    update={"source_url": source_url, "resolved_url": resolved_url}
-                )
+                return cached
 
-        extraction_url = f"https://www.tiktok.com/@_/video/{video_id}"
-        data, context = await self.adapter.extract(extraction_url, video_id, proxy_session)
-        try:
-            response = await self._build_video_response(
-                data, context, video_id, source_url, resolved_url
-            )
-        finally:
-            context.close()
-        await self.cache.set_model(cache_key, response)
-        return response
+        async with self._key_lock(url_cache_key):
+            if not refresh:
+                cached = await self.cache.get_model(url_cache_key, TikTokExtractionResponse)
+                if cached:
+                    return cached
+
+            proxy_session = ProxySession(self.proxy_manager)
+            resolved_url = await self.adapter.resolve_url(source_url, proxy_session)
+            video_id = self.adapter.extract_id(resolved_url)
+            video_cache_key = self.cache.metadata_key("tiktok", video_id)
+            if not refresh:
+                cached, remaining_ttl = await self.cache.get_model_with_ttl(
+                    video_cache_key, TikTokExtractionResponse
+                )
+                if cached and remaining_ttl:
+                    response = cached.model_copy(
+                        update={"source_url": source_url, "resolved_url": resolved_url}
+                    )
+                    await self.cache.set_model(
+                        url_cache_key,
+                        response,
+                        ttl_seconds=remaining_ttl,
+                    )
+                    return response
+
+            async with self._key_lock(video_cache_key):
+                if not refresh:
+                    cached, remaining_ttl = await self.cache.get_model_with_ttl(
+                        video_cache_key, TikTokExtractionResponse
+                    )
+                    if cached and remaining_ttl:
+                        response = cached.model_copy(
+                            update={"source_url": source_url, "resolved_url": resolved_url}
+                        )
+                        await self.cache.set_model(
+                            url_cache_key,
+                            response,
+                            ttl_seconds=remaining_ttl,
+                        )
+                        return response
+
+                extraction_url = f"https://www.tiktok.com/@_/video/{video_id}"
+                data, context = await self.adapter.extract(extraction_url, video_id, proxy_session)
+                try:
+                    response = await self._build_video_response(
+                        data, context, video_id, source_url, resolved_url
+                    )
+                finally:
+                    context.close()
+                ttl = self.settings.tiktok_info_cache_ttl_seconds
+                await self.cache.set_model(video_cache_key, response, ttl_seconds=ttl)
+                await self.cache.set_model(url_cache_key, response, ttl_seconds=ttl)
+                await self.cache.set_model(
+                    self.cache.metadata_key("tiktok-extraction", response.extraction_id),
+                    response,
+                    ttl_seconds=ttl,
+                )
+                return response
+
+    async def get_extraction(self, extraction_id: str) -> TikTokExtractionResponse:
+        cached = await self.cache.get_model(
+            self.cache.metadata_key("tiktok-extraction", extraction_id),
+            TikTokExtractionResponse,
+        )
+        if cached is None:
+            raise ExtractionExpiredError("TikTok extraction was not found or has expired")
+        return cached
+
+    async def get_cached_video(self, video_id: int | str) -> TikTokExtractionResponse | None:
+        return await self.cache.get_model(
+            self.cache.metadata_key("tiktok", str(video_id)), TikTokExtractionResponse
+        )
 
     async def _build_video_response(
         self,
@@ -343,6 +548,19 @@ class TikTokService:
     ) -> TikTokMusicMetadata | None:
         if not music:
             return None
+        audio_url = _first(music.get("playUrl"))
+        audio = None
+        if audio_url:
+            audio = await self._asset(
+                url=audio_url,
+                context=context,
+                kind="audio",
+                filename=f"{video_id}.mp3",
+                position=0,
+                expires_at=expires_at,
+                extraction_id=extraction_id,
+                declared_content_type="audio/mpeg",
+            )
         cover_url = _first(music.get("coverLarge")) or _first(music.get("coverMedium"))
         cover_url = cover_url or _first(music.get("coverThumb"))
         cover = None
@@ -361,61 +579,72 @@ class TikTokService:
             author=str(music.get("authorName", "")),
             duration_seconds=int(music.get("duration", 0)),
             cover=cover,
+            audio=audio,
         )
 
-    async def extract_music(self, video_id: int) -> TikTokMusicResponse:
+    async def extract_music(self, video_id: int, *, refresh: bool = False) -> TikTokMusicResponse:
         identity = str(video_id)
         cache_key = self.cache.metadata_key("tiktok-music", identity)
-        cached = await self.cache.get_model(cache_key, TikTokMusicResponse)
-        if cached:
-            return cached
-        proxy_session = ProxySession(self.proxy_manager)
-        url = f"https://www.tiktok.com/@_/video/{video_id}"
-        data, context = await self.adapter.extract(url, identity, proxy_session)
-        try:
-            music = data.get("music") or {}
-            audio_url = _first(music.get("playUrl"))
-            if not audio_url:
-                raise ExtractionError("TikTok response has no music asset")
-            expires_at = self._expires_at()
-            extraction_id = str(uuid4())
-            audio = await self._asset(
-                url=audio_url,
-                context=context,
-                kind="audio",
-                filename=f"{video_id}.mp3",
-                position=0,
-                expires_at=expires_at,
-                extraction_id=extraction_id,
-                declared_content_type="audio/mpeg",
-            )
-            cover_url = _first(music.get("coverLarge")) or _first(music.get("coverMedium"))
-            cover_url = cover_url or _first(music.get("coverThumb"))
-            cover = None
-            if cover_url:
-                cover = await self._asset(
-                    url=cover_url,
+        if not refresh:
+            cached = await self.cache.get_model(cache_key, TikTokMusicResponse)
+            if cached:
+                return cached
+        async with self._key_lock(cache_key):
+            if not refresh:
+                cached = await self.cache.get_model(cache_key, TikTokMusicResponse)
+                if cached:
+                    return cached
+            proxy_session = ProxySession(self.proxy_manager)
+            url = f"https://www.tiktok.com/@_/video/{video_id}"
+            data, context = await self.adapter.extract(url, identity, proxy_session)
+            try:
+                music = data.get("music") or {}
+                audio_url = _first(music.get("playUrl"))
+                if not audio_url:
+                    raise ExtractionError("TikTok response has no music asset")
+                expires_at = self._expires_at()
+                extraction_id = str(uuid4())
+                audio = await self._asset(
+                    url=audio_url,
                     context=context,
-                    kind="cover",
-                    filename=f"{video_id}_music_cover.jpg",
+                    kind="audio",
+                    filename=f"{video_id}.mp3",
                     position=0,
                     expires_at=expires_at,
                     extraction_id=extraction_id,
+                    declared_content_type="audio/mpeg",
                 )
-            response = TikTokMusicResponse(
-                extraction_id=extraction_id,
-                source_id=identity,
-                title=str(music.get("title", "")),
-                author=str(music.get("authorName", "")),
-                duration_seconds=int(music.get("duration", 0)),
-                cover=cover,
-                audio=audio,
-                expires_at=expires_at,
+                cover_url = _first(music.get("coverLarge")) or _first(music.get("coverMedium"))
+                cover_url = cover_url or _first(music.get("coverThumb"))
+                cover = None
+                if cover_url:
+                    cover = await self._asset(
+                        url=cover_url,
+                        context=context,
+                        kind="cover",
+                        filename=f"{video_id}_music_cover.jpg",
+                        position=0,
+                        expires_at=expires_at,
+                        extraction_id=extraction_id,
+                    )
+                response = TikTokMusicResponse(
+                    extraction_id=extraction_id,
+                    source_id=identity,
+                    title=str(music.get("title", "")),
+                    author=str(music.get("authorName", "")),
+                    duration_seconds=int(music.get("duration", 0)),
+                    cover=cover,
+                    audio=audio,
+                    expires_at=expires_at,
+                )
+            finally:
+                context.close()
+            await self.cache.set_model(
+                cache_key,
+                response,
+                ttl_seconds=self.settings.tiktok_info_cache_ttl_seconds,
             )
-        finally:
-            context.close()
-        await self.cache.set_model(cache_key, response)
-        return response
+            return response
 
     async def close(self) -> None:
         await self.adapter.close()

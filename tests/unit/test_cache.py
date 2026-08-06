@@ -6,7 +6,7 @@ import pytest
 
 from tt_scrap.cache import CacheStore
 from tt_scrap.errors import AssetExpiredError
-from tt_scrap.models import AssetFetchContext
+from tt_scrap.models import AssetFetchContext, LiveResponse
 
 
 def context(name: str) -> AssetFetchContext:
@@ -53,3 +53,27 @@ async def test_close_discards_all_entries() -> None:
 
     with pytest.raises(AssetExpiredError):
         await cache.get_asset(token)
+
+
+@pytest.mark.asyncio
+async def test_entries_can_have_independent_absolute_ttls() -> None:
+    cache = CacheStore(ttl_seconds=30, max_entries=10)
+    short_key = cache.metadata_key("test", "short")
+    long_key = cache.metadata_key("test", "long")
+    await cache.set_model(short_key, LiveResponse(), ttl_seconds=1)
+    await cache.set_model(long_key, LiveResponse())
+
+    await asyncio.sleep(1.05)
+
+    assert await cache.get_model(short_key, LiveResponse) is None
+    assert await cache.get_model(long_key, LiveResponse) == LiveResponse()
+
+
+@pytest.mark.asyncio
+async def test_repeated_refreshes_keep_expiration_index_bounded() -> None:
+    cache = CacheStore(ttl_seconds=30, max_entries=2)
+    key = cache.metadata_key("test", "refreshed")
+    for _ in range(20):
+        await cache.set_model(key, LiveResponse())
+
+    assert len(cache._expirations) <= 4

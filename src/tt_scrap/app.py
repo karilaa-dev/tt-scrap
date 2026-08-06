@@ -18,10 +18,12 @@ from .config import Settings, get_settings
 from .errors import ScraperError
 from .logging import configure_logging, request_id_var
 from .media import AssetDownloader
+from .media.images import ImagePreparationService
 from .models import ErrorDetail, ErrorResponse
 from .platforms.instagram import InstagramService
 from .platforms.tiktok import TikTokService
 from .proxy import ProxyManager
+from .telegram import TelegramClient, TelegramDeliveryService
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +51,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.cache = cache
         app.state.proxy_manager = proxy_manager
         app.state.asset_downloader = AssetDownloader(configured_settings, proxy_manager)
+        app.state.image_preparation = ImagePreparationService(configured_settings)
         app.state.tiktok = TikTokService(configured_settings, cache, proxy_manager)
         app.state.instagram = InstagramService(configured_settings, cache)
+        app.state.telegram_client = TelegramClient(configured_settings)
+        app.state.telegram_delivery = TelegramDeliveryService(
+            configured_settings,
+            cache,
+            app.state.tiktok,
+            app.state.asset_downloader,
+            app.state.image_preparation,
+            app.state.telegram_client,
+        )
         logger.info("tt-scrap started")
         try:
             yield
         finally:
+            await app.state.telegram_client.close()
+            await app.state.image_preparation.close()
             await app.state.instagram.close()
             await app.state.tiktok.close()
             await app.state.asset_downloader.close()
@@ -63,7 +77,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="tt-scrap",
-        description="Authenticated TikTok and Instagram extraction API",
+        description="Authenticated TikTok/Instagram extraction and Telegram delivery API",
         version=configured_settings.app_version,
         lifespan=lifespan,
     )

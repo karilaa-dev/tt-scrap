@@ -75,7 +75,9 @@ async def test_asset_limit_caps_64_concurrent_spools(settings, monkeypatch) -> N
         proxy: object,
         spool: BinaryIO,
         upstream_url: str,
-    ) -> tuple[str, int, str, int, bytes]:
+        *,
+        compute_sha256: bool,
+    ) -> tuple[str, int, str | None, int, bytes]:
         nonlocal active, peak
         active += 1
         peak = max(peak, active)
@@ -85,7 +87,7 @@ async def test_asset_limit_caps_64_concurrent_spools(settings, monkeypatch) -> N
         return (
             "image/jpeg",
             len(payload),
-            hashlib.sha256(payload).hexdigest(),
+            hashlib.sha256(payload).hexdigest() if compute_sha256 else None,
             len(payload),
             payload,
         )

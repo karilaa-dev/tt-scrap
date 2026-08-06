@@ -40,6 +40,7 @@ class Settings(BaseSettings):
 
     cache_ttl_seconds: int = Field(default=600, ge=30, le=86_400)
     cache_max_entries: int = Field(default=10_000, ge=100, le=1_000_000)
+    tiktok_info_cache_ttl_seconds: int = Field(default=60, ge=1, le=3_600)
     extraction_concurrency: int = Field(default=32, ge=1, le=512)
     download_concurrency: int = Field(default=64, ge=1, le=1024)
     slideshow_concurrency: int = Field(default=8, ge=1, le=64)
@@ -51,12 +52,26 @@ class Settings(BaseSettings):
     max_video_duration: int = Field(default=0, ge=0)
     upstream_download_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
 
+    telegram_bot_token: SecretStr = SecretStr("")
+    telegram_api_base_url: str = "https://api.telegram.org"
+    telegram_upload_concurrency: int = Field(default=16, ge=1, le=256)
+    telegram_upload_timeout_seconds: float = Field(default=600.0, gt=0, le=3_600)
+    image_conversion_workers: int = Field(default=4, ge=1, le=32)
+
     @field_validator("log_level")
     @classmethod
     def normalize_log_level(cls, value: str) -> str:
         normalized = value.strip().upper()
         if normalized not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ValueError("LOG_LEVEL is invalid")
+        return normalized
+
+    @field_validator("telegram_api_base_url")
+    @classmethod
+    def normalize_telegram_api_base_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        if not normalized.startswith(("https://", "http://")):
+            raise ValueError("TELEGRAM_API_BASE_URL must use http or https")
         return normalized
 
 

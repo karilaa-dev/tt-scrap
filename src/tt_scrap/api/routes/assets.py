@@ -20,6 +20,8 @@ async def get_asset(token: str, request: Request) -> StreamingResponse:
     context = await request.app.state.cache.get_asset(token)
     downloaded = await request.app.state.asset_downloader.download(context)
     filename = filename_for_type(context.filename, downloaded.content_type)
+    if downloaded.sha256 is None:
+        raise RuntimeError("Asset download did not produce a checksum")
 
     def chunks() -> Iterator[bytes]:
         try:

@@ -71,3 +71,33 @@ class AssetExpiredError(ScraperError):
 class AssetTooLargeError(ScraperError):
     code = "asset_too_large"
     status_code = 413
+
+
+class ExtractionExpiredError(ScraperError):
+    code = "extraction_not_found_or_expired"
+    status_code = 404
+
+
+class UnsupportedDeliveryError(ScraperError):
+    code = "unsupported_delivery"
+    status_code = 422
+
+
+class TelegramParameterError(ScraperError):
+    code = "telegram_parameter_not_supported"
+    status_code = 422
+
+
+class ImageConversionError(ScraperError):
+    code = "image_conversion_failed"
+    status_code = 502
+
+
+class TelegramNetworkError(ScraperError):
+    code = "telegram_network_error"
+    status_code = 502
+
+
+class TelegramTimeoutError(ScraperError):
+    code = "telegram_timeout"
+    status_code = 504

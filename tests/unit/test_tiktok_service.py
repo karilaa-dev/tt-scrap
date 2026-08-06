@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -31,9 +32,11 @@ class FakeAdapter:
     def __init__(self, payload: dict[str, Any]) -> None:
         self.payload = payload
         self.calls = 0
+        self.resolve_calls = 0
         self.contexts: list[FakeContext] = []
 
     async def resolve_url(self, url: str, proxy_session) -> str:
+        self.resolve_calls += 1
         return "https://www.tiktok.com/@creator/video/123"
 
     def extract_id(self, url: str) -> str:
@@ -103,7 +106,7 @@ def test_video_source_selects_known_quality_tag_and_preserves_mirrors() -> None:
     assert (source.width, source.height) == (1080, 1920)
 
 
-def test_video_source_falls_back_when_known_quality_tag_is_absent() -> None:
+def test_video_source_uses_maximum_resolution_when_known_tag_is_absent() -> None:
     source = select_video_source(
         {
             "playAddr": "https://cdn/regular",
@@ -129,7 +132,161 @@ def test_video_source_falls_back_when_known_quality_tag_is_absent() -> None:
         }
     )
 
-    assert source and source.url == "https://cdn/regular"
+    assert source and source.url == "https://cdn/1080"
+
+
+def test_video_source_uses_higher_resolution_adaptive_fallback() -> None:
+    source = select_video_source(
+        {
+            "playAddr": "https://cdn/regular-540",
+            "width": 576,
+            "height": 1024,
+            "bitrateInfo": [
+                {
+                    "Bitrate": 300_000,
+                    "GearName": "adapt_lower_720_1",
+                    "QualityType": 14,
+                    "PlayAddr": {
+                        "Width": 720,
+                        "Height": 1280,
+                        "UrlList": ["https://cdn/adaptive-720"],
+                    },
+                }
+            ],
+        }
+    )
+
+    assert source and source.url == "https://cdn/adaptive-720"
+    assert (source.width, source.height) == (720, 1280)
+
+
+def test_video_source_uses_regular_file_on_resolution_tie_without_mvmaf() -> None:
+    source = select_video_source(
+        {
+            "playAddr": "https://cdn/regular-720",
+            "width": 720,
+            "height": 1280,
+            "bitrateInfo": [
+                {
+                    "Bitrate": 900_000,
+                    "GearName": "adapt_lower_720_1",
+                    "QualityType": 14,
+                    "PlayAddr": {
+                        "Width": 720,
+                        "Height": 1280,
+                        "UrlList": ["https://cdn/adaptive-720"],
+                    },
+                }
+            ],
+        }
+    )
+
+    assert source and source.url == "https://cdn/regular-720"
+
+
+def test_video_source_uses_best_mvmaf_within_maximum_resolution() -> None:
+    source = select_video_source(
+        {
+            "playAddr": "https://cdn/regular-1080",
+            "width": 1080,
+            "height": 1920,
+            "bitrateInfo": [
+                {
+                    "Bitrate": 3_000_000,
+                    "GearName": "adapt_lowest_1080_1",
+                    "QualityType": 10,
+                    "MVMAF": ('{"v2.0":{"ori":{"v1080":91.25,"v720":98.0},"srv1":{"v1080":92.0}}}'),
+                    "PlayAddr": {
+                        "Width": 1080,
+                        "Height": 1920,
+                        "UrlList": ["https://cdn/lower-mvmaf"],
+                    },
+                },
+                {
+                    "Bitrate": 1_500_000,
+                    "GearName": "other_1080",
+                    "QualityType": 20,
+                    "MVMAF": {
+                        "v2.0": {
+                            "ori": {"v1080": 95.75, "v720": 80.0},
+                            "srv1": {"v1080": 96.0},
+                        }
+                    },
+                    "PlayAddr": {
+                        "Width": 1080,
+                        "Height": 1920,
+                        "UrlList": ["https://cdn/best-mvmaf"],
+                    },
+                },
+            ],
+        }
+    )
+
+    assert source and source.url == "https://cdn/best-mvmaf"
+
+
+def test_video_source_prioritizes_resolution_before_mvmaf() -> None:
+    source = select_video_source(
+        {
+            "playAddr": "https://cdn/regular-720",
+            "width": 720,
+            "height": 1280,
+            "bitrateInfo": [
+                {
+                    "MVMAF": '{"v2.0":{"ori":{"v720":99.0}}}',
+                    "PlayAddr": {
+                        "Width": 720,
+                        "Height": 1280,
+                        "UrlList": ["https://cdn/high-score-720"],
+                    },
+                },
+                {
+                    "MVMAF": '{"v2.0":{"ori":{"v1080":82.0}}}',
+                    "PlayAddr": {
+                        "Width": 1080,
+                        "Height": 1920,
+                        "UrlList": ["https://cdn/lower-score-1080"],
+                    },
+                },
+            ],
+        }
+    )
+
+    assert source and source.url == "https://cdn/lower-score-1080"
+    assert (source.width, source.height) == (1080, 1920)
+
+
+def test_video_source_ignores_malformed_mvmaf_and_uses_existing_fallbacks() -> None:
+    source = select_video_source(
+        {
+            "bitrateInfo": [
+                {
+                    "Bitrate": 1_000_000,
+                    "GearName": "other_1080",
+                    "QualityType": 20,
+                    "MVMAF": "not-json",
+                    "PlayAddr": {
+                        "Width": 1080,
+                        "Height": 1920,
+                        "UrlList": ["https://cdn/ordinary"],
+                    },
+                },
+                {
+                    "Bitrate": 900_000,
+                    "GearName": "adapt_lowest_1080_1",
+                    "QualityType": 30,
+                    "MVMAF": '{"v2.0":{"ori":{"unknown":"bad"}}}',
+                    "PlayAddr": {
+                        "Width": 1080,
+                        "Height": 1920,
+                        "UrlList": ["https://cdn/known-quality"],
+                    },
+                },
+            ]
+        }
+    )
+
+    assert source and source.url == "https://cdn/known-quality"
 
 
 def test_video_source_adds_highest_bitrate_adaptive_audio() -> None:
@@ -155,13 +312,24 @@ def test_video_source_adds_highest_bitrate_adaptive_audio() -> None:
             ],
             "bitrateInfo": [
                 {
+                    "Bitrate": 2_500_000,
+                    "GearName": "other_1080",
+                    "MVMAF": '{"v2.0":{"ori":{"v1080":88.0}}}',
+                    "PlayAddr": {
+                        "Width": 1080,
+                        "Height": 1920,
+                        "UrlList": ["https://cdn/lower-quality-silent-1080"],
+                    },
+                },
+                {
                     "GearName": "adapt_lowest_1080_1",
+                    "MVMAF": '{"v2.0":{"ori":{"v1080":94.0}}}',
                     "PlayAddr": {
                         "Width": 1080,
                         "Height": 1920,
                         "UrlList": ["https://cdn/silent-1080"],
                     },
-                }
+                },
             ],
         }
     )
@@ -196,6 +364,33 @@ def test_video_source_falls_back_when_adaptive_audio_is_missing() -> None:
     assert source and source.url == "https://cdn/regular-with-audio"
 
 
+def test_video_source_does_not_remux_known_muxed_normal_representation() -> None:
+    source = select_video_source(
+        {
+            "bitrateAudioInfo": [
+                {
+                    "Bitrate": 96_000,
+                    "UrlList": {"MainUrl": "https://cdn/separate-audio"},
+                }
+            ],
+            "bitrateInfo": [
+                {
+                    "GearName": "normal_720_0",
+                    "MVMAF": '{"v2.0":{"ori":{"v720":95.0}}}',
+                    "PlayAddr": {
+                        "Width": 720,
+                        "Height": 1280,
+                        "UrlList": ["https://cdn/muxed-720"],
+                    },
+                }
+            ],
+        }
+    )
+
+    assert source and source.url == "https://cdn/muxed-720"
+    assert source.audio_url is None
+
+
 @pytest.mark.asyncio
 async def test_video_response_is_normalized_cached_and_closes_context(settings) -> None:
     payload = {
@@ -220,17 +415,24 @@ async def test_video_response_is_normalized_cached_and_closes_context(settings) 
     response = await service.extract_url("https://www.tiktok.com/@creator/video/123")
     cached = await service.extract_url("https://www.tiktok.com/@creator/video/123")
     tracked = await service.extract_url("https://www.tiktok.com/@other/video/123?is_from_webapp=1")
+    tracked_again = await service.extract_url(
+        "https://www.tiktok.com/@other/video/123?is_from_webapp=1"
+    )
 
     assert response == cached
     assert tracked.source_id == response.source_id
+    assert tracked_again == tracked
     assert tracked.source_url.endswith("?is_from_webapp=1")
     assert response.content_type == "video"
     assert response.media[0].download_url.startswith("/v1/assets/")
     assert response.width == 1080
     assert response.likes == 12
     assert response.music and response.music.title == "Track"
+    assert response.music.audio and response.music.audio.kind == "audio"
+    assert await service.get_extraction(response.extraction_id) == response
     assert "cdn.test" not in response.model_dump_json()
     assert service.adapter.calls == 1
+    assert service.adapter.resolve_calls == 2
     assert service.adapter.contexts[0].closed
 
 
@@ -279,6 +481,27 @@ async def test_video_response_uses_selected_quality_source(settings) -> None:
     assert context.audio is not None
     assert context.audio.upstream_url == "https://audio.cdn.test/best-primary"
     assert context.audio.alternate_upstream_urls == ["https://audio.cdn.test/best-backup"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_identical_urls_share_one_extraction(settings) -> None:
+    payload = {
+        "video": {
+            "playAddr": "https://video.cdn.test/media",
+            "width": 720,
+            "height": 1280,
+            "duration": 5,
+        }
+    }
+    service, _cache = make_service(settings, payload)
+
+    results = await asyncio.gather(
+        *[service.extract_url("https://www.tiktok.com/@creator/video/123") for _ in range(8)]
+    )
+
+    assert len({result.extraction_id for result in results}) == 1
+    assert service.adapter.calls == 1
+    assert service.adapter.resolve_calls == 1
 
 
 @pytest.mark.asyncio

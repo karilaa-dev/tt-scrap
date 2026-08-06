@@ -36,6 +36,11 @@ _MIME_EXTENSIONS = {
     "image/png": ".png",
     "image/webp": ".webp",
     "image/heic": ".heic",
+    "image/heif": ".heif",
+    "image/avif": ".avif",
+    "image/tiff": ".tiff",
+    "image/bmp": ".bmp",
+    "image/gif": ".gif",
 }
 
 
@@ -43,8 +48,9 @@ _MIME_EXTENSIONS = {
 class DownloadedAsset:
     file: BinaryIO
     size: int
-    sha256: str
+    sha256: str | None
     content_type: str
+    declared_content_type: str | None = None
 
 
 def detect_content_type(prefix: bytes, declared: str | None) -> str:
@@ -54,8 +60,20 @@ def detect_content_type(prefix: bytes, declared: str | None) -> str:
         return "image/png"
     if prefix.startswith(b"RIFF") and prefix[8:12] == b"WEBP":
         return "image/webp"
-    if len(prefix) >= 12 and prefix[4:12] in {b"ftypheic", b"ftypmif1"}:
-        return "image/heic"
+    if prefix.startswith((b"II*\x00", b"MM\x00*")):
+        return "image/tiff"
+    if prefix.startswith(b"BM"):
+        return "image/bmp"
+    if prefix.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(prefix) >= 12 and prefix[4:8] == b"ftyp":
+        brand = prefix[8:12]
+        if brand in {b"avif", b"avis"}:
+            return "image/avif"
+        if brand in {b"mif1", b"msf1"}:
+            return "image/heif"
+        if brand in {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis"}:
+            return "image/heic"
     if len(prefix) >= 12 and prefix[4:8] == b"ftyp":
         brand = prefix[8:12]
         if brand in {b"M4A ", b"M4B ", b"mp42"} and declared and declared.startswith("audio"):
@@ -145,13 +163,17 @@ class AssetDownloader:
             return ProxyChoice(slot=None, url=None)
         return self.proxy_manager.from_slot(context.proxy_slot)
 
-    async def download(self, context: AssetFetchContext) -> DownloadedAsset:
+    async def download(
+        self, context: AssetFetchContext, *, compute_sha256: bool = True
+    ) -> DownloadedAsset:
         async with self._semaphore, self._group_limit(context.extraction_id):
             if context.audio:
-                return await self._download_and_remux(context)
-            return await self._download_single(context)
+                return await self._download_and_remux(context, compute_sha256=compute_sha256)
+            return await self._download_single(context, compute_sha256=compute_sha256)
 
-    async def _download_single(self, context: AssetFetchContext) -> DownloadedAsset:
+    async def _download_single(
+        self, context: AssetFetchContext, *, compute_sha256: bool = True
+    ) -> DownloadedAsset:
         proxy = self._initial_proxy(context)
         last_error: Exception | None = None
         upstream_urls = [context.upstream_url, *context.alternate_upstream_urls]
@@ -166,6 +188,7 @@ class AssetDownloader:
                     proxy,
                     binary_spool,
                     upstream_urls[(attempt - 1) % len(upstream_urls)],
+                    compute_sha256=compute_sha256,
                 )
                 if size == 0:
                     raise _RetryableDownload("Upstream returned an empty asset")
@@ -179,6 +202,7 @@ class AssetDownloader:
                     size=size,
                     sha256=digest,
                     content_type=detect_content_type(prefix, declared),
+                    declared_content_type=declared,
                 )
             except AssetTooLargeError:
                 spool.close()
@@ -221,10 +245,12 @@ class AssetDownloader:
             f"Asset download failed after {self.settings.download_max_retries} attempts"
         ) from last_error
 
-    async def _download_and_remux(self, context: AssetFetchContext) -> DownloadedAsset:
+    async def _download_and_remux(
+        self, context: AssetFetchContext, *, compute_sha256: bool
+    ) -> DownloadedAsset:
         audio = context.audio
         if audio is None:
-            return await self._download_single(context)
+            return await self._download_single(context, compute_sha256=compute_sha256)
         video_context = context.model_copy(update={"audio": None})
         audio_context = AssetFetchContext(
             platform=context.platform,
@@ -239,8 +265,8 @@ class AssetDownloader:
             extraction_id=context.extraction_id,
         )
         tasks = [
-            asyncio.create_task(self._download_single(video_context)),
-            asyncio.create_task(self._download_single(audio_context)),
+            asyncio.create_task(self._download_single(video_context, compute_sha256=False)),
+            asyncio.create_task(self._download_single(audio_context, compute_sha256=False)),
         ]
         try:
             video_asset, audio_asset = await asyncio.gather(*tasks)
@@ -258,12 +284,16 @@ class AssetDownloader:
                 and video_asset.size + audio_asset.size > self.settings.max_asset_bytes
             ):
                 raise AssetTooLargeError("Remuxed asset exceeds MAX_ASSET_BYTES")
-            return await self._remux_copy(video_asset.file, audio_asset.file)
+            return await self._remux_copy(
+                video_asset.file, audio_asset.file, compute_sha256=compute_sha256
+            )
         finally:
             video_asset.file.close()
             audio_asset.file.close()
 
-    async def _remux_copy(self, video: BinaryIO, audio: BinaryIO) -> DownloadedAsset:
+    async def _remux_copy(
+        self, video: BinaryIO, audio: BinaryIO, *, compute_sha256: bool = True
+    ) -> DownloadedAsset:
         async with self._remux_semaphore:
             output = tempfile.SpooledTemporaryFile(
                 max_size=self.settings.spool_threshold_bytes, mode="w+b"
@@ -321,18 +351,24 @@ class AssetDownloader:
                 message = detail[-1][:300] if detail else "unknown ffmpeg error"
                 raise NetworkError(f"Media remux failed: {message}")
 
-            output.seek(0)
-            digest = hashlib.sha256()
+            output.seek(0, 2)
+            size = output.tell()
+            if self.settings.max_asset_bytes and size > self.settings.max_asset_bytes:
+                output.close()
+                raise AssetTooLargeError("Remuxed asset exceeds MAX_ASSET_BYTES")
+            digest_value: str | None = None
             prefix = bytearray()
-            size = 0
-            while chunk := output.read(self.settings.download_chunk_bytes):
-                size += len(chunk)
-                if self.settings.max_asset_bytes and size > self.settings.max_asset_bytes:
-                    output.close()
-                    raise AssetTooLargeError("Remuxed asset exceeds MAX_ASSET_BYTES")
-                if len(prefix) < 32:
-                    prefix.extend(chunk[: 32 - len(prefix)])
-                digest.update(chunk)
+            if compute_sha256:
+                digest = hashlib.sha256()
+                output.seek(0)
+                while chunk := output.read(self.settings.download_chunk_bytes):
+                    if len(prefix) < 32:
+                        prefix.extend(chunk[: 32 - len(prefix)])
+                    digest.update(chunk)
+                digest_value = digest.hexdigest()
+            else:
+                output.seek(0)
+                prefix.extend(output.read(32))
             if size == 0:
                 output.close()
                 raise NetworkError("Media remux produced an empty asset")
@@ -340,8 +376,9 @@ class AssetDownloader:
             return DownloadedAsset(
                 file=binary_output,
                 size=size,
-                sha256=digest.hexdigest(),
+                sha256=digest_value,
                 content_type=detect_content_type(bytes(prefix), "video/mp4"),
+                declared_content_type="video/mp4",
             )
 
     async def _download_once(
@@ -350,7 +387,9 @@ class AssetDownloader:
         proxy: ProxyChoice,
         spool: BinaryIO,
         upstream_url: str,
-    ) -> tuple[str | None, int | None, str, int, bytes]:
+        *,
+        compute_sha256: bool,
+    ) -> tuple[str | None, int | None, str | None, int, bytes]:
         headers = {"Accept": "*/*"}
         if context.referer:
             headers.update(
@@ -364,7 +403,7 @@ class AssetDownloader:
                     ),
                 }
             )
-        digest = hashlib.sha256()
+        digest = hashlib.sha256() if compute_sha256 else None
         prefix = bytearray()
         size = 0
 
@@ -378,7 +417,8 @@ class AssetDownloader:
                     raise AssetTooLargeError("Asset exceeds MAX_ASSET_BYTES")
                 if len(prefix) < 32:
                     prefix.extend(chunk[: 32 - len(prefix)])
-                digest.update(chunk)
+                if digest is not None:
+                    digest.update(chunk)
                 spool.write(chunk)
 
         if context.platform == "tiktok":
@@ -416,7 +456,13 @@ class AssetDownloader:
                 )
                 length = http_response.headers.get("content-length")
         expected = int(length) if length and length.isdigit() else None
-        return declared, expected, digest.hexdigest(), size, bytes(prefix)
+        return (
+            declared,
+            expected,
+            digest.hexdigest() if digest is not None else None,
+            size,
+            bytes(prefix),
+        )
 
     async def close(self) -> None:
         await self._http.aclose()

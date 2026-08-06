@@ -145,7 +145,10 @@ async def test_adaptive_video_and_audio_download_concurrently_then_remux(
     calls: list[AssetFetchContext] = []
     both_started = asyncio.Event()
 
-    async def fake_download_single(context: AssetFetchContext) -> DownloadedAsset:
+    async def fake_download_single(
+        context: AssetFetchContext, *, compute_sha256: bool = True
+    ) -> DownloadedAsset:
+        assert not compute_sha256
         calls.append(context)
         if len(calls) == 2:
             both_started.set()
@@ -153,7 +156,8 @@ async def test_adaptive_video_and_audio_download_concurrently_then_remux(
         payload = b"video" if context.kind == "video" else b"audio"
         return DownloadedAsset(BytesIO(payload), len(payload), "input-digest", "video/mp4")
 
-    async def fake_remux(video, audio) -> DownloadedAsset:
+    async def fake_remux(video, audio, *, compute_sha256=True) -> DownloadedAsset:
+        assert compute_sha256
         assert video.read() == b"video"
         assert audio.read() == b"audio"
         return DownloadedAsset(BytesIO(b"muxed"), 5, "output-digest", "video/mp4")
