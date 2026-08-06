@@ -17,6 +17,7 @@ from ...config import Settings
 from ...errors import (
     ContentDeletedError,
     ExtractionError,
+    ExtractionExpiredError,
     InvalidLinkError,
     NetworkError,
     RateLimitError,
@@ -177,7 +178,20 @@ class InstagramService:
             expires_at=expires_at,
         )
         await self.cache.set_model(cache_key, response)
+        await self.cache.set_model(
+            self.cache.metadata_key("instagram-extraction", extraction_id),
+            response,
+        )
         return response
+
+    async def get_extraction(self, extraction_id: str) -> InstagramExtractionResponse:
+        cached = await self.cache.get_model(
+            self.cache.metadata_key("instagram-extraction", extraction_id),
+            InstagramExtractionResponse,
+        )
+        if cached is None:
+            raise ExtractionExpiredError("Instagram extraction was not found or has expired")
+        return cached
 
     async def close(self) -> None:
         await self._http.aclose()

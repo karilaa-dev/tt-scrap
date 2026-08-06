@@ -51,6 +51,7 @@ async def test_mixed_carousel_is_normalized_and_cached(settings) -> None:
         assert response.content_type == "carousel"
         assert [item.media_type for item in response.media] == ["image", "video"]
         assert response.media[1].thumbnail is not None
+        assert await service.get_extraction(response.extraction_id) == response
         assert "cdn.test" not in response.model_dump_json()
         assert route.call_count == 1
     finally:

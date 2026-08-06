@@ -3,11 +3,10 @@ from __future__ import annotations
 from typing import cast
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
 from ...models import (
-    TelegramDeliveryRecord,
+    TelegramAPIResponse,
     TelegramMultiDeliveryResponse,
     TikTokExtractionRequest,
     TikTokExtractionResponse,
@@ -16,57 +15,64 @@ from ...models import (
     TikTokTelegramDeliveryRequest,
 )
 from ..dependencies import require_api_key
+from ..responses import AUTHENTICATED_RESPONSES, TELEGRAM_DELIVERY_RESPONSES
+from ..telegram import telegram_delivery_response
 
 router = APIRouter(
     prefix="/v1/tiktok",
     tags=["tiktok"],
     dependencies=[Depends(require_api_key)],
+    responses=AUTHENTICATED_RESPONSES,
 )
 
 
-@router.post("/extractions", response_model=TikTokExtractionResponse)
+@router.post(
+    "/extractions",
+    response_model=TikTokExtractionResponse,
+    operation_id="extractTikTok",
+)
 async def extract_tiktok(
     payload: TikTokExtractionRequest, request: Request
 ) -> TikTokExtractionResponse:
+    """Extract a TikTok post and return short-lived opaque asset references."""
     result = await request.app.state.tiktok.extract_url(str(payload.url), refresh=payload.refresh)
     return cast(TikTokExtractionResponse, result)
 
 
-@router.post("/music", response_model=TikTokMusicResponse)
+@router.post(
+    "/music",
+    response_model=TikTokMusicResponse,
+    operation_id="extractTikTokMusic",
+)
 async def extract_tiktok_music(
     payload: TikTokMusicRequest, request: Request
 ) -> TikTokMusicResponse:
+    """Extract the music attached to a TikTok post by numeric post ID."""
     result = await request.app.state.tiktok.extract_music(payload.video_id)
     return cast(TikTokMusicResponse, result)
 
 
-@router.post("/telegram-deliveries", response_model=None)
+@router.post(
+    "/telegram-deliveries",
+    response_model=TelegramAPIResponse | TelegramMultiDeliveryResponse,
+    operation_id="deliverTikTokToTelegram",
+    responses=TELEGRAM_DELIVERY_RESPONSES,
+)
 async def deliver_tiktok_to_telegram(
     payload: TikTokTelegramDeliveryRequest, request: Request
 ) -> Response:
-    outcome = await request.app.state.telegram_delivery.deliver(payload)
-    if len(outcome.calls) == 1:
-        call = outcome.calls[0]
-        return Response(
-            content=call.body,
-            status_code=call.status_code,
-            headers={"Content-Type": call.content_type},
-        )
+    """Resolve, prepare, and upload TikTok media using the server's Telegram bot.
 
-    ok = all(call.ok for call in outcome.calls)
-    response = TelegramMultiDeliveryResponse(
-        ok=ok,
-        partial=not ok and any(call.ok for call in outcome.calls),
-        deliveries=[
-            TelegramDeliveryRecord(
-                method=call.method,
-                status_code=call.status_code,
-                response=call.value,
-            )
-            for call in outcome.calls
-        ],
-    )
-    return JSONResponse(
-        status_code=200 if ok else 207,
-        content=response.model_dump(mode="json"),
-    )
+    `media` sends videos with metadata or slideshows as photo galleries;
+    `document` sends original/file media without Telegram technical metadata; and
+    `audio` sends the post's music. The caller supplies destination and optional
+    Telegram parameters, but never multipart media fields or a bot token.
+
+    A single Telegram call is returned byte-for-byte with Telegram's HTTP status.
+    Multiple gallery batches use `TelegramMultiDeliveryResponse`; HTTP 207 means an
+    earlier batch succeeded before a later one failed. Do not blindly retry the
+    whole request after timeouts or ambiguous upload failures because that can
+    duplicate messages.
+    """
+    outcome = await request.app.state.telegram_delivery.deliver(payload)
+    return telegram_delivery_response(outcome)

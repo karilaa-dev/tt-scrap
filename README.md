@@ -7,7 +7,7 @@ a Telegram bot.
 Supported content:
 
 - TikTok videos, slideshows, covers, and music
-- Direct Telegram video, photo-album, document, and audio delivery
+- Direct Telegram video, photo-album/carousel, document, and audio delivery
 - Instagram reels, images, and mixed carousels
 - TikTok short links, cookies, sticky proxies, rotation, and staged retries
 
@@ -83,6 +83,25 @@ Authorization: Bearer <TT_SCRAP_API_KEY>
 
 Health endpoints and API documentation at `/docs` are public.
 
+### OpenAPI schema
+
+The running service generates its OpenAPI 3.1 contract directly from the current
+FastAPI routes and Pydantic models:
+
+```bash
+curl http://127.0.0.1:8000/openapi.json --output openapi.json
+```
+
+The repository also contains the generated `openapi.json` for client generation
+without a running server. Regenerate it after API or model changes with:
+
+```bash
+uv run tt-scrap-openapi openapi.json
+```
+
+Do not edit the generated document manually. The test suite verifies that it is
+identical to the schema produced by the current application.
+
 ### Extract TikTok media
 
 ```bash
@@ -131,6 +150,26 @@ the selected video's audio is separate, both files are downloaded concurrently a
 FFmpeg stream-copies them into MP4 without re-encoding. This same muxing path is
 used by direct Telegram delivery and `/v1/assets` downloads. Video and audio
 thumbnails are normalized to Telegram-compliant JPEGs.
+
+### Deliver Instagram media to Telegram
+
+```bash
+curl http://127.0.0.1:8000/v1/instagram/telegram-deliveries \
+  -H "Authorization: Bearer $TT_SCRAP_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source":{"url":"https://www.instagram.com/p/SHORTCODE/"},
+    "delivery":"media",
+    "telegram":{"chat_id":1289167515,"caption":"Optional caption"}
+  }'
+```
+
+Instagram delivery accepts a URL or a cached `extraction_id`. Media mode uses
+`sendPhoto`, `sendVideo`, or mixed photo/video `sendMediaGroup` calls while retaining
+carousel order. Document mode sends original/file media and preserves source image
+bytes. Unsupported photos and video thumbnails use the same asynchronous conversion
+pipeline as TikTok. Carousel captions are placed on the first item of the first
+album batch.
 
 Slideshow photo mode passes static JPEG, PNG, and WebP through unchanged. Other
 decodable formats are converted concurrently to baseline JPEG in persistent image

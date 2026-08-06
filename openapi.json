@@ -1,0 +1,1848 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "tt-scrap",
+    "description": "Authenticated extraction, download, and direct Telegram-delivery API for TikTok and\nInstagram.\n\n## Client integration\n\nUse the origin that served this document as the API base URL. Every `/v1/*` request\nrequires `Authorization: Bearer <TT_SCRAP_API_KEY>`. `/openapi.json`, `/docs`, and\nhealth endpoints are public. API errors use `ErrorResponse`; keep `error.request_id`\nfor diagnostics and branch on the stable `error.code` rather than message text.\n\n### TikTok information and downloads\n\nCall `extractTikTok` with a public TikTok URL. The response contains metadata and\nopaque `AssetDescriptor.download_url` paths instead of upstream CDN URLs. Resolve a\nrelative download path against the tt-scrap base URL, send the bearer token again,\nand consume it before `expires_at`. TikTok metadata and `extraction_id` are cached\nbriefly (60 seconds by default); asset tokens normally live longer. A repeated URL\nwithin the metadata TTL reuses extraction work unless `refresh=true`.\n\nVideo selection is server-side: highest pixel resolution first, then TikTok's\nprecomputed original-reference MVMAF score. When the selected adaptive stream has\nseparate audio, tt-scrap downloads both concurrently and stream-copies them into MP4\nwithout re-encoding. This happens for both `downloadAsset` and Telegram delivery.\n\nCall `extractInstagram` with a post or reel URL to receive ordered image/video items\nand opaque asset paths. Its `extraction_id` can be passed directly to\n`deliverInstagramToTelegram` while cached, avoiding another Instagram API request.\n\n### Direct Telegram delivery\n\nCall `deliverTikTokToTelegram` or `deliverInstagramToTelegram`; the Telegram bot token\nis configured on tt-scrap and must not be sent by the client. TikTok `source` accepts\nexactly one of `url`, a recent `extraction_id`, or `video_id`; `video_id` is valid only\nwith `delivery=\"audio\"`. Instagram `source` accepts exactly one of `url` or a recent\n`extraction_id`. `refresh=true` cannot be combined with `extraction_id`.\n\nDelivery modes:\n\n* `media`: video via `sendVideo`; one slideshow image via `sendPhoto`; multiple\n  slideshow images via one or more `sendMediaGroup` calls.\n* `document`: video via `sendDocument`; slideshow images as document media groups.\n  Original image bytes are preserved and video/photo technical metadata is omitted.\n* `audio`: TikTok music via `sendAudio`, with inferred title, performer, duration,\n  filename, and a converted thumbnail when available.\n\nInstagram supports `media` and `document`. A mixed carousel is sent in source order\nas photo/video media groups; document mode sends every carousel item as a document.\n\n`telegram.chat_id` is required. Other Telegram fields are optional overrides. The\nclient must not provide managed multipart fields: `video`, `audio`, `photo`,\n`document`, `media`, `thumbnail`, or `cover`. Parameter validity depends on the\nchosen media and delivery mode; unsupported combinations return\n`telegram_parameter_not_supported`. TikTok slideshow delivery does not accept caption\nfields. Instagram carousel captions are attached to the first item of the first\nalbum batch.\n\nFor one Telegram API call, tt-scrap returns Telegram's JSON and HTTP status directly.\nFor several album batches, it returns `TelegramMultiDeliveryResponse` in order. HTTP\n207 means at least one earlier batch succeeded before a later failure. Do not\nautomatically retry an ambiguous delivery timeout or an entire partial delivery,\nbecause doing so can duplicate Telegram messages.\n\n### Slideshows and images\n\nTikTok slideshows and Instagram carousels are prepared fully before the first\nTelegram call, retain their original order, and are partitioned into valid albums of\n2-10 items. Supported photo formats pass through; unsupported formats are converted\nasynchronously to baseline JPEG. Document mode preserves original image formats.\nVideo and audio covers are normalized to Telegram-compatible JPEG thumbnails.",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/health/live": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Live",
+        "description": "Report whether the process can serve HTTP requests.",
+        "operationId": "getHealthLive",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LiveResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Ready",
+        "description": "Report whether required configuration is present.",
+        "operationId": "getHealthReady",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A required service credential is not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tiktok/extractions": {
+      "post": {
+        "tags": [
+          "tiktok"
+        ],
+        "summary": "Extract Tiktok",
+        "description": "Extract a TikTok post and return short-lived opaque asset references.",
+        "operationId": "extractTikTok",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TikTokExtractionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TikTokExtractionResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid tt-scrap bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request validation or delivery-parameter error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Stable tt-scrap error envelope; inspect error.code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tiktok/music": {
+      "post": {
+        "tags": [
+          "tiktok"
+        ],
+        "summary": "Extract Tiktok Music",
+        "description": "Extract the music attached to a TikTok post by numeric post ID.",
+        "operationId": "extractTikTokMusic",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TikTokMusicRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TikTokMusicResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid tt-scrap bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request validation or delivery-parameter error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Stable tt-scrap error envelope; inspect error.code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/tiktok/telegram-deliveries": {
+      "post": {
+        "tags": [
+          "tiktok"
+        ],
+        "summary": "Deliver Tiktok To Telegram",
+        "description": "Resolve, prepare, and upload TikTok media using the server's Telegram bot.\n\n`media` sends videos with metadata or slideshows as photo galleries;\n`document` sends original/file media without Telegram technical metadata; and\n`audio` sends the post's music. The caller supplies destination and optional\nTelegram parameters, but never multipart media fields or a bot token.\n\nA single Telegram call is returned byte-for-byte with Telegram's HTTP status.\nMultiple gallery batches use `TelegramMultiDeliveryResponse`; HTTP 207 means an\nearlier batch succeeded before a later one failed. Do not blindly retry the\nwhole request after timeouts or ambiguous upload failures because that can\nduplicate messages.",
+        "operationId": "deliverTikTokToTelegram",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TikTokTelegramDeliveryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/TelegramAPIResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TelegramMultiDeliveryResponse"
+                    }
+                  ],
+                  "title": "Response Delivertiktoktotelegram"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid tt-scrap bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request validation or delivery-parameter error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A raw Telegram Bot API failure or a stable tt-scrap error envelope. Do not automatically retry an ambiguous upload response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/TelegramAPIResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ],
+                  "title": "Response Default Delivertiktoktotelegram"
+                }
+              }
+            }
+          },
+          "207": {
+            "description": "Some earlier Telegram album batches succeeded before a failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelegramMultiDeliveryResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/instagram/extractions": {
+      "post": {
+        "tags": [
+          "instagram"
+        ],
+        "summary": "Extract Instagram",
+        "description": "Extract an Instagram post into ordered opaque media and thumbnail references.",
+        "operationId": "extractInstagram",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstagramExtractionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstagramExtractionResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid tt-scrap bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request validation or delivery-parameter error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Stable tt-scrap error envelope; inspect error.code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/instagram/telegram-deliveries": {
+      "post": {
+        "tags": [
+          "instagram"
+        ],
+        "summary": "Deliver Instagram To Telegram",
+        "description": "Resolve, prepare, and upload Instagram media using the server's Telegram bot.\n\nA single image uses `sendPhoto`, a single video uses `sendVideo`, and a carousel\nuses mixed `sendMediaGroup` batches. Document mode sends all items as files.\nUnsupported image formats and video thumbnails are converted asynchronously.\n\nOne Telegram call is returned verbatim. Multiple batches return\n`TelegramMultiDeliveryResponse`; do not retry an ambiguous or partial upload\nautomatically because that can duplicate messages.",
+        "operationId": "deliverInstagramToTelegram",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstagramTelegramDeliveryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/TelegramAPIResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TelegramMultiDeliveryResponse"
+                    }
+                  ],
+                  "title": "Response Deliverinstagramtotelegram"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid tt-scrap bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request validation or delivery-parameter error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A raw Telegram Bot API failure or a stable tt-scrap error envelope. Do not automatically retry an ambiguous upload response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/TelegramAPIResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ],
+                  "title": "Response Default Deliverinstagramtotelegram"
+                }
+              }
+            }
+          },
+          "207": {
+            "description": "Some earlier Telegram album batches succeeded before a failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelegramMultiDeliveryResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/assets/{token}": {
+      "get": {
+        "tags": [
+          "assets"
+        ],
+        "summary": "Get Asset",
+        "description": "Download an opaque asset URL returned by an extraction response.\n\nSend the same tt-scrap bearer token used for extraction. The token is temporary;\ndownload before the descriptor's `expires_at`. For TikTok adaptive video, this\nrequest also downloads the separate audio and performs a stream-copy MP4 mux\nbefore responding, so the downloaded video is playable and contains audio.",
+        "operationId": "downloadAsset",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Resolved media bytes; Content-Type reflects the detected format",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "video/mp4": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "audio/mpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "audio/mp4": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/webp": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/heic": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/heif": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/avif": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/tiff": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/bmp": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/gif": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            },
+            "headers": {
+              "Content-Length": {
+                "description": "Exact response size in bytes",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Content-Disposition": {
+                "description": "Attachment filename with a detected-format extension",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "ETag": {
+                "description": "Quoted SHA-256 digest",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Content-SHA256": {
+                "description": "Unquoted SHA-256 digest",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Cache-Control": {
+                "description": "Always private, no-store",
+                "schema": {
+                  "type": "string",
+                  "example": "private, no-store"
+                }
+              },
+              "X-Request-ID": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid tt-scrap bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request validation or delivery-parameter error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Stable tt-scrap error envelope; inspect error.code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AssetDescriptor": {
+        "properties": {
+          "asset_id": {
+            "type": "string",
+            "title": "Asset Id",
+            "description": "Opaque asset token; do not parse or persist it"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "video",
+              "image",
+              "audio",
+              "cover",
+              "thumbnail"
+            ],
+            "title": "Kind",
+            "description": "Logical purpose of this asset"
+          },
+          "position": {
+            "type": "integer",
+            "title": "Position",
+            "description": "Zero-based order within the post",
+            "default": 0
+          },
+          "download_url": {
+            "type": "string",
+            "title": "Download Url",
+            "description": "Relative authenticated download path. Resolve against the tt-scrap base URL"
+          },
+          "filename": {
+            "type": "string",
+            "title": "Filename",
+            "description": "Suggested filename before final format detection"
+          },
+          "content_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content Type",
+            "description": "Declared MIME type when known; trust the download response type"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At",
+            "description": "Expiry time for this asset reference"
+          }
+        },
+        "type": "object",
+        "required": [
+          "asset_id",
+          "kind",
+          "download_url",
+          "filename",
+          "expires_at"
+        ],
+        "title": "AssetDescriptor",
+        "description": "Temporary opaque reference to media that tt-scrap can download on demand."
+      },
+      "ErrorDetail": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code",
+            "description": "Stable error identifier suitable for branching"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message",
+            "description": "Human-readable diagnostic; wording may change"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id",
+            "description": "Correlation ID to retain for logs and support"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "request_id"
+        ],
+        "title": "ErrorDetail",
+        "description": "Stable machine-readable error details."
+      },
+      "ErrorResponse": {
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "title": "ErrorResponse",
+        "description": "Error envelope returned by tt-scrap exception handlers."
+      },
+      "InstagramExtractionRequest": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "maxLength": 2083,
+            "minLength": 1,
+            "format": "uri",
+            "title": "Url",
+            "description": "Public Instagram post, reel, TV, or story URL"
+          },
+          "refresh": {
+            "type": "boolean",
+            "title": "Refresh",
+            "description": "Bypass cached extraction and create a new extraction_id",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "title": "InstagramExtractionRequest",
+        "description": "Extract metadata and assets from an Instagram post URL.",
+        "examples": [
+          {
+            "refresh": false,
+            "url": "https://www.instagram.com/reel/SHORTCODE/"
+          }
+        ]
+      },
+      "InstagramExtractionResponse": {
+        "properties": {
+          "extraction_id": {
+            "type": "string",
+            "title": "Extraction Id",
+            "description": "Cached extraction reference reusable by Instagram Telegram delivery"
+          },
+          "platform": {
+            "type": "string",
+            "const": "instagram",
+            "title": "Platform",
+            "default": "instagram"
+          },
+          "source_url": {
+            "type": "string",
+            "title": "Source Url"
+          },
+          "content_type": {
+            "type": "string",
+            "enum": [
+              "video",
+              "image",
+              "carousel"
+            ],
+            "title": "Content Type",
+            "description": "Single media kind or an ordered mixed carousel"
+          },
+          "media": {
+            "items": {
+              "$ref": "#/components/schemas/InstagramMediaItem"
+            },
+            "type": "array",
+            "title": "Media",
+            "description": "Ordered extracted media items"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At",
+            "description": "Expiry time for the associated asset references"
+          }
+        },
+        "type": "object",
+        "required": [
+          "extraction_id",
+          "source_url",
+          "content_type",
+          "media",
+          "expires_at"
+        ],
+        "title": "InstagramExtractionResponse",
+        "description": "Normalized Instagram post information and temporary asset references."
+      },
+      "InstagramMediaItem": {
+        "properties": {
+          "position": {
+            "type": "integer",
+            "title": "Position",
+            "description": "Zero-based source carousel order"
+          },
+          "media_type": {
+            "type": "string",
+            "enum": [
+              "video",
+              "image"
+            ],
+            "title": "Media Type",
+            "description": "Telegram media type selected for this item"
+          },
+          "quality": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quality",
+            "description": "Upstream quality label when supplied"
+          },
+          "asset": {
+            "$ref": "#/components/schemas/AssetDescriptor",
+            "description": "Temporary image or video asset"
+          },
+          "thumbnail": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AssetDescriptor"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional video thumbnail prepared for Telegram media mode"
+          }
+        },
+        "type": "object",
+        "required": [
+          "position",
+          "media_type",
+          "asset"
+        ],
+        "title": "InstagramMediaItem",
+        "description": "One ordered Instagram media item with an optional thumbnail."
+      },
+      "InstagramTelegramDeliveryRequest": {
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/InstagramTelegramSource"
+          },
+          "delivery": {
+            "type": "string",
+            "enum": [
+              "media",
+              "document"
+            ],
+            "title": "Delivery",
+            "description": "media sends displayable media; document sends original/file media",
+            "default": "media"
+          },
+          "refresh": {
+            "type": "boolean",
+            "title": "Refresh",
+            "description": "Bypass cached URL extraction; invalid with source.extraction_id",
+            "default": false
+          },
+          "telegram": {
+            "$ref": "#/components/schemas/TelegramParameters"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source",
+          "telegram"
+        ],
+        "title": "InstagramTelegramDeliveryRequest",
+        "description": "Request direct Telegram delivery of an Instagram post.\n\n`media` sends photos, videos, or mixed media groups. `document` sends every\nitem as a file and preserves original image bytes. The Telegram bot token is\nconfigured on tt-scrap and is not part of this request.",
+        "examples": [
+          {
+            "delivery": "media",
+            "refresh": false,
+            "source": {
+              "url": "https://www.instagram.com/reel/SHORTCODE/"
+            },
+            "telegram": {
+              "caption": "Optional caption",
+              "chat_id": 123456789
+            }
+          },
+          {
+            "delivery": "document",
+            "source": {
+              "extraction_id": "recent-extraction-id"
+            },
+            "telegram": {
+              "chat_id": 123456789
+            }
+          }
+        ]
+      },
+      "InstagramTelegramSource": {
+        "properties": {
+          "url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2083,
+                "minLength": 1,
+                "format": "uri"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url",
+            "description": "Instagram post or reel URL"
+          },
+          "extraction_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extraction Id",
+            "description": "Recent Instagram extraction_id; avoids another upstream request"
+          }
+        },
+        "type": "object",
+        "title": "InstagramTelegramSource",
+        "description": "Exactly one Instagram source selector for Telegram delivery."
+      },
+      "LiveResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "ok",
+            "title": "Status",
+            "default": "ok"
+          }
+        },
+        "type": "object",
+        "title": "LiveResponse"
+      },
+      "ReadyResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "ready",
+            "title": "Status",
+            "default": "ready"
+          }
+        },
+        "type": "object",
+        "title": "ReadyResponse"
+      },
+      "TelegramAPIResponse": {
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "title": "Ok"
+          },
+          "result": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "parameters": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameters"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "ok"
+        ],
+        "title": "TelegramAPIResponse",
+        "description": "Raw response envelope returned by the Telegram Bot API."
+      },
+      "TelegramDeliveryRecord": {
+        "properties": {
+          "method": {
+            "type": "string",
+            "title": "Method"
+          },
+          "status_code": {
+            "type": "integer",
+            "title": "Status Code"
+          },
+          "response": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response"
+          }
+        },
+        "type": "object",
+        "required": [
+          "method",
+          "status_code",
+          "response"
+        ],
+        "title": "TelegramDeliveryRecord",
+        "description": "One attempted Telegram album batch in delivery order."
+      },
+      "TelegramMultiDeliveryResponse": {
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "title": "Ok"
+          },
+          "partial": {
+            "type": "boolean",
+            "title": "Partial"
+          },
+          "deliveries": {
+            "items": {
+              "$ref": "#/components/schemas/TelegramDeliveryRecord"
+            },
+            "type": "array",
+            "title": "Deliveries"
+          }
+        },
+        "type": "object",
+        "required": [
+          "ok",
+          "partial",
+          "deliveries"
+        ],
+        "title": "TelegramMultiDeliveryResponse",
+        "description": "Result used when a slideshow requires multiple Telegram album calls."
+      },
+      "TelegramParameters": {
+        "properties": {
+          "chat_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Chat Id",
+            "description": "Target chat ID or @channelusername accepted by the configured bot"
+          },
+          "business_connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Business Connection Id"
+          },
+          "message_thread_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message Thread Id"
+          },
+          "direct_messages_topic_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Direct Messages Topic Id"
+          },
+          "receiver_user_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Receiver User Id"
+          },
+          "callback_query_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Callback Query Id"
+          },
+          "duration": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration"
+          },
+          "width": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Width"
+          },
+          "height": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Height"
+          },
+          "start_timestamp": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Timestamp"
+          },
+          "caption": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Caption",
+            "description": "Caption for single calls; Instagram carousels use the first item; TikTok slideshows reject it"
+          },
+          "parse_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parse Mode"
+          },
+          "caption_entities": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Caption Entities"
+          },
+          "show_caption_above_media": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Show Caption Above Media"
+          },
+          "has_spoiler": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Has Spoiler"
+          },
+          "supports_streaming": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Supports Streaming"
+          },
+          "disable_content_type_detection": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disable Content Type Detection"
+          },
+          "performer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Performer"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "disable_notification": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disable Notification"
+          },
+          "protect_content": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Protect Content"
+          },
+          "allow_paid_broadcast": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Allow Paid Broadcast"
+          },
+          "message_effect_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message Effect Id"
+          },
+          "suggested_post_parameters": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Suggested Post Parameters"
+          },
+          "reply_parameters": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Parameters"
+          },
+          "reply_markup": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Markup"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "chat_id"
+        ],
+        "title": "TelegramParameters",
+        "description": "Destination and caller-controlled Telegram Bot API parameters.\n\nExtra Telegram fields are forwarded when compatible with the selected method.\ntt-scrap owns all multipart media fields, so callers must not supply `video`,\n`audio`, `photo`, `document`, `media`, `thumbnail`, or `cover`. Fields supported\nby one Telegram method can be rejected for another delivery/media combination."
+      },
+      "TikTokExtractionRequest": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "maxLength": 2083,
+            "minLength": 1,
+            "format": "uri",
+            "title": "Url",
+            "description": "Public TikTok video, slideshow, or short URL"
+          },
+          "refresh": {
+            "type": "boolean",
+            "title": "Refresh",
+            "description": "Bypass the short metadata cache and create a new extraction",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "title": "TikTokExtractionRequest",
+        "description": "Extract metadata and temporary asset references from a TikTok URL.",
+        "examples": [
+          {
+            "refresh": false,
+            "url": "https://www.tiktok.com/@creator/video/1234567890123456789"
+          }
+        ]
+      },
+      "TikTokExtractionResponse": {
+        "properties": {
+          "extraction_id": {
+            "type": "string",
+            "title": "Extraction Id",
+            "description": "Short-lived extraction reference reusable by Telegram delivery; default TTL 60s"
+          },
+          "platform": {
+            "type": "string",
+            "const": "tiktok",
+            "title": "Platform",
+            "default": "tiktok"
+          },
+          "source_id": {
+            "type": "string",
+            "title": "Source Id"
+          },
+          "source_url": {
+            "type": "string",
+            "title": "Source Url"
+          },
+          "resolved_url": {
+            "type": "string",
+            "title": "Resolved Url"
+          },
+          "content_type": {
+            "type": "string",
+            "enum": [
+              "video",
+              "slideshow"
+            ],
+            "title": "Content Type",
+            "description": "Determines whether media contains one video or ordered slideshow images"
+          },
+          "cover": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AssetDescriptor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "width": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Width"
+          },
+          "height": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Height"
+          },
+          "duration_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Seconds"
+          },
+          "likes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Likes"
+          },
+          "views": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Views"
+          },
+          "media": {
+            "items": {
+              "$ref": "#/components/schemas/AssetDescriptor"
+            },
+            "type": "array",
+            "title": "Media",
+            "description": "One selected best-quality video or ordered slideshow images"
+          },
+          "music": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TikTokMusicMetadata"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "extraction_id",
+          "source_id",
+          "source_url",
+          "resolved_url",
+          "content_type",
+          "media",
+          "expires_at"
+        ],
+        "title": "TikTokExtractionResponse",
+        "description": "Normalized TikTok post information with no upstream CDN URLs exposed."
+      },
+      "TikTokMusicMetadata": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "author": {
+            "type": "string",
+            "title": "Author"
+          },
+          "duration_seconds": {
+            "type": "integer",
+            "title": "Duration Seconds"
+          },
+          "cover": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AssetDescriptor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "audio": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AssetDescriptor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "title",
+          "author",
+          "duration_seconds"
+        ],
+        "title": "TikTokMusicMetadata",
+        "description": "Music information embedded in a TikTok extraction response."
+      },
+      "TikTokMusicRequest": {
+        "properties": {
+          "video_id": {
+            "type": "integer",
+            "exclusiveMinimum": 0.0,
+            "title": "Video Id",
+            "description": "Numeric TikTok post ID"
+          }
+        },
+        "type": "object",
+        "required": [
+          "video_id"
+        ],
+        "title": "TikTokMusicRequest",
+        "description": "Extract TikTok music using a numeric post ID.",
+        "examples": [
+          {
+            "video_id": 1234567890123456789
+          }
+        ]
+      },
+      "TikTokMusicResponse": {
+        "properties": {
+          "extraction_id": {
+            "type": "string",
+            "title": "Extraction Id"
+          },
+          "platform": {
+            "type": "string",
+            "const": "tiktok",
+            "title": "Platform",
+            "default": "tiktok"
+          },
+          "source_id": {
+            "type": "string",
+            "title": "Source Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "author": {
+            "type": "string",
+            "title": "Author"
+          },
+          "duration_seconds": {
+            "type": "integer",
+            "title": "Duration Seconds"
+          },
+          "cover": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AssetDescriptor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "audio": {
+            "$ref": "#/components/schemas/AssetDescriptor"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "extraction_id",
+          "source_id",
+          "title",
+          "author",
+          "duration_seconds",
+          "audio",
+          "expires_at"
+        ],
+        "title": "TikTokMusicResponse",
+        "description": "TikTok music metadata and temporary audio/cover asset references."
+      },
+      "TikTokTelegramDeliveryRequest": {
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/TikTokTelegramSource",
+            "description": "Exactly one TikTok source selector"
+          },
+          "delivery": {
+            "type": "string",
+            "enum": [
+              "media",
+              "document",
+              "audio"
+            ],
+            "title": "Delivery",
+            "description": "media sends playable media/galleries; document sends files; audio sends music",
+            "default": "media"
+          },
+          "refresh": {
+            "type": "boolean",
+            "title": "Refresh",
+            "description": "Bypass cached URL extraction; invalid with source.extraction_id",
+            "default": false
+          },
+          "telegram": {
+            "$ref": "#/components/schemas/TelegramParameters",
+            "description": "Telegram destination and optional method-compatible overrides"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source",
+          "telegram"
+        ],
+        "title": "TikTokTelegramDeliveryRequest",
+        "description": "Request server-side TikTok preparation and direct Telegram upload.\n\nThe Telegram bot token is server configuration, not part of this request.\n`refresh` cannot be used with `source.extraction_id`.",
+        "examples": [
+          {
+            "delivery": "media",
+            "refresh": false,
+            "source": {
+              "url": "https://www.tiktok.com/@creator/video/1234567890123456789"
+            },
+            "telegram": {
+              "caption": "Optional caption",
+              "chat_id": 123456789
+            }
+          },
+          {
+            "delivery": "document",
+            "source": {
+              "extraction_id": "recent-extraction-id"
+            },
+            "telegram": {
+              "chat_id": 123456789
+            }
+          },
+          {
+            "delivery": "audio",
+            "source": {
+              "video_id": 1234567890123456789
+            },
+            "telegram": {
+              "chat_id": 123456789
+            }
+          }
+        ]
+      },
+      "TikTokTelegramSource": {
+        "properties": {
+          "url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2083,
+                "minLength": 1,
+                "format": "uri"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url",
+            "description": "TikTok URL to resolve and extract"
+          },
+          "extraction_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extraction Id",
+            "description": "Recent extraction_id; avoids URL resolution and extraction"
+          },
+          "video_id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Video Id",
+            "description": "Numeric TikTok post ID; only valid when delivery is audio"
+          }
+        },
+        "type": "object",
+        "title": "TikTokTelegramSource",
+        "description": "Exactly one source selector for Telegram delivery.\n\n`url` performs or reuses extraction, `extraction_id` reuses recent extraction\ncontext, and `video_id` is accepted only for audio delivery."
+      }
+    },
+    "securitySchemes": {
+      "HTTPBearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "health",
+      "description": "Unauthenticated process health checks."
+    },
+    {
+      "name": "tiktok",
+      "description": "TikTok metadata extraction, music extraction, and Telegram delivery."
+    },
+    {
+      "name": "instagram",
+      "description": "Instagram metadata extraction, opaque assets, and direct Telegram delivery."
+    },
+    {
+      "name": "assets",
+      "description": "Authenticated streaming download of temporary opaque assets."
+    }
+  ]
+}

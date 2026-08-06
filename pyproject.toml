@@ -30,6 +30,7 @@ dev = [
 
 [project.scripts]
 tt-scrap = "tt_scrap.main:run"
+tt-scrap-openapi = "tt_scrap.openapi:run"
 
 [build-system]
 requires = ["hatchling"]
