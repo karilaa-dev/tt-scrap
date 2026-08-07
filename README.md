@@ -109,6 +109,18 @@ identical to the schema produced by the current application.
 
 ### Extract TikTok media
 
+Resolve a short TikTok share link without extracting metadata or downloading media:
+
+```bash
+curl http://127.0.0.1:8000/v1/tiktok/resolutions \
+  -H "Authorization: Bearer $TT_SCRAP_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://www.tiktok.com/t/EXAMPLE/"}'
+```
+
+The response includes the numeric `source_id` and full `resolved_url`. A client can
+use `source_id` to check its database before requesting extraction or delivery.
+
 ```bash
 curl http://127.0.0.1:8000/v1/tiktok/extractions \
   -H "Authorization: Bearer $TT_SCRAP_API_KEY" \

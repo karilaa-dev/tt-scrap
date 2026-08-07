@@ -43,6 +43,10 @@ send a caller-generated `X-Request-ID` to correlate the response with server log
 
 ### TikTok information and downloads
 
+Call `resolveTikTokUrl` to turn a short share URL into its full TikTok post URL and
+numeric `source_id` without extracting metadata or downloading media. This lets a
+client check its own database before doing any extraction work.
+
 Call `extractTikTok` with a public TikTok URL. The response contains metadata and
 opaque `AssetDescriptor.download_url` paths instead of upstream CDN URLs. Resolve a
 relative download path against the tt-scrap base URL, send the bearer token again,
@@ -106,7 +110,9 @@ _OPENAPI_TAGS = [
     {"name": "health", "description": "Unauthenticated process health checks."},
     {
         "name": "tiktok",
-        "description": "TikTok metadata extraction, music extraction, and Telegram delivery.",
+        "description": (
+            "TikTok URL resolution, metadata extraction, music extraction, and Telegram delivery."
+        ),
     },
     {
         "name": "instagram",

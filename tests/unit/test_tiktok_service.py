@@ -70,6 +70,60 @@ def test_video_url_fallback() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_resolution_returns_post_id_without_extraction_and_is_cached(settings) -> None:
+    service, _cache = make_service(settings, {})
+    short_url = "https://www.tiktok.com/t/EXAMPLE/"
+
+    first = await service.resolve_url(short_url)
+    second = await service.resolve_url(short_url)
+
+    assert first == second
+    assert first.source_id == "123"
+    assert first.source_url == short_url
+    assert first.resolved_url == "https://www.tiktok.com/@creator/video/123"
+    assert service.adapter.resolve_calls == 1
+    assert service.adapter.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_extraction_reuses_cached_resolution(settings) -> None:
+    service, _cache = make_service(
+        settings,
+        {
+            "video": {
+                "playAddr": "https://video.cdn.test/media",
+                "width": 720,
+                "height": 1280,
+                "duration": 5,
+            }
+        },
+    )
+    short_url = "https://www.tiktok.com/t/EXAMPLE/"
+
+    await service.resolve_url(short_url)
+    extraction = await service.extract_url(short_url)
+
+    assert extraction.source_id == "123"
+    assert service.adapter.resolve_calls == 1
+    assert service.adapter.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_extraction_bypasses_cached_resolution(settings) -> None:
+    service, _cache = make_service(
+        settings,
+        {"video": {"playAddr": "https://video.cdn.test/media", "duration": 5}},
+    )
+    short_url = "https://www.tiktok.com/t/EXAMPLE/"
+
+    await service.resolve_url(short_url)
+    await service.extract_url(short_url, refresh=True)
+
+    assert service.adapter.resolve_calls == 2
+    assert service.adapter.calls == 1
+
+
 def test_video_source_selects_known_quality_tag_and_preserves_mirrors() -> None:
     source = select_video_source(
         {

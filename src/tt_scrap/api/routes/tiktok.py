@@ -12,6 +12,8 @@ from ...models import (
     TikTokExtractionResponse,
     TikTokMusicRequest,
     TikTokMusicResponse,
+    TikTokResolutionRequest,
+    TikTokResolutionResponse,
     TikTokTelegramDeliveryRequest,
 )
 from ..dependencies import require_api_key
@@ -24,6 +26,23 @@ router = APIRouter(
     dependencies=[Depends(require_api_key)],
     responses=AUTHENTICATED_RESPONSES,
 )
+
+
+@router.post(
+    "/resolutions",
+    response_model=TikTokResolutionResponse,
+    operation_id="resolveTikTokUrl",
+)
+async def resolve_tiktok_url(
+    payload: TikTokResolutionRequest, request: Request
+) -> TikTokResolutionResponse:
+    """Follow a TikTok share link and return its full post URL and numeric ID.
+
+    This endpoint performs redirect resolution only. It does not call the TikTok
+    metadata extractor, create asset references, or download any media.
+    """
+    result = await request.app.state.tiktok.resolve_url(str(payload.url))
+    return cast(TikTokResolutionResponse, result)
 
 
 @router.post(

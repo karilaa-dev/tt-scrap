@@ -26,6 +26,7 @@ from ...models import (
     TikTokExtractionResponse,
     TikTokMusicMetadata,
     TikTokMusicResponse,
+    TikTokResolutionResponse,
 )
 from ...proxy import ProxyManager, ProxySession
 from .adapter import TikTokAdapter, YtdlpContext, validate_tiktok_url
@@ -341,6 +342,71 @@ class TikTokService:
             success=True,
         )
 
+    @staticmethod
+    def _log_resolution(
+        response: TikTokResolutionResponse,
+        started_at: float,
+        *,
+        cache_hit: bool,
+        cache_scope: str | None = None,
+    ) -> None:
+        log_event(
+            logger,
+            "tiktok.resolution.completed",
+            message=(
+                "TikTok URL resolution served from cache"
+                if cache_hit
+                else "TikTok URL resolution completed"
+            ),
+            platform="tiktok",
+            source_id=response.source_id,
+            cache_hit=cache_hit,
+            cache_scope=cache_scope,
+            elapsed_ms=elapsed_ms(started_at),
+            success=True,
+        )
+
+    async def resolve_url(
+        self, source_url: str, *, refresh: bool = False
+    ) -> TikTokResolutionResponse:
+        """Resolve a share URL and return its post ID without extracting metadata."""
+        started_at = perf_counter()
+        source_url = source_url.strip()
+        validate_tiktok_url(source_url)
+        cache_key = self.cache.metadata_key("tiktok-resolution", source_url)
+        if not refresh:
+            cached = await self.cache.get_model(cache_key, TikTokResolutionResponse)
+            if cached:
+                self._log_resolution(cached, started_at, cache_hit=True, cache_scope="url")
+                return cached
+
+        async with self._key_lock(cache_key):
+            if not refresh:
+                cached = await self.cache.get_model(cache_key, TikTokResolutionResponse)
+                if cached:
+                    self._log_resolution(
+                        cached,
+                        started_at,
+                        cache_hit=True,
+                        cache_scope="url_coalesced",
+                    )
+                    return cached
+
+            proxy_session = ProxySession(self.proxy_manager)
+            resolved_url = await self.adapter.resolve_url(source_url, proxy_session)
+            response = TikTokResolutionResponse(
+                source_id=self.adapter.extract_id(resolved_url),
+                source_url=source_url,
+                resolved_url=resolved_url,
+            )
+            await self.cache.set_model(
+                cache_key,
+                response,
+                ttl_seconds=self.settings.tiktok_info_cache_ttl_seconds,
+            )
+            self._log_resolution(response, started_at, cache_hit=False)
+            return response
+
     async def _asset(
         self,
         *,
@@ -406,9 +472,9 @@ class TikTokService:
                     )
                     return cached
 
-            proxy_session = ProxySession(self.proxy_manager)
-            resolved_url = await self.adapter.resolve_url(source_url, proxy_session)
-            video_id = self.adapter.extract_id(resolved_url)
+            resolution = await self.resolve_url(source_url, refresh=refresh)
+            resolved_url = resolution.resolved_url
+            video_id = resolution.source_id
             video_cache_key = self.cache.metadata_key("tiktok", video_id)
             if not refresh:
                 cached, remaining_ttl = await self.cache.get_model_with_ttl(
@@ -454,6 +520,7 @@ class TikTokService:
                         return response
 
                 extraction_url = f"https://www.tiktok.com/@_/video/{video_id}"
+                proxy_session = ProxySession(self.proxy_manager)
                 data, context = await self.adapter.extract(extraction_url, video_id, proxy_session)
                 try:
                     response = await self._build_video_response(

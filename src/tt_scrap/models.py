@@ -37,6 +37,31 @@ class TikTokMusicMetadata(BaseModel):
     audio: AssetDescriptor | None = None
 
 
+class TikTokResolutionRequest(BaseModel):
+    """Resolve a TikTok share URL without extracting post metadata or media."""
+
+    model_config = ConfigDict(
+        str_strip_whitespace=True,
+        json_schema_extra={"examples": [{"url": "https://www.tiktok.com/t/EXAMPLE/"}]},
+    )
+
+    url: HttpUrl = Field(description="Public TikTok video, photo, or short share URL")
+
+
+class TikTokResolutionResponse(BaseModel):
+    """Final TikTok post URL and its numeric post identifier."""
+
+    platform: Literal["tiktok"] = "tiktok"
+    source_id: str = Field(
+        pattern=r"^\d+$",
+        description="Numeric TikTok video or photo post ID; preserve it as a string",
+    )
+    source_url: str = Field(description="Original URL supplied by the caller")
+    resolved_url: str = Field(
+        description="Full TikTok video or photo URL after following share-link redirects"
+    )
+
+
 class TikTokExtractionRequest(BaseModel):
     """Extract metadata and temporary asset references from a TikTok URL."""
 

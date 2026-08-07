@@ -5,6 +5,7 @@ import io
 import json
 import logging
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -12,7 +13,7 @@ from pydantic import SecretStr
 
 from tt_scrap.app import create_app
 from tt_scrap.media import DownloadedAsset
-from tt_scrap.models import AssetFetchContext
+from tt_scrap.models import AssetFetchContext, TikTokResolutionResponse
 from tt_scrap.openapi import build_openapi_schema
 from tt_scrap.telegram import TelegramCallResponse, TelegramDeliveryOutcome
 
@@ -134,6 +135,7 @@ async def test_expired_asset_has_stable_error(settings) -> None:
 def test_openapi_has_expected_contract(settings) -> None:
     app = create_app(settings)
     schema = app.openapi()
+    assert "/v1/tiktok/resolutions" in schema["paths"]
     assert "/v1/tiktok/extractions" in schema["paths"]
     assert "/v1/tiktok/music" in schema["paths"]
     assert "/v1/tiktok/telegram-deliveries" in schema["paths"]
@@ -143,6 +145,17 @@ def test_openapi_has_expected_contract(settings) -> None:
     assert "RawVideoResponse" not in schema["components"]["schemas"]
     assert "HTTPValidationError" not in schema["components"]["schemas"]
     assert "## Client integration" in schema["info"]["description"]
+    resolution = schema["paths"]["/v1/tiktok/resolutions"]["post"]
+    assert resolution["operationId"] == "resolveTikTokUrl"
+    assert resolution["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/TikTokResolutionResponse"
+    }
+    assert (
+        schema["components"]["schemas"]["TikTokResolutionResponse"]["properties"]["source_id"][
+            "pattern"
+        ]
+        == r"^\d+$"
+    )
     delivery = schema["paths"]["/v1/tiktok/telegram-deliveries"]["post"]
     assert delivery["operationId"] == "deliverTikTokToTelegram"
     assert delivery["responses"]["200"]["content"]["application/json"]["schema"]["anyOf"]
@@ -169,6 +182,30 @@ def test_openapi_has_expected_contract(settings) -> None:
         for methods in schema["paths"].values()
         for operation in methods.values()
     )
+
+
+@pytest.mark.asyncio
+async def test_tiktok_resolution_endpoint_returns_full_url_without_extraction(settings) -> None:
+    app = create_app(settings)
+    response_model = TikTokResolutionResponse(
+        source_id="1234567890123456789",
+        source_url="https://www.tiktok.com/t/EXAMPLE/",
+        resolved_url="https://www.tiktok.com/@creator/video/1234567890123456789",
+    )
+    async with app.router.lifespan_context(app):
+        resolver = AsyncMock(return_value=response_model)
+        app.state.tiktok.resolve_url = resolver
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/v1/tiktok/resolutions",
+                headers={"Authorization": "Bearer test-api-key-that-is-long-enough"},
+                json={"url": "https://www.tiktok.com/t/EXAMPLE/"},
+            )
+
+    assert response.status_code == 200
+    assert response.json() == response_model.model_dump(mode="json")
+    resolver.assert_awaited_once_with("https://www.tiktok.com/t/EXAMPLE/")
 
 
 def test_exported_openapi_schema_is_current(settings) -> None:

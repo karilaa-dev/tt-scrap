@@ -86,6 +86,22 @@ async def test_short_url_rejects_redirect_to_non_tiktok_host(settings) -> None:
 
 
 @pytest.mark.asyncio
+@respx.mock
+async def test_short_url_follows_redirect_to_full_tiktok_post(settings) -> None:
+    short_url = "https://vt.tiktok.com/EXAMPLE/"
+    full_url = "https://www.tiktok.com/@creator/video/1234567890123456789"
+    respx.get(short_url).mock(return_value=Response(302, headers={"Location": full_url}))
+    respx.get(full_url).mock(return_value=Response(200))
+    adapter = TikTokAdapter(settings, ProxyManager())
+    try:
+        resolved = await adapter.resolve_url(short_url, ProxySession(ProxyManager()))
+        assert resolved == full_url
+        assert adapter.extract_id(resolved) == "1234567890123456789"
+    finally:
+        await adapter.close()
+
+
+@pytest.mark.asyncio
 async def test_transient_metadata_failure_is_retried(settings, monkeypatch) -> None:
     adapter = TikTokAdapter(settings, ProxyManager())
     calls = 0
