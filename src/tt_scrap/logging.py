@@ -111,10 +111,8 @@ class ConsoleFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         timestamp = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         request_id = request_id_var.get()
-        line = (
-            f"{timestamp} {record.levelname:<8} {record.name} "
-            f"[{request_id}] {record.getMessage()}"
-        )
+        message = record.getMessage()
+        line = f"{timestamp} {record.levelname:<8} {record.name} [{request_id}] {message}"
         fields = [
             f"{name}={self._format_value(value)}"
             for name in sorted(_STRUCTURED_FIELDS)
