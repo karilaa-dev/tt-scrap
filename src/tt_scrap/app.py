@@ -135,10 +135,13 @@ def _error_response(status: int, code: str, message: str, request_id: str) -> JS
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     configured_settings = settings or get_settings()
+    # Configure logging while Uvicorn is importing the ASGI application. Doing
+    # this before lifespan startup also gives Uvicorn startup records the same
+    # formatter as application records.
+    configure_logging(configured_settings.log_level, configured_settings.log_format)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        configure_logging(configured_settings.log_level)
         cache = CacheStore(
             configured_settings.cache_ttl_seconds,
             configured_settings.cache_max_entries,

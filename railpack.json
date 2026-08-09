@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "provider": "python",
+  "deploy": {
+    "startCommand": "tt-scrap",
+    "aptPackages": [
+      "ffmpeg"
+    ]
+  }
+}

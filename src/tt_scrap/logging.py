@@ -1,4 +1,4 @@
-"""JSON logging and request correlation."""
+"""Consistent console/JSON logging and request correlation."""
 
 from __future__ import annotations
 
@@ -99,12 +99,48 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
-def configure_logging(level: str) -> None:
+class ConsoleFormatter(logging.Formatter):
+    """Compact, human-readable formatter that retains structured diagnostics."""
+
+    @staticmethod
+    def _format_value(value: object) -> str:
+        if isinstance(value, str):
+            return json.dumps(value, ensure_ascii=False)
+        return json.dumps(value, ensure_ascii=False, default=str)
+
+    def format(self, record: logging.LogRecord) -> str:
+        timestamp = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        request_id = request_id_var.get()
+        line = (
+            f"{timestamp} {record.levelname:<8} {record.name} "
+            f"[{request_id}] {record.getMessage()}"
+        )
+        fields = [
+            f"{name}={self._format_value(value)}"
+            for name in sorted(_STRUCTURED_FIELDS)
+            if (value := getattr(record, name, None)) is not None
+        ]
+        if fields:
+            line = f"{line} {' '.join(fields)}"
+        if record.exc_info:
+            line = f"{line}\n{self.formatException(record.exc_info)}"
+        return line
+
+
+def configure_logging(level: str, log_format: str = "console") -> None:
     handler = logging.StreamHandler()
-    handler.setFormatter(JsonFormatter())
+    handler.setFormatter(JsonFormatter() if log_format == "json" else ConsoleFormatter())
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(level)
+
+    # Uvicorn installs dedicated handlers with its own formatter. Clear them so
+    # startup, shutdown, and application events all use the selected format.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        uvicorn_logger = logging.getLogger(name)
+        uvicorn_logger.handlers.clear()
+        uvicorn_logger.propagate = True
+
     for name in ("httpx", "httpcore", "uvicorn.access"):
         logging.getLogger(name).setLevel(logging.WARNING)

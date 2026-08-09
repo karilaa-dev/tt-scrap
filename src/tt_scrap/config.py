@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     app_version: str = "1.0.0"
     environment: str = "production"
     log_level: str = "INFO"
+    log_format: str = "console"
 
     tt_scrap_api_key: SecretStr = Field(min_length=16)
     rapidapi_key: SecretStr = SecretStr("")
@@ -64,6 +65,14 @@ class Settings(BaseSettings):
         normalized = value.strip().upper()
         if normalized not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ValueError("LOG_LEVEL is invalid")
+        return normalized
+
+    @field_validator("log_format")
+    @classmethod
+    def normalize_log_format(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"console", "json"}:
+            raise ValueError("LOG_FORMAT must be console or json")
         return normalized
 
     @field_validator("telegram_api_base_url")

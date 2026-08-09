@@ -256,7 +256,7 @@ for example `Server-Timing: app;dur=1842.317`. The duration measures server work
 to response streaming; it does not measure how long the caller takes to receive a
 streamed asset.
 
-At `LOG_LEVEL=INFO`, the service writes one JSON `http.request.completed` event for
+At `LOG_LEVEL=INFO`, the service writes one `http.request.completed` event for
 every request and correlated stage events for cache lookups, URL resolution,
 metadata APIs, upstream media downloads, image validation/conversion, separate-track
 downloads, FFmpeg stream-copy remuxing, album preparation, each Telegram API upload,
@@ -264,7 +264,11 @@ and total Telegram delivery. Durations use `elapsed_ms`; bounded pools also repo
 `queue_wait_ms`. Transfer events report byte counts without logging media URLs,
 credentials, cookies, captions, chat IDs, or request bodies.
 
-Use the response's request ID to inspect one complete operation:
+`LOG_FORMAT=console` is the default and produces compact human-readable output for
+terminal and Dokploy logs. Set `LOG_FORMAT=json` when logs are consumed by `jq` or a
+structured log collector. Uvicorn startup/shutdown records use the same formatter.
+
+With `LOG_FORMAT=json`, use the response's request ID to inspect one complete operation:
 
 ```bash
 docker compose logs --no-log-prefix tt-scrap \
