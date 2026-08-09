@@ -818,8 +818,8 @@ class TelegramDeliveryService:
         self, request: TikTokTelegramDeliveryRequest, extraction: TikTokExtractionResponse
     ) -> TelegramDeliveryOutcome:
         if len(extraction.media) == 1:
-            single_fields = _DOCUMENT_FIELDS if request.delivery == "document" else _PHOTO_FIELDS
-            fields = self._fields(request.telegram, single_fields)
+            allowed_fields = _DOCUMENT_FIELDS if request.delivery == "document" else _PHOTO_FIELDS
+            fields = self._fields(request.telegram, allowed_fields)
         else:
             fields = self._fields(request.telegram, _MEDIA_GROUP_FIELDS)
         download_started_at = perf_counter()
@@ -905,20 +905,20 @@ class TelegramDeliveryService:
             if len(prepared) == 1:
                 item = prepared[0]
                 if request.delivery == "document":
-                    single_fields = dict(fields)
-                    single_fields["disable_content_type_detection"] = True
-                    single_fields["document"] = "attach://media_0"
+                    single_call_fields = dict(fields)
+                    single_call_fields["disable_content_type_detection"] = True
+                    single_call_fields["document"] = "attach://media_0"
                     response = await self._client.call(
                         "sendDocument",
-                        single_fields,
+                        single_call_fields,
                         [TelegramUpload("media_0", item.file, item.filename, item.content_type)],
                     )
                 else:
-                    single_fields = dict(fields)
-                    single_fields["photo"] = "attach://media_0"
+                    single_call_fields = dict(fields)
+                    single_call_fields["photo"] = "attach://media_0"
                     response = await self._client.call(
                         "sendPhoto",
-                        single_fields,
+                        single_call_fields,
                         [TelegramUpload("media_0", item.file, item.filename, item.content_type)],
                     )
                 return TelegramDeliveryOutcome([response])

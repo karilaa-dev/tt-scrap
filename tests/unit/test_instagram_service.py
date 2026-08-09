@@ -35,7 +35,7 @@ async def test_mixed_carousel_is_normalized_and_cached(settings) -> None:
                         "url": "https://cdn.test/video",
                         "thumbnail": "https://cdn.test/thumb",
                     },
-                ]
+                ],
             },
         )
     )

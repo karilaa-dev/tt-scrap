@@ -97,7 +97,7 @@ async def test_extraction_reuses_cached_resolution(settings) -> None:
                 "width": 720,
                 "height": 1280,
                 "duration": 5,
-            }
+            },
         },
     )
     short_url = "https://www.tiktok.com/t/EXAMPLE/"
