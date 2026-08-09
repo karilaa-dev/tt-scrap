@@ -87,9 +87,10 @@ as photo/video media groups; document mode sends every carousel item as a docume
 client must not provide managed multipart fields: `video`, `audio`, `photo`,
 `document`, `media`, `thumbnail`, or `cover`. Parameter validity depends on the
 chosen media and delivery mode; unsupported combinations return
-`telegram_parameter_not_supported`. TikTok slideshow delivery does not accept caption
-fields. Instagram carousel captions are attached to the first item of the first
-album batch.
+`telegram_parameter_not_supported`. A one-image TikTok slideshow accepts a caption
+on its single photo or document; multi-image TikTok slideshows do not accept caption
+fields. Instagram carousel captions are attached to the first item of the first album
+batch.
 
 For one Telegram API call, tt-scrap returns Telegram's JSON and HTTP status directly.
 For several album batches, it returns `TelegramMultiDeliveryResponse` in order. HTTP

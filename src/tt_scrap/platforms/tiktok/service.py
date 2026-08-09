@@ -42,6 +42,14 @@ def _first(value: Any) -> str | None:
     return None
 
 
+def _nested_string(value: dict[str, Any], key: str, nested_key: str) -> str | None:
+    nested = value.get(key)
+    if not isinstance(nested, dict):
+        return None
+    candidate = nested.get(nested_key)
+    return candidate.strip() if isinstance(candidate, str) and candidate.strip() else None
+
+
 @dataclass(frozen=True, slots=True)
 class VideoSource:
     url: str
@@ -695,6 +703,7 @@ class TikTokService:
             source_id=video_id,
             source_url=source_url,
             resolved_url=resolved_url,
+            creator_username=_nested_string(data, "author", "uniqueId"),
             content_type=content_type,
             cover=cover,
             width=width,

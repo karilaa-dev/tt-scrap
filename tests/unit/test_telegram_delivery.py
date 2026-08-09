@@ -262,6 +262,33 @@ async def test_slideshow_is_partitioned_without_single_item_tail(settings) -> No
 
 
 @pytest.mark.asyncio
+async def test_single_image_slideshow_attaches_caption_to_photo(settings) -> None:
+    cache = CacheStore(600, 100)
+    image = await descriptor(cache, "image-0", "image")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/photo/123",
+        resolved_url="https://www.tiktok.com/@a/photo/123",
+        content_type="slideshow",
+        media=[image],
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+    downloader = FakeDownloader({"image-0": (b"\xff\xd8\xffimage", "image/jpeg")})
+    client = FakeTelegramClient()
+
+    await service(settings, cache, extraction, downloader, client).deliver(
+        request(caption="source", parse_mode="HTML")
+    )
+
+    method, fields, uploads = client.calls[0]
+    assert method == "sendPhoto"
+    assert fields["caption"] == "source"
+    assert fields["parse_mode"] == "HTML"
+    assert uploads["media_0"] == b"\xff\xd8\xffimage"
+
+
+@pytest.mark.asyncio
 async def test_slideshow_stops_after_first_telegram_failure(settings) -> None:
     cache = CacheStore(600, 100)
     media = [await descriptor(cache, f"image-{index}", "image", index) for index in range(21)]

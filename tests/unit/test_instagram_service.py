@@ -23,6 +23,7 @@ async def test_mixed_carousel_is_normalized_and_cached(settings) -> None:
         return_value=Response(
             200,
             json={
+                "owner": {"username": "instagram_creator"},
                 "media": [
                     {
                         "type": "image",
@@ -49,6 +50,8 @@ async def test_mixed_carousel_is_normalized_and_cached(settings) -> None:
         assert tracked.content_type == response.content_type
         assert tracked.source_url.endswith("?igsh=tracking")
         assert response.content_type == "carousel"
+        assert response.source_id == "ABC123"
+        assert response.creator_username == "instagram_creator"
         assert [item.media_type for item in response.media] == ["image", "video"]
         assert [item.asset.filename for item in response.media] == [
             "ABC123_1.jpg",

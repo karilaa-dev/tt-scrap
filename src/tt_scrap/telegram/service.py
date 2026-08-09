@@ -817,7 +817,11 @@ class TelegramDeliveryService:
     async def _deliver_slideshow(
         self, request: TikTokTelegramDeliveryRequest, extraction: TikTokExtractionResponse
     ) -> TelegramDeliveryOutcome:
-        fields = self._fields(request.telegram, _MEDIA_GROUP_FIELDS)
+        if len(extraction.media) == 1:
+            single_fields = _DOCUMENT_FIELDS if request.delivery == "document" else _PHOTO_FIELDS
+            fields = self._fields(request.telegram, single_fields)
+        else:
+            fields = self._fields(request.telegram, _MEDIA_GROUP_FIELDS)
         download_started_at = perf_counter()
         tasks = [asyncio.create_task(self._download(item)) for item in extraction.media]
         results = await asyncio.gather(*tasks, return_exceptions=True)

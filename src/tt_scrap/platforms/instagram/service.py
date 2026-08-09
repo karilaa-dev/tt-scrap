@@ -61,6 +61,19 @@ def extract_instagram_media_id(url: str) -> str:
     return path_parts[1]
 
 
+def extract_creator_username(payload: dict[str, Any]) -> str | None:
+    """Read known provider shapes without deriving identity from the URL."""
+    candidates: list[Any] = [payload.get("username")]
+    for key in ("owner", "author", "user"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested.get("username"))
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 class InstagramService:
     def __init__(self, settings: Settings, cache: CacheStore) -> None:
         self.settings = settings
@@ -257,7 +270,9 @@ class InstagramService:
             content_type = "video" if media[0].media_type == "video" else "image"
         response = InstagramExtractionResponse(
             extraction_id=extraction_id,
+            source_id=media_id,
             source_url=source_url,
+            creator_username=extract_creator_username(payload),
             content_type=content_type,
             media=media,
             expires_at=expires_at,

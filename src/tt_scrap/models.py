@@ -96,6 +96,10 @@ class TikTokExtractionResponse(BaseModel):
     source_id: str
     source_url: str
     resolved_url: str
+    creator_username: str | None = Field(
+        default=None,
+        description="TikTok author uniqueId when supplied by the extractor",
+    )
     content_type: Literal["video", "slideshow"] = Field(
         description="Determines whether media contains one video or ordered slideshow images"
     )
@@ -200,7 +204,7 @@ class TelegramParameters(BaseModel):
         default=None,
         description=(
             "Caption for single calls; Instagram carousels use the first item; "
-            "TikTok slideshows reject it"
+            "multi-image TikTok slideshows reject it"
         ),
     )
     parse_mode: str | None = None
@@ -354,7 +358,12 @@ class InstagramExtractionResponse(BaseModel):
         description="Cached extraction reference reusable by Instagram Telegram delivery"
     )
     platform: Literal["instagram"] = "instagram"
+    source_id: str = Field(description="Instagram post shortcode or story media ID")
     source_url: str
+    creator_username: str | None = Field(
+        default=None,
+        description="Instagram creator username when supplied by the upstream provider",
+    )
     content_type: Literal["video", "image", "carousel"] = Field(
         description="Single media kind or an ordered mixed carousel"
     )

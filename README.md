@@ -121,6 +121,11 @@ curl http://127.0.0.1:8000/v1/tiktok/resolutions \
 The response includes the numeric `source_id` and full `resolved_url`. A client can
 use `source_id` to check its database before requesting extraction or delivery.
 
+TikTok extraction responses also include nullable `creator_username`, sourced from
+the extracted `author.uniqueId`. Instagram extraction responses include the post
+`source_id` and nullable provider-supplied `creator_username`; neither service
+derives a creator name from a placeholder URL.
+
 ```bash
 curl http://127.0.0.1:8000/v1/tiktok/extractions \
   -H "Authorization: Bearer $TT_SCRAP_API_KEY" \

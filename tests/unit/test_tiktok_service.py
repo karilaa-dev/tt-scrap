@@ -91,6 +91,7 @@ async def test_extraction_reuses_cached_resolution(settings) -> None:
     service, _cache = make_service(
         settings,
         {
+            "author": {"uniqueId": "tiktok_creator"},
             "video": {
                 "playAddr": "https://video.cdn.test/media",
                 "width": 720,
@@ -105,6 +106,7 @@ async def test_extraction_reuses_cached_resolution(settings) -> None:
     extraction = await service.extract_url(short_url)
 
     assert extraction.source_id == "123"
+    assert extraction.creator_username == "tiktok_creator"
     assert service.adapter.resolve_calls == 1
     assert service.adapter.calls == 1
 

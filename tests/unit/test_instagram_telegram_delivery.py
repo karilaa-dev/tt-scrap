@@ -176,6 +176,7 @@ async def test_single_instagram_image_is_converted_and_sent_as_photo(settings) -
     image = await descriptor(cache, "image", "image", 0)
     extraction = InstagramExtractionResponse(
         extraction_id="instagram-extraction",
+        source_id="ABC123",
         source_url="https://www.instagram.com/p/ABC123/",
         content_type="image",
         media=[InstagramMediaItem(position=0, media_type="image", asset=image)],
@@ -203,6 +204,7 @@ async def test_single_instagram_video_uses_converted_thumbnail(settings) -> None
     thumbnail = await descriptor(cache, "thumbnail", "thumbnail", 0)
     extraction = InstagramExtractionResponse(
         extraction_id="instagram-extraction",
+        source_id="ABC123",
         source_url="https://www.instagram.com/reel/ABC123/",
         content_type="video",
         media=[
@@ -249,6 +251,7 @@ async def test_mixed_instagram_carousel_preserves_order_caption_and_thumbnail(se
     last = await descriptor(cache, "last", "image", 2)
     extraction = InstagramExtractionResponse(
         extraction_id="instagram-extraction",
+        source_id="ABC123",
         source_url="https://www.instagram.com/p/ABC123/",
         content_type="carousel",
         media=[
@@ -301,6 +304,7 @@ async def test_instagram_document_carousel_preserves_bytes_and_options(settings)
     second = await descriptor(cache, "second", "video", 1)
     extraction = InstagramExtractionResponse(
         extraction_id="instagram-extraction",
+        source_id="ABC123",
         source_url="https://www.instagram.com/p/ABC123/",
         content_type="carousel",
         media=[
@@ -336,6 +340,7 @@ async def test_instagram_carousel_batches_without_single_item_tail(settings) -> 
     descriptors = [await descriptor(cache, f"image-{index}", "image", index) for index in range(11)]
     extraction = InstagramExtractionResponse(
         extraction_id="instagram-extraction",
+        source_id="ABC123",
         source_url="https://www.instagram.com/p/ABC123/",
         content_type="carousel",
         media=[
