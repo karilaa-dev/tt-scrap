@@ -50,6 +50,7 @@ are:
 | `TT_SCRAP_API_KEY` | Bearer token required by every `/v1/` endpoint |
 | `LOG_LEVEL` | JSON log verbosity; timing events are emitted at `INFO` |
 | `RAPIDAPI_KEY` | Instagram RapidAPI credential |
+| `INSTAGRAM_CONCURRENCY` | Maximum concurrent Instagram provider calls; default 4 |
 | `YTDLP_COOKIES` | Optional Netscape cookie file for restricted TikToks |
 | `PROXY_FILE` | Optional file containing one proxy URL per line |
 | `PROXY_DATA_ONLY` | Bypass proxies for media downloads when `true` |
@@ -173,6 +174,13 @@ FFmpeg stream-copies them into MP4 without re-encoding. This same muxing path is
 used by direct Telegram delivery and `/v1/assets` downloads. Video and audio
 thumbnails are normalized to Telegram-compliant JPEGs.
 
+After a successful Telegram upload, the process keeps Telegram's bot-scoped
+`file_id` in a bounded in-memory index keyed by the opaque asset ID. Repeating the
+same cached extraction reuses that `file_id`, as recommended by Telegram, and skips
+both the upstream download and multipart upload. A refreshed or expired extraction
+has new asset IDs and therefore performs a fresh upload. If Telegram rejects a
+cached ID, the service discards it and falls back to one normal upload.
+
 ### Deliver Instagram media to Telegram
 
 ```bash
@@ -189,15 +197,16 @@ curl http://127.0.0.1:8000/v1/instagram/telegram-deliveries \
 Instagram delivery accepts a URL or a cached `extraction_id`. Media mode uses
 `sendPhoto`, `sendVideo`, or mixed photo/video `sendMediaGroup` calls while retaining
 carousel order. Document mode sends original/file media and preserves source image
-bytes. Unsupported photos and video thumbnails use the same asynchronous conversion
-pipeline as TikTok. Carousel captions are placed on the first item of the first
-album batch.
+bytes. HEIC/HEIF photos and usable video thumbnails use the same asynchronous
+conversion pipeline as TikTok. Carousel captions are placed on the first item of
+the first album batch.
 
-Slideshow photo mode passes static JPEG, PNG, and WebP through unchanged. Other
-decodable formats are converted concurrently to baseline JPEG in persistent image
-worker processes. A gallery is prepared completely before its first album is sent;
-albums are then sent sequentially in groups of 2–10 while preserving order.
-Document mode preserves original media bytes and skips photo/thumbnail conversion.
+Slideshow photo mode passes static JPEG, PNG, and WebP through byte-for-byte. Only
+HEIC/HEIF photos are converted concurrently to baseline JPEG in persistent image
+worker processes; other unsupported photo formats fail before the first Telegram
+call. A gallery is prepared completely before its first album is sent; albums are
+then sent sequentially in groups of 2–10 while preserving order. Document mode
+preserves original media bytes and skips photo/thumbnail conversion.
 
 To compare JPEG and PNG conversion cost for a representative HEIC/HEIF input
 without putting benchmarking work in the request path:

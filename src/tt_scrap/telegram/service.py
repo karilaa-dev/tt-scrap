@@ -5,17 +5,23 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any, BinaryIO, Literal
+from typing import Any, BinaryIO, Literal, cast
 
 from ..cache import CacheStore
 from ..config import Settings
-from ..errors import ConfigurationError, ExtractionError, TelegramParameterError
+from ..errors import (
+    ConfigurationError,
+    ExtractionError,
+    ImageConversionError,
+    TelegramParameterError,
+)
 from ..logging import elapsed_ms, log_event
 from ..media import AssetDownloader, DownloadedAsset, ImagePreparationService
 from ..media.downloader import filename_for_type
-from ..media.images import is_native_telegram_photo
+from ..media.images import detect_image_format, is_native_telegram_photo
 from ..models import (
     AssetDescriptor,
     InstagramExtractionResponse,
@@ -79,6 +85,7 @@ _ALBUM_MEDIA_FIRST_FIELDS = {"show_caption_above_media"}
 _ALBUM_MEDIA_ITEM_FIELDS = {"has_spoiler"}
 _ALBUM_VIDEO_FIELDS = {"start_timestamp", "supports_streaming"}
 _KNOWN_TELEGRAM_FIELDS = set(TelegramParameters.model_fields)
+_TelegramMediaKind = Literal["audio", "document", "photo", "video"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +129,21 @@ def _album_batches[AlbumItemT](items: list[AlbumItemT]) -> list[list[AlbumItemT]
     return batches
 
 
+def _message_file_id(message: Any, media_kind: _TelegramMediaKind) -> str | None:
+    if not isinstance(message, dict):
+        return None
+    media = message.get(media_kind)
+    if media_kind == "photo":
+        if not isinstance(media, list):
+            return None
+        candidates = [item for item in media if isinstance(item, dict)]
+        media = candidates[-1] if candidates else None
+    if not isinstance(media, dict):
+        return None
+    file_id = media.get("file_id")
+    return file_id if isinstance(file_id, str) and file_id else None
+
+
 class TelegramDeliveryService:
     def __init__(
         self,
@@ -140,6 +162,96 @@ class TelegramDeliveryService:
         self._client = client
         self._instagram = instagram
         self._pipeline_limit = asyncio.Semaphore(settings.telegram_upload_concurrency)
+        self._file_id_max_entries = settings.cache_max_entries
+        self._file_ids: OrderedDict[tuple[str, _TelegramMediaKind], str] = OrderedDict()
+
+    def _cached_file_id(
+        self, descriptor: AssetDescriptor, media_kind: _TelegramMediaKind
+    ) -> str | None:
+        key = (descriptor.asset_id, media_kind)
+        file_id = self._file_ids.get(key)
+        if file_id is not None:
+            self._file_ids.move_to_end(key)
+        return file_id
+
+    def _forget_file_id(self, descriptor: AssetDescriptor, media_kind: _TelegramMediaKind) -> None:
+        self._file_ids.pop((descriptor.asset_id, media_kind), None)
+
+    def _remember_file_id(
+        self,
+        descriptor: AssetDescriptor,
+        media_kind: _TelegramMediaKind,
+        file_id: str,
+    ) -> None:
+        key = (descriptor.asset_id, media_kind)
+        self._file_ids[key] = file_id
+        self._file_ids.move_to_end(key)
+        while len(self._file_ids) > self._file_id_max_entries:
+            self._file_ids.popitem(last=False)
+
+    def _remember_single_response(
+        self,
+        response: TelegramCallResponse,
+        descriptor: AssetDescriptor,
+        media_kind: _TelegramMediaKind,
+    ) -> None:
+        if not response.ok or not isinstance(response.value, dict):
+            return
+        file_id = _message_file_id(response.value.get("result"), media_kind)
+        if file_id is not None:
+            self._remember_file_id(descriptor, media_kind, file_id)
+
+    def _remember_album_response(
+        self,
+        response: TelegramCallResponse,
+        descriptors: list[AssetDescriptor],
+        media_kinds: list[_TelegramMediaKind],
+    ) -> None:
+        if not response.ok or not isinstance(response.value, dict):
+            return
+        result = response.value.get("result")
+        if not isinstance(result, list) or len(result) != len(descriptors):
+            return
+        for message, descriptor, media_kind in zip(result, descriptors, media_kinds, strict=True):
+            file_id = _message_file_id(message, media_kind)
+            if file_id is not None:
+                self._remember_file_id(descriptor, media_kind, file_id)
+
+    async def _call_with_cached_file_id(
+        self,
+        method: str,
+        fields: dict[str, Any],
+        field_name: str,
+        descriptor: AssetDescriptor,
+        media_kind: _TelegramMediaKind,
+    ) -> TelegramCallResponse | None:
+        file_id = self._cached_file_id(descriptor, media_kind)
+        if file_id is None:
+            return None
+        cached_fields = dict(fields)
+        cached_fields[field_name] = file_id
+        started_at = perf_counter()
+        response = await self._client.call(method, cached_fields, [])
+        log_event(
+            logger,
+            "telegram.file_id_cache.completed",
+            level=logging.INFO if response.ok else logging.WARNING,
+            message=(
+                "Telegram media reused without upload"
+                if response.ok
+                else "Cached Telegram media was rejected"
+            ),
+            telegram_method=method,
+            media_type=media_kind,
+            status_code=response.status_code,
+            cache_hit=True,
+            elapsed_ms=elapsed_ms(started_at),
+            success=response.ok,
+        )
+        if response.ok:
+            return response
+        self._forget_file_id(descriptor, media_kind)
+        return None
 
     async def deliver(self, request: TikTokTelegramDeliveryRequest) -> TelegramDeliveryOutcome:
         if not self._client.configured:
@@ -294,6 +406,72 @@ class TelegramDeliveryService:
                 )
         return media_result, cover_result
 
+    async def _download_with_prepared_thumbnail(
+        self,
+        media: AssetDescriptor,
+        cover: AssetDescriptor | None,
+        thumbnail_filename: str,
+    ) -> tuple[
+        DownloadedAsset,
+        DownloadedAsset | None,
+        tuple[io.BytesIO, str] | None,
+    ]:
+        """Prepare a cover as soon as it downloads, while media keeps downloading."""
+
+        async def download_and_prepare_cover() -> tuple[
+            DownloadedAsset,
+            tuple[io.BytesIO, str] | None,
+        ]:
+            assert cover is not None
+            downloaded_cover = await self._download(cover)
+            try:
+                return downloaded_cover, await self._thumbnail(
+                    downloaded_cover,
+                    thumbnail_filename,
+                )
+            except BaseException:
+                downloaded_cover.file.close()
+                raise
+
+        media_task = asyncio.create_task(self._download(media))
+        cover_task = (
+            asyncio.create_task(download_and_prepare_cover()) if cover is not None else None
+        )
+        tasks = [media_task, *([cover_task] if cover_task is not None else [])]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        media_result = results[0]
+        if isinstance(media_result, BaseException):
+            for result in results[1:]:
+                if isinstance(result, tuple):
+                    downloaded_cover, result_thumbnail = cast(
+                        tuple[DownloadedAsset, tuple[io.BytesIO, str] | None],
+                        result,
+                    )
+                    downloaded_cover.file.close()
+                    if result_thumbnail is not None:
+                        result_thumbnail[0].close()
+            raise media_result
+
+        cover_result: DownloadedAsset | None = None
+        prepared_thumbnail: tuple[io.BytesIO, str] | None = None
+        if len(results) > 1:
+            candidate = results[1]
+            if isinstance(candidate, tuple):
+                cover_result, prepared_thumbnail = cast(
+                    tuple[DownloadedAsset, tuple[io.BytesIO, str] | None],
+                    candidate,
+                )
+            elif isinstance(candidate, BaseException):
+                log_event(
+                    logger,
+                    "telegram.thumbnail_download.failed",
+                    level=logging.WARNING,
+                    message="Media cover download failed; Telegram will generate a preview",
+                    error_type=type(candidate).__name__,
+                    success=False,
+                )
+        return cast(DownloadedAsset, media_result), cover_result, prepared_thumbnail
+
     async def _thumbnail(
         self, cover: DownloadedAsset | None, filename: str
     ) -> tuple[io.BytesIO, str] | None:
@@ -333,37 +511,65 @@ class TelegramDeliveryService:
         self, request: TikTokTelegramDeliveryRequest, extraction: TikTokExtractionResponse
     ) -> TelegramDeliveryOutcome:
         if request.delivery == "document":
+            fields = self._fields(request.telegram, _DOCUMENT_FIELDS)
+            self._default(
+                fields,
+                request.telegram,
+                "disable_content_type_detection",
+                True,
+            )
+            cached_response = await self._call_with_cached_file_id(
+                "sendDocument",
+                fields,
+                "document",
+                extraction.media[0],
+                "document",
+            )
+            if cached_response is not None:
+                return TelegramDeliveryOutcome([cached_response])
             video = await self._download(extraction.media[0])
-            cover = None
-        else:
-            video, cover = await self._download_with_cover(extraction.media[0], extraction.cover)
-        extra_files: list[BinaryIO] = []
-        try:
-            filename = filename_for_type(extraction.media[0].filename, video.content_type)
-            if request.delivery == "document":
-                fields = self._fields(request.telegram, _DOCUMENT_FIELDS)
-                self._default(
-                    fields,
-                    request.telegram,
-                    "disable_content_type_detection",
-                    True,
-                )
+            try:
+                filename = filename_for_type(extraction.media[0].filename, video.content_type)
                 fields["document"] = "attach://document_file"
                 response = await self._client.call(
                     "sendDocument",
                     fields,
                     [TelegramUpload("document_file", video.file, filename, video.content_type)],
                 )
+                self._remember_single_response(
+                    response,
+                    extraction.media[0],
+                    "document",
+                )
                 return TelegramDeliveryOutcome([response])
+            finally:
+                video.file.close()
 
-            fields = self._fields(request.telegram, _VIDEO_FIELDS)
-            self._default(fields, request.telegram, "duration", extraction.duration_seconds)
-            self._default(fields, request.telegram, "width", extraction.width)
-            self._default(fields, request.telegram, "height", extraction.height)
-            self._default(fields, request.telegram, "supports_streaming", True)
+        fields = self._fields(request.telegram, _VIDEO_FIELDS)
+        self._default(fields, request.telegram, "duration", extraction.duration_seconds)
+        self._default(fields, request.telegram, "width", extraction.width)
+        self._default(fields, request.telegram, "height", extraction.height)
+        self._default(fields, request.telegram, "supports_streaming", True)
+        cached_response = await self._call_with_cached_file_id(
+            "sendVideo",
+            fields,
+            "video",
+            extraction.media[0],
+            "video",
+        )
+        if cached_response is not None:
+            return TelegramDeliveryOutcome([cached_response])
+
+        video, cover, thumbnail = await self._download_with_prepared_thumbnail(
+            extraction.media[0],
+            extraction.cover,
+            f"{extraction.source_id}_thumbnail.jpg",
+        )
+        extra_files: list[BinaryIO] = []
+        try:
+            filename = filename_for_type(extraction.media[0].filename, video.content_type)
             fields["video"] = "attach://video_file"
             uploads = [TelegramUpload("video_file", video.file, filename, video.content_type)]
-            thumbnail = await self._thumbnail(cover, f"{extraction.source_id}_thumbnail.jpg")
             if thumbnail is not None:
                 thumbnail_file, thumbnail_name = thumbnail
                 extra_files.append(thumbnail_file)
@@ -373,6 +579,7 @@ class TelegramDeliveryService:
                     TelegramUpload("thumbnail_file", thumbnail_file, thumbnail_name, "image/jpeg")
                 )
             response = await self._client.call("sendVideo", fields, uploads)
+            self._remember_single_response(response, extraction.media[0], "video")
             return TelegramDeliveryOutcome([response])
         finally:
             video.file.close()
@@ -408,17 +615,30 @@ class TelegramDeliveryService:
         audio_descriptor = music.audio
         if audio_descriptor is None:
             raise ExtractionError("TikTok response has no music asset")
-        audio, cover = await self._download_with_cover(audio_descriptor, music.cover)
+        fields = self._fields(request.telegram, _AUDIO_FIELDS)
+        self._default(fields, request.telegram, "duration", music.duration_seconds)
+        self._default(fields, request.telegram, "title", music.title)
+        self._default(fields, request.telegram, "performer", music.author)
+        cached_response = await self._call_with_cached_file_id(
+            "sendAudio",
+            fields,
+            "audio",
+            audio_descriptor,
+            "audio",
+        )
+        if cached_response is not None:
+            return TelegramDeliveryOutcome([cached_response])
+
+        audio, cover, thumbnail = await self._download_with_prepared_thumbnail(
+            audio_descriptor,
+            music.cover,
+            f"{audio_descriptor.asset_id}_thumbnail.jpg",
+        )
         extra_files: list[BinaryIO] = []
         try:
-            fields = self._fields(request.telegram, _AUDIO_FIELDS)
-            self._default(fields, request.telegram, "duration", music.duration_seconds)
-            self._default(fields, request.telegram, "title", music.title)
-            self._default(fields, request.telegram, "performer", music.author)
             fields["audio"] = "attach://audio_file"
             filename = filename_for_type(audio_descriptor.filename, audio.content_type)
             uploads = [TelegramUpload("audio_file", audio.file, filename, audio.content_type)]
-            thumbnail = await self._thumbnail(cover, f"{audio_descriptor.asset_id}_thumbnail.jpg")
             if thumbnail is not None:
                 thumbnail_file, thumbnail_name = thumbnail
                 extra_files.append(thumbnail_file)
@@ -427,6 +647,7 @@ class TelegramDeliveryService:
                     TelegramUpload("thumbnail_file", thumbnail_file, thumbnail_name, "image/jpeg")
                 )
             response = await self._client.call("sendAudio", fields, uploads)
+            self._remember_single_response(response, audio_descriptor, "audio")
             return TelegramDeliveryOutcome([response])
         finally:
             audio.file.close()
@@ -441,6 +662,8 @@ class TelegramDeliveryService:
         thumbnail: DownloadedAsset | None,
         *,
         document: bool,
+        converted_thumbnail: tuple[io.BytesIO, str] | None = None,
+        thumbnail_prepared: bool = False,
     ) -> tuple[_PreparedInstagramItem, list[BinaryIO]]:
         filename = filename_for_type(item.asset.filename, downloaded.content_type)
         if document:
@@ -464,10 +687,12 @@ class TelegramDeliveryService:
 
         extra_files: list[BinaryIO] = []
         prepared_thumbnail = None
-        converted = await self._thumbnail(
-            thumbnail,
-            f"{item.asset.asset_id}_thumbnail.jpg",
-        )
+        converted = converted_thumbnail
+        if not thumbnail_prepared:
+            converted = await self._thumbnail(
+                thumbnail,
+                f"{item.asset.asset_id}_thumbnail.jpg",
+            )
         if converted is not None:
             thumbnail_file, thumbnail_name = converted
             extra_files.append(thumbnail_file)
@@ -490,11 +715,52 @@ class TelegramDeliveryService:
         request: InstagramTelegramDeliveryRequest,
         item: InstagramMediaItem,
     ) -> TelegramDeliveryOutcome:
-        use_thumbnail = request.delivery == "media" and item.media_type == "video"
-        downloaded, thumbnail = await self._download_with_cover(
+        if request.delivery == "document":
+            method = "sendDocument"
+            field_name = "document"
+            media_kind: _TelegramMediaKind = "document"
+            fields = self._fields(request.telegram, _DOCUMENT_FIELDS)
+            self._default(
+                fields,
+                request.telegram,
+                "disable_content_type_detection",
+                True,
+            )
+        elif item.media_type == "image":
+            method = "sendPhoto"
+            field_name = "photo"
+            media_kind = "photo"
+            fields = self._fields(request.telegram, _PHOTO_FIELDS)
+        else:
+            method = "sendVideo"
+            field_name = "video"
+            media_kind = "video"
+            fields = self._fields(request.telegram, _VIDEO_FIELDS)
+            self._default(fields, request.telegram, "supports_streaming", True)
+        cached_response = await self._call_with_cached_file_id(
+            method,
+            fields,
+            field_name,
             item.asset,
-            item.thumbnail if use_thumbnail else None,
+            media_kind,
         )
+        if cached_response is not None:
+            return TelegramDeliveryOutcome([cached_response])
+
+        use_thumbnail = request.delivery == "media" and item.media_type == "video"
+        if use_thumbnail:
+            (
+                downloaded,
+                thumbnail,
+                converted_thumbnail,
+            ) = await self._download_with_prepared_thumbnail(
+                item.asset,
+                item.thumbnail,
+                f"{item.asset.asset_id}_thumbnail.jpg",
+            )
+        else:
+            downloaded, thumbnail = await self._download_with_cover(item.asset, None)
+            converted_thumbnail = None
         extra_files: list[BinaryIO] = []
         try:
             prepared, owned_files = await self._prepare_instagram_item(
@@ -502,16 +768,11 @@ class TelegramDeliveryService:
                 downloaded,
                 thumbnail,
                 document=request.delivery == "document",
+                converted_thumbnail=converted_thumbnail,
+                thumbnail_prepared=use_thumbnail,
             )
             extra_files.extend(owned_files)
             if request.delivery == "document":
-                fields = self._fields(request.telegram, _DOCUMENT_FIELDS)
-                self._default(
-                    fields,
-                    request.telegram,
-                    "disable_content_type_detection",
-                    True,
-                )
                 fields["document"] = "attach://document_file"
                 response = await self._client.call(
                     "sendDocument",
@@ -525,10 +786,10 @@ class TelegramDeliveryService:
                         )
                     ],
                 )
+                self._remember_single_response(response, item.asset, "document")
                 return TelegramDeliveryOutcome([response])
 
             if item.media_type == "image":
-                fields = self._fields(request.telegram, _PHOTO_FIELDS)
                 fields["photo"] = "attach://photo_file"
                 response = await self._client.call(
                     "sendPhoto",
@@ -542,10 +803,9 @@ class TelegramDeliveryService:
                         )
                     ],
                 )
+                self._remember_single_response(response, item.asset, "photo")
                 return TelegramDeliveryOutcome([response])
 
-            fields = self._fields(request.telegram, _VIDEO_FIELDS)
-            self._default(fields, request.telegram, "supports_streaming", True)
             fields["video"] = "attach://video_file"
             uploads = [
                 TelegramUpload(
@@ -567,12 +827,15 @@ class TelegramDeliveryService:
                     )
                 )
             response = await self._client.call("sendVideo", fields, uploads)
+            self._remember_single_response(response, item.asset, "video")
             return TelegramDeliveryOutcome([response])
         finally:
             downloaded.file.close()
             if thumbnail is not None:
                 thumbnail.file.close()
             _close_files(extra_files)
+            if converted_thumbnail is not None:
+                converted_thumbnail[0].close()
 
     async def _deliver_instagram_carousel(
         self,
@@ -581,18 +844,119 @@ class TelegramDeliveryService:
     ) -> TelegramDeliveryOutcome:
         document = request.delivery == "document"
 
+        item_fields = set(_ALBUM_CAPTION_FIELDS)
+        if document:
+            item_fields.add("disable_content_type_detection")
+        else:
+            item_fields |= (
+                _ALBUM_MEDIA_FIRST_FIELDS | _ALBUM_MEDIA_ITEM_FIELDS | _ALBUM_VIDEO_FIELDS
+            )
+        fields = self._fields(request.telegram, _MEDIA_GROUP_FIELDS | item_fields)
+        first_item_fields = {
+            name: fields.pop(name)
+            for name in _ALBUM_CAPTION_FIELDS | _ALBUM_MEDIA_FIRST_FIELDS
+            if name in fields
+        }
+        all_media_fields = {
+            name: fields.pop(name) for name in _ALBUM_MEDIA_ITEM_FIELDS if name in fields
+        }
+        video_fields = {name: fields.pop(name) for name in _ALBUM_VIDEO_FIELDS if name in fields}
+        disable_content_type_detection = fields.pop(
+            "disable_content_type_detection",
+            True,
+        )
+
+        cached_entries: list[tuple[InstagramMediaItem, _TelegramMediaKind, str | None]] = []
+        for item in extraction.media:
+            cached_media_kind: _TelegramMediaKind = (
+                "document" if document else "photo" if item.media_type == "image" else "video"
+            )
+            cached_entries.append(
+                (
+                    item,
+                    cached_media_kind,
+                    self._cached_file_id(item.asset, cached_media_kind),
+                )
+            )
+        if all(file_id is not None for _item, _media_kind, file_id in cached_entries):
+            cached_calls: list[TelegramCallResponse] = []
+            cached_batches = _album_batches(cached_entries)
+            for cached_batch_index, cached_batch in enumerate(cached_batches):
+                batch_fields = dict(fields)
+                if cached_batch_index > 0:
+                    batch_fields.pop("reply_parameters", None)
+                cached_media_payload: list[dict[str, Any]] = []
+                for cached_item_index, (_item, item_media_kind, file_id) in enumerate(cached_batch):
+                    cached_media_item: dict[str, Any] = {
+                        "type": item_media_kind,
+                        "media": file_id,
+                    }
+                    if cached_batch_index == 0 and cached_item_index == 0:
+                        cached_media_item.update(first_item_fields)
+                    if document:
+                        cached_media_item["disable_content_type_detection"] = (
+                            disable_content_type_detection
+                        )
+                    else:
+                        cached_media_item.update(all_media_fields)
+                        if item_media_kind == "video":
+                            cached_media_item.update(video_fields)
+                            cached_media_item.setdefault("supports_streaming", True)
+                    cached_media_payload.append(cached_media_item)
+                batch_fields["media"] = cached_media_payload
+                batch_started_at = perf_counter()
+                response = await self._client.call("sendMediaGroup", batch_fields, [])
+                cached_calls.append(response)
+                log_event(
+                    logger,
+                    "telegram.album_batch.completed",
+                    level=logging.INFO if response.ok else logging.WARNING,
+                    message="Instagram Telegram album batch reused without upload",
+                    platform="instagram",
+                    delivery=request.delivery,
+                    batch_index=cached_batch_index + 1,
+                    batch_count=len(cached_batches),
+                    item_count=len(cached_batch),
+                    status_code=response.status_code,
+                    cache_hit=True,
+                    elapsed_ms=elapsed_ms(batch_started_at),
+                    success=response.ok,
+                )
+                if not response.ok:
+                    for item, item_media_kind, _file_id in cached_batch:
+                        self._forget_file_id(item.asset, item_media_kind)
+                    break
+            return TelegramDeliveryOutcome(cached_calls)
+
         async def download_item(
             item: InstagramMediaItem,
-        ) -> tuple[DownloadedAsset, DownloadedAsset | None]:
+        ) -> tuple[
+            DownloadedAsset,
+            DownloadedAsset | None,
+            tuple[io.BytesIO, str] | None,
+        ]:
             cover = item.thumbnail if not document and item.media_type == "video" else None
-            return await self._download_with_cover(item.asset, cover)
+            if cover is not None:
+                return await self._download_with_prepared_thumbnail(
+                    item.asset,
+                    cover,
+                    f"{item.asset.asset_id}_thumbnail.jpg",
+                )
+            downloaded, downloaded_cover = await self._download_with_cover(item.asset, None)
+            return downloaded, downloaded_cover, None
 
         download_started_at = perf_counter()
         download_outcomes = await asyncio.gather(
             *[download_item(item) for item in extraction.media],
             return_exceptions=True,
         )
-        downloaded_items: list[tuple[DownloadedAsset, DownloadedAsset | None]] = []
+        downloaded_items: list[
+            tuple[
+                DownloadedAsset,
+                DownloadedAsset | None,
+                tuple[io.BytesIO, str] | None,
+            ]
+        ] = []
         download_failure: BaseException | None = None
         for download_outcome in download_outcomes:
             if isinstance(download_outcome, BaseException):
@@ -600,10 +964,12 @@ class TelegramDeliveryService:
             else:
                 downloaded_items.append(download_outcome)
         if download_failure is not None:
-            for media, thumbnail in downloaded_items:
+            for media, thumbnail, converted_thumbnail in downloaded_items:
                 media.file.close()
                 if thumbnail is not None:
                     thumbnail.file.close()
+                if converted_thumbnail is not None:
+                    converted_thumbnail[0].close()
             log_event(
                 logger,
                 "telegram.album_downloads.failed",
@@ -626,7 +992,7 @@ class TelegramDeliveryService:
             item_count=len(downloaded_items),
             output_bytes=sum(
                 media.size + (thumbnail.size if thumbnail is not None else 0)
-                for media, thumbnail in downloaded_items
+                for media, thumbnail, _converted_thumbnail in downloaded_items
             ),
             elapsed_ms=elapsed_ms(download_started_at),
             success=True,
@@ -642,6 +1008,8 @@ class TelegramDeliveryService:
                         downloaded[0],
                         downloaded[1],
                         document=document,
+                        converted_thumbnail=downloaded[2],
+                        thumbnail_prepared=True,
                     )
                     for item, downloaded in zip(
                         extraction.media,
@@ -685,33 +1053,12 @@ class TelegramDeliveryService:
                 success=True,
             )
 
-            item_fields = set(_ALBUM_CAPTION_FIELDS)
-            if document:
-                item_fields.add("disable_content_type_detection")
-            else:
-                item_fields |= (
-                    _ALBUM_MEDIA_FIRST_FIELDS | _ALBUM_MEDIA_ITEM_FIELDS | _ALBUM_VIDEO_FIELDS
-                )
-            fields = self._fields(request.telegram, _MEDIA_GROUP_FIELDS | item_fields)
-            first_item_fields = {
-                name: fields.pop(name)
-                for name in _ALBUM_CAPTION_FIELDS | _ALBUM_MEDIA_FIRST_FIELDS
-                if name in fields
-            }
-            all_media_fields = {
-                name: fields.pop(name) for name in _ALBUM_MEDIA_ITEM_FIELDS if name in fields
-            }
-            video_fields = {
-                name: fields.pop(name) for name in _ALBUM_VIDEO_FIELDS if name in fields
-            }
-            disable_content_type_detection = fields.pop(
-                "disable_content_type_detection",
-                True,
-            )
-
             calls: list[TelegramCallResponse] = []
             batches = _album_batches(prepared)
-            for batch_index, batch in enumerate(batches):
+            item_batches = _album_batches(extraction.media)
+            for batch_index, (batch, item_batch) in enumerate(
+                zip(batches, item_batches, strict=True)
+            ):
                 batch_fields = dict(fields)
                 if batch_index > 0:
                     batch_fields.pop("reply_parameters", None)
@@ -766,6 +1113,15 @@ class TelegramDeliveryService:
                 batch_started_at = perf_counter()
                 response = await self._client.call("sendMediaGroup", batch_fields, uploads)
                 calls.append(response)
+                media_kinds: list[_TelegramMediaKind] = [
+                    ("document" if document else "photo" if item.media_type == "image" else "video")
+                    for item in item_batch
+                ]
+                self._remember_album_response(
+                    response,
+                    [item.asset for item in item_batch],
+                    media_kinds,
+                )
                 log_event(
                     logger,
                     "telegram.album_batch.completed",
@@ -784,10 +1140,12 @@ class TelegramDeliveryService:
                     break
             return TelegramDeliveryOutcome(calls)
         finally:
-            for media, thumbnail in downloaded_items:
+            for media, thumbnail, converted_thumbnail in downloaded_items:
                 media.file.close()
                 if thumbnail is not None:
                     thumbnail.file.close()
+                if converted_thumbnail is not None:
+                    converted_thumbnail[0].close()
             _close_files(extra_files)
 
     async def _prepare_slideshow_item(
@@ -799,13 +1157,23 @@ class TelegramDeliveryService:
         downloaded.file.seek(0)
         prefix = downloaded.file.read(32)
         downloaded.file.seek(0)
-        if is_native_telegram_photo(prefix) and await self._images.native_photo_is_compliant(
-            downloaded.file,
-            downloaded.size,
-            downloaded.content_type,
-            downloaded.declared_content_type,
-        ):
+        detected = detect_image_format(prefix)
+        if is_native_telegram_photo(prefix):
+            compliant = await self._images.native_photo_is_compliant(
+                downloaded.file,
+                downloaded.size,
+                downloaded.content_type,
+                downloaded.declared_content_type,
+            )
+            if not compliant:
+                raise ImageConversionError(
+                    f"Native {detected.upper()} photo is invalid or exceeds Telegram limits"
+                )
             return _PreparedUpload(downloaded.file, filename, downloaded.content_type), None
+        if detected not in {"heic", "heif"}:
+            raise ImageConversionError(
+                f"Unsupported Telegram photo format: {detected}; only HEIC/HEIF is converted"
+            )
         data = await self._images.read_file(downloaded.file)
         converted = await self._images.convert_photo(data, filename)
         converted_file = io.BytesIO(converted.data)
@@ -820,8 +1188,76 @@ class TelegramDeliveryService:
         if len(extraction.media) == 1:
             allowed_fields = _DOCUMENT_FIELDS if request.delivery == "document" else _PHOTO_FIELDS
             fields = self._fields(request.telegram, allowed_fields)
+            cached_fields = dict(fields)
+            if request.delivery == "document":
+                cached_fields["disable_content_type_detection"] = True
+                method = "sendDocument"
+                field_name = "document"
+                media_kind: _TelegramMediaKind = "document"
+            else:
+                method = "sendPhoto"
+                field_name = "photo"
+                media_kind = "photo"
+            cached_response = await self._call_with_cached_file_id(
+                method,
+                cached_fields,
+                field_name,
+                extraction.media[0],
+                media_kind,
+            )
+            if cached_response is not None:
+                return TelegramDeliveryOutcome([cached_response])
         else:
             fields = self._fields(request.telegram, _MEDIA_GROUP_FIELDS)
+            album_media_kind: _TelegramMediaKind = (
+                "document" if request.delivery == "document" else "photo"
+            )
+            cached_entries = [
+                (descriptor, self._cached_file_id(descriptor, album_media_kind))
+                for descriptor in extraction.media
+            ]
+            if all(file_id is not None for _descriptor, file_id in cached_entries):
+                cached_calls: list[TelegramCallResponse] = []
+                cached_batches = _album_batches(cached_entries)
+                for cached_batch_index, cached_batch in enumerate(cached_batches):
+                    batch_fields = dict(fields)
+                    if cached_batch_index > 0:
+                        batch_fields.pop("reply_parameters", None)
+                    batch_fields["media"] = [
+                        {
+                            "type": album_media_kind,
+                            "media": file_id,
+                            **(
+                                {"disable_content_type_detection": True}
+                                if album_media_kind == "document"
+                                else {}
+                            ),
+                        }
+                        for _descriptor, file_id in cached_batch
+                    ]
+                    batch_started_at = perf_counter()
+                    response = await self._client.call("sendMediaGroup", batch_fields, [])
+                    cached_calls.append(response)
+                    log_event(
+                        logger,
+                        "telegram.album_batch.completed",
+                        level=logging.INFO if response.ok else logging.WARNING,
+                        message="TikTok Telegram album batch reused without upload",
+                        platform="tiktok",
+                        delivery=request.delivery,
+                        batch_index=cached_batch_index + 1,
+                        batch_count=len(cached_batches),
+                        item_count=len(cached_batch),
+                        status_code=response.status_code,
+                        cache_hit=True,
+                        elapsed_ms=elapsed_ms(batch_started_at),
+                        success=response.ok,
+                    )
+                    if not response.ok:
+                        for descriptor, _file_id in cached_batch:
+                            self._forget_file_id(descriptor, album_media_kind)
+                        break
+                return TelegramDeliveryOutcome(cached_calls)
         download_started_at = perf_counter()
         tasks = [asyncio.create_task(self._download(item)) for item in extraction.media]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -913,6 +1349,11 @@ class TelegramDeliveryService:
                         single_call_fields,
                         [TelegramUpload("media_0", item.file, item.filename, item.content_type)],
                     )
+                    self._remember_single_response(
+                        response,
+                        extraction.media[0],
+                        "document",
+                    )
                 else:
                     single_call_fields = dict(fields)
                     single_call_fields["photo"] = "attach://media_0"
@@ -921,11 +1362,15 @@ class TelegramDeliveryService:
                         single_call_fields,
                         [TelegramUpload("media_0", item.file, item.filename, item.content_type)],
                     )
+                    self._remember_single_response(response, extraction.media[0], "photo")
                 return TelegramDeliveryOutcome([response])
 
             calls: list[TelegramCallResponse] = []
             batches = _album_batches(prepared)
-            for batch_index, batch in enumerate(batches):
+            descriptor_batches = _album_batches(extraction.media)
+            for batch_index, (batch, descriptor_batch) in enumerate(
+                zip(batches, descriptor_batches, strict=True)
+            ):
                 batch_fields = dict(fields)
                 if batch_index > 0:
                     batch_fields.pop("reply_parameters", None)
@@ -947,6 +1392,14 @@ class TelegramDeliveryService:
                 batch_started_at = perf_counter()
                 response = await self._client.call("sendMediaGroup", batch_fields, uploads)
                 calls.append(response)
+                batch_media_kind: _TelegramMediaKind = (
+                    "document" if request.delivery == "document" else "photo"
+                )
+                self._remember_album_response(
+                    response,
+                    descriptor_batch,
+                    [batch_media_kind] * len(descriptor_batch),
+                )
                 log_event(
                     logger,
                     "telegram.album_batch.completed",

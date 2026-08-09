@@ -102,9 +102,10 @@ because doing so can duplicate Telegram messages.
 
 TikTok slideshows and Instagram carousels are prepared fully before the first
 Telegram call, retain their original order, and are partitioned into valid albums of
-2-10 items. Supported photo formats pass through; unsupported formats are converted
-asynchronously to baseline JPEG. Document mode preserves original image formats.
-Video and audio covers are normalized to Telegram-compatible JPEG thumbnails.
+2-10 items. Static JPEG, PNG, and WebP pass through byte-for-byte. Only HEIC/HEIF
+photos are converted asynchronously to baseline JPEG; other unsupported formats are
+rejected before upload. Document mode preserves original image formats. Video and
+audio covers are normalized to Telegram-compatible JPEG thumbnails when possible.
 """.strip()
 
 _OPENAPI_TAGS = [
@@ -155,6 +156,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.proxy_manager = proxy_manager
         app.state.asset_downloader = AssetDownloader(configured_settings, proxy_manager)
         app.state.image_preparation = ImagePreparationService(configured_settings)
+        await app.state.image_preparation.warm()
         app.state.tiktok = TikTokService(configured_settings, cache, proxy_manager)
         app.state.instagram = InstagramService(configured_settings, cache)
         app.state.telegram_client = TelegramClient(configured_settings)

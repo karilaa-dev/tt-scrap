@@ -52,7 +52,9 @@ async def deliver_instagram_to_telegram(
 
     A single image uses `sendPhoto`, a single video uses `sendVideo`, and a carousel
     uses mixed `sendMediaGroup` batches. Document mode sends all items as files.
-    Unsupported image formats and video thumbnails are converted asynchronously.
+    Static JPEG, PNG, and WebP images pass through unchanged. HEIC/HEIF images and
+    usable video thumbnails are converted asynchronously; other image formats are
+    rejected in media mode.
 
     One Telegram call is returned verbatim. Multiple batches return
     `TelegramMultiDeliveryResponse`; do not retry an ambiguous or partial upload

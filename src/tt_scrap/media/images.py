@@ -40,11 +40,8 @@ ImageFormat = Literal[
 _NATIVE_PHOTO_FORMATS = {"jpeg", "png", "webp"}
 _PHOTO_MAX_BYTES = 10 * 1024 * 1024
 _THUMBNAIL_MAX_BYTES = 200_000
-_CONTENT_TYPE_ALIASES = {
-    "image/jpg": "image/jpeg",
-    "image/pjpeg": "image/jpeg",
-    "image/x-png": "image/png",
-}
+_HEIC_PHOTO_FORMATS = {"heic", "heif"}
+_THUMBNAIL_INPUT_FORMATS = _NATIVE_PHOTO_FORMATS | _HEIC_PHOTO_FORMATS
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +97,10 @@ def _init_image_worker() -> None:
     Image.MAX_IMAGE_PIXELS = 100_000_000
 
 
+def _warm_image_worker() -> None:
+    """Force ProcessPoolExecutor workers to start during application startup."""
+
+
 def _rgb_image(image: Image.Image) -> Image.Image:
     oriented = ImageOps.exif_transpose(image)
     if oriented.mode in {"RGBA", "LA"} or (
@@ -149,6 +150,8 @@ def _encode_jpeg(image: Image.Image, *, quality: int, subsampling: int) -> bytes
 
 
 def _convert_photo_sync(data: bytes, filename: str) -> ConvertedImage:
+    if detect_image_format(data[:32]) not in _HEIC_PHOTO_FORMATS:
+        raise ValueError("Only HEIC/HEIF photos may be converted")
     try:
         with Image.open(io.BytesIO(data)) as opened:
             opened.seek(0)
@@ -225,24 +228,14 @@ def _read_file_sync(file: BinaryIO) -> bytes:
     return data
 
 
-def _normalized_content_type(value: str | None) -> str | None:
-    if value is None:
-        return None
-    normalized = value.split(";", 1)[0].strip().lower()
-    return _CONTENT_TYPE_ALIASES.get(normalized, normalized)
-
-
 def _native_photo_is_compliant_sync(
     file: BinaryIO,
     size: int,
     detected_content_type: str,
     declared_content_type: str | None,
 ) -> bool:
+    del detected_content_type, declared_content_type
     if size > _PHOTO_MAX_BYTES:
-        return False
-    if declared_content_type is not None and _normalized_content_type(
-        declared_content_type
-    ) != _normalized_content_type(detected_content_type):
         return False
     try:
         file.seek(0)
@@ -269,6 +262,7 @@ def image_worker_count(configured_workers: int, available_cpus: int | None = Non
 class ImagePreparationService:
     def __init__(self, settings: Settings) -> None:
         workers = image_worker_count(settings.image_conversion_workers)
+        self._workers = workers
         self._semaphore = asyncio.Semaphore(workers)
         self._executor = ProcessPoolExecutor(
             max_workers=workers,
@@ -280,6 +274,25 @@ class ImagePreparationService:
             "image.worker_pool.started",
             message="Image conversion worker pool started",
             worker_count=workers,
+        )
+
+    async def warm(self) -> None:
+        """Start HEIC workers before the first request pays their spawn cost."""
+        started_at = perf_counter()
+        loop = asyncio.get_running_loop()
+        await asyncio.gather(
+            *(
+                loop.run_in_executor(self._executor, _warm_image_worker)
+                for _ in range(self._workers)
+            )
+        )
+        log_event(
+            logger,
+            "image.worker_pool.warmed",
+            message="Image conversion worker pool warmed",
+            worker_count=self._workers,
+            elapsed_ms=elapsed_ms(started_at),
+            success=True,
         )
 
     async def read_file(self, file: BinaryIO) -> bytes:
@@ -324,6 +337,9 @@ class ImagePreparationService:
 
     async def convert_photo(self, data: bytes, filename: str) -> ConvertedImage:
         started_at = perf_counter()
+        detected = detect_image_format(data[:32])
+        if detected not in _HEIC_PHOTO_FORMATS:
+            raise ImageConversionError(f"Only HEIC/HEIF photos are converted; detected {detected}")
         async with self._semaphore:
             queue_wait = elapsed_ms(started_at)
             loop = asyncio.get_running_loop()
@@ -362,6 +378,9 @@ class ImagePreparationService:
 
     async def prepare_thumbnail(self, data: bytes, filename: str) -> ConvertedImage:
         started_at = perf_counter()
+        detected = detect_image_format(data[:32])
+        if detected not in _THUMBNAIL_INPUT_FORMATS:
+            raise ImageConversionError(f"Unsupported Telegram thumbnail format: {detected}")
         verified = await asyncio.to_thread(_verified_jpeg_thumbnail, data, filename)
         if verified is not None:
             log_event(
@@ -381,11 +400,16 @@ class ImagePreparationService:
         queue_started_at = perf_counter()
         async with self._semaphore:
             queue_wait = elapsed_ms(queue_started_at)
-            loop = asyncio.get_running_loop()
             try:
-                result = await loop.run_in_executor(
-                    self._executor, partial(_thumbnail_sync, data, filename)
-                )
+                if detected in _NATIVE_PHOTO_FORMATS:
+                    result = await asyncio.to_thread(_thumbnail_sync, data, filename)
+                    execution = "thread"
+                else:
+                    loop = asyncio.get_running_loop()
+                    result = await loop.run_in_executor(
+                        self._executor, partial(_thumbnail_sync, data, filename)
+                    )
+                    execution = "process"
             except (OSError, RuntimeError, ValueError) as exc:
                 log_event(
                     logger,
@@ -409,6 +433,7 @@ class ImagePreparationService:
             height=result.height,
             content_type=result.content_type,
             fast_path=False,
+            execution=execution,
             queue_wait_ms=queue_wait,
             elapsed_ms=elapsed_ms(started_at),
             success=True,

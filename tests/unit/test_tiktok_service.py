@@ -561,6 +561,36 @@ async def test_concurrent_identical_urls_share_one_extraction(settings) -> None:
 
 
 @pytest.mark.asyncio
+async def test_concurrent_refreshes_share_one_fresh_extraction(settings) -> None:
+    payload = {
+        "video": {
+            "playAddr": "https://video.cdn.test/media",
+            "width": 720,
+            "height": 1280,
+            "duration": 5,
+        }
+    }
+    service, _cache = make_service(settings, payload)
+    original_extract = service.adapter.extract
+
+    async def delayed_extract(url: str, video_id: str, proxy_session):
+        await asyncio.sleep(0.01)
+        return await original_extract(url, video_id, proxy_session)
+
+    service.adapter.extract = delayed_extract
+    results = await asyncio.gather(
+        *[
+            service.extract_url("https://www.tiktok.com/@creator/video/123", refresh=True)
+            for _ in range(8)
+        ]
+    )
+
+    assert len({result.extraction_id for result in results}) == 1
+    assert service.adapter.calls == 1
+    assert service.adapter.resolve_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_slideshow_preserves_order(settings) -> None:
     payload = {
         "imagePost": {

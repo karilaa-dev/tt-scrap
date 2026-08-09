@@ -82,6 +82,14 @@ class CacheStore:
         payload, _remaining_ttl = await self._get_with_ttl(key)
         return payload
 
+    async def get_generation(self, key: str) -> int | None:
+        """Return an entry version without extending its absolute lifetime."""
+        async with self._lock:
+            now = time.monotonic()
+            self._purge_expired(now)
+            entry = self._entries.get(key)
+            return entry.generation if entry is not None else None
+
     async def _set(self, key: str, payload: bytes, ttl_seconds: float | None = None) -> None:
         ttl = self.ttl_seconds if ttl_seconds is None else ttl_seconds
         if ttl <= 0:

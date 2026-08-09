@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
 from typing import Any, Literal
@@ -79,7 +82,14 @@ class InstagramService:
         self.settings = settings
         self.cache = cache
         self.assets = AssetFactory(cache)
-        self._semaphore = asyncio.Semaphore(settings.extraction_concurrency)
+        # The upstream currently accepts four simultaneous conversions. A
+        # dedicated limit prevents larger TikTok-oriented worker settings from
+        # creating immediate, wasteful Instagram 429 responses.
+        self._semaphore = asyncio.Semaphore(
+            min(settings.instagram_concurrency, settings.extraction_concurrency)
+        )
+        self._key_lock_guard = asyncio.Lock()
+        self._key_locks: dict[str, tuple[asyncio.Lock, int]] = {}
         self._http = httpx.AsyncClient(
             follow_redirects=True,
             timeout=httpx.Timeout(settings.instagram_request_timeout_seconds),
@@ -93,6 +103,28 @@ class InstagramService:
     def _expires_at(self) -> datetime:
         return datetime.now(UTC) + timedelta(seconds=self.settings.cache_ttl_seconds)
 
+    @asynccontextmanager
+    async def _key_lock(self, key: str) -> AsyncIterator[bool]:
+        """Serialize one post and report whether this call joined existing work."""
+        async with self._key_lock_guard:
+            lock, users = self._key_locks.get(key, (asyncio.Lock(), 0))
+            joined = users > 0
+            self._key_locks[key] = (lock, users + 1)
+        acquired = False
+        try:
+            await lock.acquire()
+            acquired = True
+            yield joined
+        finally:
+            if acquired:
+                lock.release()
+            async with self._key_lock_guard:
+                current, users = self._key_locks[key]
+                if users == 1:
+                    del self._key_locks[key]
+                else:
+                    self._key_locks[key] = (current, users - 1)
+
     async def _rapidapi(self, source_url: str) -> dict[str, Any]:
         key = self.settings.rapidapi_key.get_secret_value()
         if not key:
@@ -103,6 +135,7 @@ class InstagramService:
             for attempt in range(1, self.settings.instagram_max_attempts + 1):
                 attempt_started_at = perf_counter()
                 attempt_status: int | None = None
+                attempt_retry_after: float | None = None
                 try:
                     response = await self._http.get(
                         f"https://{_RAPIDAPI_HOST}/convert",
@@ -117,6 +150,12 @@ class InstagramService:
                     if response.status_code == 404:
                         raise ContentDeletedError("Instagram post was not found or is private")
                     if response.status_code == 429:
+                        try:
+                            parsed_retry_after = float(response.headers.get("Retry-After", ""))
+                            if parsed_retry_after >= 0:
+                                attempt_retry_after = min(parsed_retry_after, 30.0)
+                        except ValueError:
+                            pass
                         raise RateLimitError("Instagram API rate limit exceeded")
                     if response.status_code >= 500:
                         raise NetworkError("Instagram API is unavailable")
@@ -178,7 +217,14 @@ class InstagramService:
                         success=False,
                     )
                 if attempt < self.settings.instagram_max_attempts:
-                    await asyncio.sleep(self.settings.instagram_retry_delay_seconds)
+                    delay = self.settings.instagram_retry_delay_seconds * (2 ** (attempt - 1))
+                    if attempt_status == 429:
+                        # RapidAPI does not consistently return Retry-After for
+                        # this provider. Give active conversions time to finish
+                        # instead of burning every retry in a few milliseconds.
+                        delay = max(delay, attempt_retry_after or 1.0)
+                    delay += random.random() * min(delay * 0.25, 0.25)
+                    await asyncio.sleep(delay)
         if last_status == 429:
             raise RateLimitError("Instagram API rate limit exceeded") from last_error
         raise NetworkError("Instagram extraction failed after retries") from last_error
@@ -190,23 +236,78 @@ class InstagramService:
         normalized_url = normalize_instagram_url(source_url)
         media_id = extract_instagram_media_id(normalized_url)
         cache_key = self.cache.metadata_key("instagram", normalized_url)
+        baseline_generation = await self.cache.get_generation(cache_key) if refresh else None
         if not refresh:
             cached = await self.cache.get_model(cache_key, InstagramExtractionResponse)
             if cached:
-                response = cached.model_copy(update={"source_url": source_url})
-                log_event(
-                    logger,
-                    "instagram.extraction.completed",
-                    message="Instagram extraction served from cache",
-                    platform="instagram",
-                    source_id=media_id,
-                    cache_hit=True,
+                response = self._cached_response(
+                    cached,
+                    source_url,
+                    media_id,
+                    started_at,
                     cache_scope="url",
-                    media_count=len(response.media),
-                    elapsed_ms=elapsed_ms(started_at),
-                    success=True,
                 )
                 return response
+
+        async with self._key_lock(cache_key) as joined:
+            # Recheck after joining in-flight work. This also coalesces concurrent
+            # refresh requests while ensuring a later, non-overlapping refresh
+            # still performs a new provider call.
+            refreshed_by_joined_request = (
+                joined
+                and refresh
+                and await self.cache.get_generation(cache_key) != baseline_generation
+            )
+            if not refresh or refreshed_by_joined_request:
+                cached = await self.cache.get_model(cache_key, InstagramExtractionResponse)
+                if cached:
+                    return self._cached_response(
+                        cached,
+                        source_url,
+                        media_id,
+                        started_at,
+                        cache_scope="url_coalesced",
+                    )
+            return await self._extract_uncached(
+                normalized_url,
+                source_url,
+                media_id,
+                cache_key,
+                started_at,
+            )
+
+    @staticmethod
+    def _cached_response(
+        cached: InstagramExtractionResponse,
+        source_url: str,
+        media_id: str,
+        started_at: float,
+        *,
+        cache_scope: str,
+    ) -> InstagramExtractionResponse:
+        response = cached.model_copy(update={"source_url": source_url})
+        log_event(
+            logger,
+            "instagram.extraction.completed",
+            message="Instagram extraction served from cache",
+            platform="instagram",
+            source_id=media_id,
+            cache_hit=True,
+            cache_scope=cache_scope,
+            media_count=len(response.media),
+            elapsed_ms=elapsed_ms(started_at),
+            success=True,
+        )
+        return response
+
+    async def _extract_uncached(
+        self,
+        normalized_url: str,
+        source_url: str,
+        media_id: str,
+        cache_key: str,
+        started_at: float,
+    ) -> InstagramExtractionResponse:
         payload = await self._rapidapi(normalized_url)
         raw_media = payload.get("media") or []
         if not isinstance(raw_media, list) or not raw_media:
