@@ -1,15 +1,38 @@
+# Secrets and local configuration
 .env
 .env.*
 !.env.example
+cookies.*
+!cookies.example.*
+proxies.*
+!proxies.example.*
+
+# Downloaded and temporary media
+/downloads/
+/tmp/
+*.part
+*.ytdl
+
+# Python environments and generated packages
 .venv/
+venv/
+build/
+dist/
+*.egg-info/
 __pycache__/
 *.py[cod]
+
+# Test, type-checker, linter, and coverage output
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.coverage*
+.coverage
+.coverage.*
+coverage.xml
 htmlcov/
-cookies.txt
-proxies.txt
+
+# Local logs and editor/OS metadata
 *.log
-tmp/
+.DS_Store
+.idea/
+.vscode/

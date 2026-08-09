@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "tt-scrap"
-    app_version: str = "1.0.0"
+    app_version: str = "1.1.0"
     environment: str = "production"
     log_level: str = "INFO"
     log_format: str = "console"

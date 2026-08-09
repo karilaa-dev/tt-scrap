@@ -13,5 +13,11 @@ __pycache__
 htmlcov
 cookies.txt
 proxies.txt
+downloads
+tmp
 tests
 scripts
+build
+dist
+*.egg-info
+*.log
