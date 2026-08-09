@@ -82,6 +82,38 @@ async def test_instagram_asset_retries_and_verifies(settings) -> None:
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_length_delimited_asset_can_be_relayed_without_spooling(settings) -> None:
+    payload = b"\x00\x00\x00\x18ftypisomstreamed-video"
+    route = respx.get("https://cdn.test/video").mock(
+        return_value=Response(
+            200,
+            content=payload,
+            headers={"Content-Type": "video/mp4", "Content-Length": str(len(payload))},
+        )
+    )
+    downloader = AssetDownloader(settings, ProxyManager())
+    try:
+        async with downloader.stream(
+            AssetFetchContext(
+                platform="instagram",
+                upstream_url="https://cdn.test/video",
+                filename="video.mp4",
+                kind="video",
+            )
+        ) as streamed:
+            assert streamed is not None
+            received = b"".join([chunk async for chunk in streamed.chunks])
+
+        assert route.call_count == 1
+        assert streamed.size == len(payload)
+        assert streamed.content_type == "video/mp4"
+        assert received == payload
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_truncated_asset_is_retried_then_rejected(settings) -> None:
     settings.download_max_retries = 2
     route = respx.get("https://cdn.test/truncated").mock(

@@ -85,31 +85,6 @@ class FakeTelegramClient:
         return TelegramCallResponse(method, status, body, "application/json")
 
 
-class FileIdTelegramClient(FakeTelegramClient):
-    async def call(self, method, fields, uploads) -> TelegramCallResponse:
-        response = await super().call(method, fields, uploads)
-        if not response.ok:
-            return response
-        if method == "sendMediaGroup":
-            result = []
-            for index, media in enumerate(fields["media"]):
-                media_type = media["type"]
-                value: Any = {"file_id": f"telegram-{media_type}-{index}"}
-                if media_type == "photo":
-                    value = [value]
-                result.append({media_type: value})
-        else:
-            media_type = {
-                "sendDocument": "document",
-                "sendPhoto": "photo",
-                "sendVideo": "video",
-            }[method]
-            value = {"file_id": f"telegram-{media_type}"}
-            result = {media_type: [value] if media_type == "photo" else value}
-        body = json.dumps({"ok": True, "result": result}).encode()
-        return TelegramCallResponse(method, 200, body, "application/json")
-
-
 class FakeInstagram:
     def __init__(self, extraction: InstagramExtractionResponse) -> None:
         self.extraction = extraction
@@ -320,41 +295,6 @@ async def test_mixed_instagram_carousel_preserves_order_caption_and_thumbnail(se
         b"\xff\xd8\xffthumbnail",
         b"\xff\xd8\xffconverted",
     ]
-
-
-@pytest.mark.asyncio
-async def test_repeated_instagram_carousel_reuses_file_ids_without_download(settings) -> None:
-    cache = CacheStore(600, 100)
-    first = await descriptor(cache, "first", "image", 0)
-    video = await descriptor(cache, "video", "video", 1, declared_content_type="video/mp4")
-    extraction = InstagramExtractionResponse(
-        extraction_id="instagram-extraction",
-        source_id="ABC123",
-        source_url="https://www.instagram.com/p/ABC123/",
-        content_type="carousel",
-        media=[
-            InstagramMediaItem(position=0, media_type="image", asset=first),
-            InstagramMediaItem(position=1, media_type="video", asset=video),
-        ],
-        expires_at=datetime.now(UTC) + timedelta(minutes=10),
-    )
-    downloader = FakeDownloader(
-        {"first": (b"\xff\xd8\xfffirst", "image/jpeg"), "video": (b"video", "video/mp4")}
-    )
-    client = FileIdTelegramClient()
-    delivery, _instagram = service(settings, cache, extraction, downloader, client)
-
-    await delivery.deliver_instagram(request(caption="first"))
-    await delivery.deliver_instagram(request(caption="second"))
-
-    assert sorted(downloader.calls) == ["first", "video"]
-    assert len(client.calls) == 2
-    assert [item["media"] for item in client.calls[1][1]["media"]] == [
-        "telegram-photo-0",
-        "telegram-video-1",
-    ]
-    assert client.calls[1][1]["media"][0]["caption"] == "second"
-    assert client.calls[1][2] == {}
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+from collections.abc import AsyncIterable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -10,7 +12,7 @@ import pytest
 
 from tt_scrap.cache import CacheStore
 from tt_scrap.errors import ImageConversionError
-from tt_scrap.media import ConvertedImage, DownloadedAsset
+from tt_scrap.media import ConvertedImage, DownloadedAsset, StreamedAsset
 from tt_scrap.models import (
     AssetDescriptor,
     AssetFetchContext,
@@ -33,6 +35,28 @@ class FakeDownloader:
         self.calls.append(context.upstream_url)
         payload, content_type = self.payloads[context.upstream_url]
         return DownloadedAsset(io.BytesIO(payload), len(payload), None, content_type)
+
+    @asynccontextmanager
+    async def stream(self, context: AssetFetchContext):
+        yield None
+
+
+class StreamingDownloader(FakeDownloader):
+    def __init__(self, payloads: dict[str, tuple[bytes, str]]) -> None:
+        super().__init__(payloads)
+        self.stream_calls: list[str] = []
+
+    @asynccontextmanager
+    async def stream(self, context: AssetFetchContext):
+        self.stream_calls.append(context.upstream_url)
+        payload, content_type = self.payloads[context.upstream_url]
+
+        async def chunks():
+            midpoint = max(1, len(payload) // 2)
+            yield payload[:midpoint]
+            yield payload[midpoint:]
+
+        yield StreamedAsset(chunks(), len(payload), content_type)
 
 
 class FakeImages:
@@ -87,8 +111,11 @@ class FakeTelegramClient:
     async def call(self, method, fields, uploads) -> TelegramCallResponse:
         uploaded: dict[str, bytes] = {}
         for upload in uploads:
-            upload.file.seek(0)
-            uploaded[upload.field_name] = upload.file.read()
+            if isinstance(upload.file, AsyncIterable):
+                uploaded[upload.field_name] = b"".join([chunk async for chunk in upload.file])
+            else:
+                upload.file.seek(0)
+                uploaded[upload.field_name] = upload.file.read()
         copied_fields = json.loads(json.dumps(fields))
         self.calls.append((method, copied_fields, uploaded))
         status = (
@@ -100,32 +127,6 @@ class FakeTelegramClient:
             else b'{"ok":false,"error_code":429,"description":"retry"}'
         )
         return TelegramCallResponse(method, status, body, "application/json")
-
-
-class FileIdTelegramClient(FakeTelegramClient):
-    async def call(self, method, fields, uploads) -> TelegramCallResponse:
-        response = await super().call(method, fields, uploads)
-        if not response.ok:
-            return response
-        if method == "sendMediaGroup":
-            result = []
-            for index, media in enumerate(fields["media"]):
-                media_type = media["type"]
-                value: Any = {"file_id": f"telegram-{media_type}-{index}"}
-                if media_type == "photo":
-                    value = [value]
-                result.append({media_type: value})
-        else:
-            media_type = {
-                "sendAudio": "audio",
-                "sendDocument": "document",
-                "sendPhoto": "photo",
-                "sendVideo": "video",
-            }[method]
-            value = {"file_id": f"telegram-{media_type}"}
-            result = {media_type: [value] if media_type == "photo" else value}
-        body = json.dumps({"ok": True, "result": result}).encode()
-        return TelegramCallResponse(method, 200, body, "application/json")
 
 
 class FakeTikTok:
@@ -232,7 +233,7 @@ async def test_video_upload_infers_metadata_and_attaches_thumbnail(settings) -> 
 
 
 @pytest.mark.asyncio
-async def test_repeated_video_reuses_telegram_file_id_without_download(settings) -> None:
+async def test_video_relays_upstream_bytes_into_telegram_upload(settings) -> None:
     cache = CacheStore(600, 100)
     video = await descriptor(cache, "video", "video")
     cover = await descriptor(cache, "cover", "cover")
@@ -246,27 +247,23 @@ async def test_repeated_video_reuses_telegram_file_id_without_download(settings)
         cover=cover,
         expires_at=datetime.now(UTC) + timedelta(minutes=10),
     )
-    downloader = FakeDownloader(
-        {"video": (b"video-data", "video/mp4"), "cover": (b"cover-data", "image/jpeg")}
+    downloader = StreamingDownloader(
+        {"video": (b"streamed-video", "video/mp4"), "cover": (b"cover", "image/jpeg")}
     )
-    client = FileIdTelegramClient()
-    delivery = service(settings, cache, extraction, downloader, client)
+    client = FakeTelegramClient()
 
-    await delivery.deliver(request(caption="first"))
-    await delivery.deliver(request(caption="second"))
+    await service(settings, cache, extraction, downloader, client).deliver(request())
 
-    assert sorted(downloader.calls) == ["cover", "video"]
-    assert len(client.calls) == 2
-    assert client.calls[1][0] == "sendVideo"
-    assert client.calls[1][1]["video"] == "telegram-video"
-    assert client.calls[1][1]["caption"] == "second"
-    assert client.calls[1][2] == {}
+    assert downloader.stream_calls == ["video"]
+    assert downloader.calls == ["cover"]
+    assert client.calls[0][2]["video_file"] == b"streamed-video"
 
 
 @pytest.mark.asyncio
-async def test_rejected_cached_file_id_falls_back_to_upload(settings) -> None:
+async def test_video_relay_does_not_wait_for_a_slow_source_cover(settings) -> None:
     cache = CacheStore(600, 100)
     video = await descriptor(cache, "video", "video")
+    cover = await descriptor(cache, "cover", "cover")
     extraction = TikTokExtractionResponse(
         extraction_id="extraction-1",
         source_id="123",
@@ -274,53 +271,29 @@ async def test_rejected_cached_file_id_falls_back_to_upload(settings) -> None:
         resolved_url="https://www.tiktok.com/@a/video/123",
         content_type="video",
         media=[video],
+        cover=cover,
         expires_at=datetime.now(UTC) + timedelta(minutes=10),
     )
-    downloader = FakeDownloader({"video": (b"video-data", "video/mp4")})
-    client = FileIdTelegramClient(statuses=[200, 400, 200])
-    delivery = service(settings, cache, extraction, downloader, client)
 
-    await delivery.deliver(request())
-    outcome = await delivery.deliver(request())
+    class SlowCoverDownloader(StreamingDownloader):
+        async def download(self, context, *, compute_sha256=True):
+            if context.upstream_url == "cover":
+                await asyncio.sleep(1)
+            return await super().download(context, compute_sha256=compute_sha256)
 
-    assert outcome.calls[0].ok
-    assert downloader.calls == ["video", "video"]
-    assert len(client.calls) == 3
-    assert client.calls[1][1]["video"] == "telegram-video"
-    assert client.calls[1][2] == {}
-    assert client.calls[2][1]["video"] == "attach://video_file"
-    assert client.calls[2][2]["video_file"] == b"video-data"
-
-
-@pytest.mark.asyncio
-async def test_repeated_slideshow_reuses_album_file_ids_without_download(settings) -> None:
-    cache = CacheStore(600, 100)
-    media = [await descriptor(cache, f"image-{index}", "image", index) for index in range(2)]
-    extraction = TikTokExtractionResponse(
-        extraction_id="extraction-1",
-        source_id="123",
-        source_url="https://www.tiktok.com/@a/photo/123",
-        resolved_url="https://www.tiktok.com/@a/photo/123",
-        content_type="slideshow",
-        media=media,
-        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    downloader = SlowCoverDownloader(
+        {"video": (b"streamed-video", "video/mp4"), "cover": (b"cover", "image/jpeg")}
     )
-    downloader = FakeDownloader(
-        {f"image-{index}": (b"\xff\xd8\xffimage", "image/jpeg") for index in range(2)}
+    client = FakeTelegramClient()
+    settings.telegram_thumbnail_wait_seconds = 0.01
+
+    await asyncio.wait_for(
+        service(settings, cache, extraction, downloader, client).deliver(request()),
+        timeout=0.5,
     )
-    client = FileIdTelegramClient()
-    delivery = service(settings, cache, extraction, downloader, client)
 
-    await delivery.deliver(request())
-    await delivery.deliver(request())
-
-    assert sorted(downloader.calls) == ["image-0", "image-1"]
-    assert len(client.calls) == 2
-    assert [item["media"] for item in client.calls[1][1]["media"]] == [
-        "telegram-photo-0",
-        "telegram-photo-1",
-    ]
-    assert client.calls[1][2] == {}
+    assert client.calls[0][2] == {"video_file": b"streamed-video"}
+    assert "thumbnail" not in client.calls[0][1]
 
 
 @pytest.mark.asyncio

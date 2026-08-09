@@ -62,6 +62,7 @@ are:
 | `TELEGRAM_API_BASE_URL` | Telegram Bot API base URL, including custom/local servers |
 | `TELEGRAM_UPLOAD_CONCURRENCY` | Maximum concurrent delivery pipelines; default 20 |
 | `TELEGRAM_UPLOAD_TIMEOUT_SECONDS` | Per Telegram upload timeout; default 600 seconds |
+| `TELEGRAM_THUMBNAIL_WAIT_SECONDS` | Soft cover-preparation budget for relayed videos; default 1.5 seconds |
 | `MAX_VIDEO_DURATION` | Maximum duration in seconds; zero disables it |
 | `MAX_ASSET_BYTES` | Maximum downloaded size; zero disables it |
 
@@ -174,12 +175,12 @@ FFmpeg stream-copies them into MP4 without re-encoding. This same muxing path is
 used by direct Telegram delivery and `/v1/assets` downloads. Video and audio
 thumbnails are normalized to Telegram-compliant JPEGs.
 
-After a successful Telegram upload, the process keeps Telegram's bot-scoped
-`file_id` in a bounded in-memory index keyed by the opaque asset ID. Repeating the
-same cached extraction reuses that `file_id`, as recommended by Telegram, and skips
-both the upstream download and multipart upload. A refreshed or expired extraction
-has new asset IDs and therefore performs a fresh upload. If Telegram rejects a
-cached ID, the service discards it and falls back to one normal upload.
+Length-delimited, unmodified TikTok videos are relayed into Telegram while the
+upstream response is still arriving. This overlaps the CDN download with the
+Telegram upload and avoids an intermediate spool. Separate audio/video tracks,
+unknown-length assets, and transformed media keep the verified download/remux
+fallback. Relay covers have a short soft deadline; Telegram generates the preview
+when the source cover is slower than that budget.
 
 ### Deliver Instagram media to Telegram
 

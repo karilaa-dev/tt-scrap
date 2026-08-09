@@ -10,8 +10,11 @@ from pydantic import SecretStr
 from tt_scrap.telegram import TelegramClient, TelegramUpload
 
 
+@pytest.mark.parametrize("relay", [False, True])
 @pytest.mark.asyncio
-async def test_client_streams_multipart_and_serializes_telegram_fields(settings) -> None:
+async def test_client_streams_multipart_and_serializes_telegram_fields(
+    settings, relay: bool
+) -> None:
     received: dict[str, bytes] = {}
 
     async def handler(request: web.Request) -> web.Response:
@@ -37,6 +40,21 @@ async def test_client_streams_multipart_and_serializes_telegram_fields(settings)
         )
     )
     try:
+
+        async def chunks():
+            yield b"vid"
+            yield b"eo"
+
+        upload = (
+            TelegramUpload("video_file", chunks(), "video.mp4", "video/mp4", size=5)
+            if relay
+            else TelegramUpload(
+                "video_file",
+                io.BytesIO(b"video"),
+                "video.mp4",
+                "video/mp4",
+            )
+        )
         response = await client.call(
             "sendVideo",
             {
@@ -45,7 +63,7 @@ async def test_client_streams_multipart_and_serializes_telegram_fields(settings)
                 "reply_markup": {"inline_keyboard": []},
                 "video": "attach://video_file",
             },
-            [TelegramUpload("video_file", io.BytesIO(b"video"), "video.mp4", "video/mp4")],
+            [upload],
         )
     finally:
         await client.close()

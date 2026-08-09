@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import AsyncIterable
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, BinaryIO
@@ -20,9 +21,10 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True, slots=True)
 class TelegramUpload:
     field_name: str
-    file: BinaryIO
+    file: BinaryIO | AsyncIterable[bytes]
     filename: str
     content_type: str
+    size: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,7 +58,18 @@ def _form_value(value: Any) -> str:
     return str(value)
 
 
-def _file_size(file: BinaryIO) -> int | None:
+class _SizedAsyncIterablePayload(aiohttp.payload.AsyncIterablePayload):
+    def __init__(self, value: AsyncIterable[bytes], size: int, **kwargs: Any) -> None:
+        super().__init__(value, **kwargs)
+        self._size = size
+
+
+def _file_size(upload: TelegramUpload) -> int | None:
+    if upload.size is not None:
+        return upload.size
+    file = upload.file
+    if not hasattr(file, "tell") or not hasattr(file, "seek"):
+        return None
     try:
         position = file.tell()
         file.seek(0, 2)
@@ -118,7 +131,7 @@ class TelegramClient:
         if not self._token:
             raise ConfigurationError("Telegram delivery is not configured")
         started_at = perf_counter()
-        upload_sizes = [_file_size(upload.file) for upload in uploads]
+        upload_sizes = [_file_size(upload) for upload in uploads]
         upload_bytes = (
             sum(size for size in upload_sizes if size is not None)
             if all(size is not None for size in upload_sizes)
@@ -129,10 +142,21 @@ class TelegramClient:
             if value is not None:
                 form.add_field(name, _form_value(value))
         for upload in uploads:
-            upload.file.seek(0)
+            if isinstance(upload.file, AsyncIterable):
+                if upload.size is None:
+                    raise ValueError("Streaming Telegram uploads require a known size")
+                upload_value: BinaryIO | aiohttp.payload.Payload = _SizedAsyncIterablePayload(
+                    upload.file,
+                    upload.size,
+                    filename=upload.filename,
+                    content_type=upload.content_type,
+                )
+            else:
+                upload.file.seek(0)
+                upload_value = upload.file
             form.add_field(
                 upload.field_name,
-                upload.file,
+                upload_value,
                 filename=upload.filename,
                 content_type=upload.content_type,
             )

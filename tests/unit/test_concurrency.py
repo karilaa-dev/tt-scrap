@@ -23,6 +23,7 @@ class FakeContext:
 def test_production_concurrency_defaults() -> None:
     assert Settings.model_fields["instagram_concurrency"].default == 4
     assert Settings.model_fields["telegram_upload_concurrency"].default == 20
+    assert Settings.model_fields["telegram_thumbnail_wait_seconds"].default == 1.5
     assert Settings.model_fields["image_conversion_workers"].default == 0
 
 

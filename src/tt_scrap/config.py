@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     telegram_api_base_url: str = "https://api.telegram.org"
     telegram_upload_concurrency: int = Field(default=20, ge=1, le=256)
     telegram_upload_timeout_seconds: float = Field(default=600.0, gt=0, le=3_600)
+    telegram_thumbnail_wait_seconds: float = Field(default=1.5, ge=0, le=30)
     image_conversion_workers: int = Field(default=0, ge=0, le=256)
 
     @field_validator("log_level")
