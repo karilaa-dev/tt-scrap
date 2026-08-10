@@ -5,17 +5,24 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any, BinaryIO, Literal
+from typing import Any, BinaryIO, Literal, cast
 
 from ..cache import CacheStore
 from ..config import Settings
-from ..errors import ConfigurationError, ExtractionError, TelegramParameterError
+from ..errors import (
+    ConfigurationError,
+    ExtractionError,
+    ImageConversionError,
+    TelegramParameterError,
+)
 from ..logging import elapsed_ms, log_event
-from ..media import AssetDownloader, DownloadedAsset, ImagePreparationService
+from ..media import AssetDownloader, DownloadedAsset, ImagePreparationService, StreamedAsset
 from ..media.downloader import filename_for_type
-from ..media.images import is_native_telegram_photo
+from ..media.images import detect_image_format, is_native_telegram_photo
 from ..models import (
     AssetDescriptor,
     InstagramExtractionResponse,
@@ -139,7 +146,23 @@ class TelegramDeliveryService:
         self._images = images
         self._client = client
         self._instagram = instagram
-        self._pipeline_limit = asyncio.Semaphore(settings.telegram_upload_concurrency)
+        self._pipeline_limit = asyncio.Semaphore(settings.telegram_pipeline_concurrency)
+        self._upload_limit = asyncio.Semaphore(settings.telegram_upload_concurrency)
+        self._thumbnail_wait_seconds = settings.telegram_thumbnail_wait_seconds
+
+    @asynccontextmanager
+    async def _upload_slot(self) -> AsyncIterator[None]:
+        async with self._upload_limit:
+            yield
+
+    async def _call(
+        self,
+        method: str,
+        fields: dict[str, Any],
+        uploads: list[TelegramUpload],
+    ) -> TelegramCallResponse:
+        async with self._upload_slot():
+            return await self._client.call(method, fields, uploads)
 
     async def deliver(self, request: TikTokTelegramDeliveryRequest) -> TelegramDeliveryOutcome:
         if not self._client.configured:
@@ -265,6 +288,12 @@ class TelegramDeliveryService:
         context = await self._cache.get_asset(descriptor.asset_id)
         return await self._downloader.download(context, compute_sha256=False)
 
+    @asynccontextmanager
+    async def _stream(self, descriptor: AssetDescriptor) -> AsyncIterator[StreamedAsset | None]:
+        context = await self._cache.get_asset(descriptor.asset_id)
+        async with self._downloader.stream(context) as streamed:
+            yield streamed
+
     async def _download_with_cover(
         self, media: AssetDescriptor, cover: AssetDescriptor | None
     ) -> tuple[DownloadedAsset, DownloadedAsset | None]:
@@ -293,6 +322,79 @@ class TelegramDeliveryService:
                     success=False,
                 )
         return media_result, cover_result
+
+    async def _download_prepared_thumbnail(
+        self,
+        cover: AssetDescriptor | None,
+        thumbnail_filename: str,
+    ) -> tuple[DownloadedAsset | None, tuple[io.BytesIO, str] | None]:
+        if cover is None:
+            return None, None
+        try:
+            downloaded_cover = await self._download(cover)
+        except Exception as exc:
+            log_event(
+                logger,
+                "telegram.thumbnail_download.failed",
+                level=logging.WARNING,
+                message="Media cover download failed; Telegram will generate a preview",
+                error_type=type(exc).__name__,
+                success=False,
+            )
+            return None, None
+        try:
+            thumbnail = await self._thumbnail(
+                downloaded_cover,
+                thumbnail_filename,
+            )
+        except BaseException:
+            downloaded_cover.file.close()
+            raise
+        return downloaded_cover, thumbnail
+
+    async def _download_with_prepared_thumbnail(
+        self,
+        media: AssetDescriptor,
+        cover: AssetDescriptor | None,
+        thumbnail_filename: str,
+    ) -> tuple[
+        DownloadedAsset,
+        DownloadedAsset | None,
+        tuple[io.BytesIO, str] | None,
+    ]:
+        """Prepare a cover as soon as it downloads, while media keeps downloading."""
+        media_task = asyncio.create_task(self._download(media))
+        cover_task = (
+            asyncio.create_task(self._download_prepared_thumbnail(cover, thumbnail_filename))
+            if cover is not None
+            else None
+        )
+        tasks = [media_task, *([cover_task] if cover_task is not None else [])]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        media_result = results[0]
+        if isinstance(media_result, BaseException):
+            for result in results[1:]:
+                if isinstance(result, tuple):
+                    downloaded_cover, result_thumbnail = cast(
+                        tuple[DownloadedAsset | None, tuple[io.BytesIO, str] | None],
+                        result,
+                    )
+                    if downloaded_cover is not None:
+                        downloaded_cover.file.close()
+                    if result_thumbnail is not None:
+                        result_thumbnail[0].close()
+            raise media_result
+
+        cover_result: DownloadedAsset | None = None
+        prepared_thumbnail: tuple[io.BytesIO, str] | None = None
+        if len(results) > 1:
+            candidate = results[1]
+            if isinstance(candidate, tuple):
+                cover_result, prepared_thumbnail = cast(
+                    tuple[DownloadedAsset | None, tuple[io.BytesIO, str] | None],
+                    candidate,
+                )
+        return cast(DownloadedAsset, media_result), cover_result, prepared_thumbnail
 
     async def _thumbnail(
         self, cover: DownloadedAsset | None, filename: str
@@ -329,41 +431,174 @@ class TelegramDeliveryService:
         if name not in parameters.model_fields_set and value is not None:
             fields[name] = value
 
+    async def _try_relay_video(
+        self,
+        extraction: TikTokExtractionResponse,
+        fields: dict[str, Any],
+    ) -> TelegramDeliveryOutcome | None:
+        async with self._stream(extraction.media[0]) as streamed:
+            if streamed is None:
+                return None
+            cover: DownloadedAsset | None = None
+            thumbnail: tuple[io.BytesIO, str] | None = None
+            if extraction.cover is not None and self._thumbnail_wait_seconds > 0:
+                try:
+                    cover, thumbnail = await asyncio.wait_for(
+                        self._download_prepared_thumbnail(
+                            extraction.cover,
+                            f"{extraction.source_id}_thumbnail.jpg",
+                        ),
+                        timeout=self._thumbnail_wait_seconds,
+                    )
+                except TimeoutError:
+                    log_event(
+                        logger,
+                        "telegram.relay_thumbnail.skipped",
+                        level=logging.INFO,
+                        message="Slow source cover skipped; Telegram will generate a preview",
+                        wait_seconds=self._thumbnail_wait_seconds,
+                        success=True,
+                    )
+            try:
+                filename = filename_for_type(
+                    extraction.media[0].filename,
+                    streamed.content_type,
+                )
+                fields["video"] = "attach://video_file"
+                uploads = [
+                    TelegramUpload(
+                        "video_file",
+                        streamed.chunks,
+                        filename,
+                        streamed.content_type,
+                        size=streamed.size,
+                    )
+                ]
+                if thumbnail is not None:
+                    thumbnail_file, thumbnail_name = thumbnail
+                    fields["thumbnail"] = "attach://thumbnail_file"
+                    fields["cover"] = "attach://thumbnail_file"
+                    uploads.append(
+                        TelegramUpload(
+                            "thumbnail_file",
+                            thumbnail_file,
+                            thumbnail_name,
+                            "image/jpeg",
+                        )
+                    )
+                try:
+                    response = await self._call("sendVideo", fields, uploads)
+                except Exception:
+                    if streamed.failure is None:
+                        raise
+                    log_event(
+                        logger,
+                        "telegram.relay.fallback",
+                        level=logging.WARNING,
+                        message="Interrupted media relay is retrying through verified spool",
+                        delivery="media",
+                        error_type=type(streamed.failure).__name__,
+                        success=False,
+                    )
+                    return None
+                return TelegramDeliveryOutcome([response])
+            finally:
+                if cover is not None:
+                    cover.file.close()
+                if thumbnail is not None:
+                    thumbnail[0].close()
+
     async def _deliver_video(
         self, request: TikTokTelegramDeliveryRequest, extraction: TikTokExtractionResponse
     ) -> TelegramDeliveryOutcome:
         if request.delivery == "document":
+            fields = self._fields(request.telegram, _DOCUMENT_FIELDS)
+            self._default(
+                fields,
+                request.telegram,
+                "disable_content_type_detection",
+                True,
+            )
+            async with self._stream(extraction.media[0]) as streamed:
+                if streamed is not None:
+                    filename = filename_for_type(
+                        extraction.media[0].filename,
+                        streamed.content_type,
+                    )
+                    fields["document"] = "attach://document_file"
+                    try:
+                        response = await self._call(
+                            "sendDocument",
+                            fields,
+                            [
+                                TelegramUpload(
+                                    "document_file",
+                                    streamed.chunks,
+                                    filename,
+                                    streamed.content_type,
+                                    size=streamed.size,
+                                )
+                            ],
+                        )
+                    except Exception:
+                        if streamed.failure is None:
+                            raise
+                        log_event(
+                            logger,
+                            "telegram.relay.fallback",
+                            level=logging.WARNING,
+                            message="Interrupted media relay is retrying through verified spool",
+                            delivery="document",
+                            error_type=type(streamed.failure).__name__,
+                            success=False,
+                        )
+                    else:
+                        return TelegramDeliveryOutcome([response])
             video = await self._download(extraction.media[0])
-            cover = None
-        else:
-            video, cover = await self._download_with_cover(extraction.media[0], extraction.cover)
-        extra_files: list[BinaryIO] = []
-        try:
-            filename = filename_for_type(extraction.media[0].filename, video.content_type)
-            if request.delivery == "document":
-                fields = self._fields(request.telegram, _DOCUMENT_FIELDS)
-                self._default(
-                    fields,
-                    request.telegram,
-                    "disable_content_type_detection",
-                    True,
-                )
+            try:
+                filename = filename_for_type(extraction.media[0].filename, video.content_type)
                 fields["document"] = "attach://document_file"
-                response = await self._client.call(
+                response = await self._call(
                     "sendDocument",
                     fields,
                     [TelegramUpload("document_file", video.file, filename, video.content_type)],
                 )
                 return TelegramDeliveryOutcome([response])
+            finally:
+                video.file.close()
 
-            fields = self._fields(request.telegram, _VIDEO_FIELDS)
-            self._default(fields, request.telegram, "duration", extraction.duration_seconds)
-            self._default(fields, request.telegram, "width", extraction.width)
-            self._default(fields, request.telegram, "height", extraction.height)
-            self._default(fields, request.telegram, "supports_streaming", True)
+        fields = self._fields(request.telegram, _VIDEO_FIELDS)
+        self._default(fields, request.telegram, "duration", extraction.duration_seconds)
+        self._default(fields, request.telegram, "width", extraction.width)
+        self._default(fields, request.telegram, "height", extraction.height)
+        self._default(fields, request.telegram, "supports_streaming", True)
+        relayed = await self._try_relay_video(extraction, fields)
+        if relayed is not None:
+            return relayed
+
+        fields.pop("thumbnail", None)
+        fields.pop("cover", None)
+
+        video, cover, thumbnail = await self._download_with_prepared_thumbnail(
+            extraction.media[0],
+            extraction.cover,
+            f"{extraction.source_id}_thumbnail.jpg",
+        )
+        extra_files: list[BinaryIO] = []
+        try:
+            filename = filename_for_type(
+                extraction.media[0].filename,
+                video.content_type,
+            )
             fields["video"] = "attach://video_file"
-            uploads = [TelegramUpload("video_file", video.file, filename, video.content_type)]
-            thumbnail = await self._thumbnail(cover, f"{extraction.source_id}_thumbnail.jpg")
+            uploads = [
+                TelegramUpload(
+                    "video_file",
+                    video.file,
+                    filename,
+                    video.content_type,
+                )
+            ]
             if thumbnail is not None:
                 thumbnail_file, thumbnail_name = thumbnail
                 extra_files.append(thumbnail_file)
@@ -372,7 +607,7 @@ class TelegramDeliveryService:
                 uploads.append(
                     TelegramUpload("thumbnail_file", thumbnail_file, thumbnail_name, "image/jpeg")
                 )
-            response = await self._client.call("sendVideo", fields, uploads)
+            response = await self._call("sendVideo", fields, uploads)
             return TelegramDeliveryOutcome([response])
         finally:
             video.file.close()
@@ -408,17 +643,20 @@ class TelegramDeliveryService:
         audio_descriptor = music.audio
         if audio_descriptor is None:
             raise ExtractionError("TikTok response has no music asset")
-        audio, cover = await self._download_with_cover(audio_descriptor, music.cover)
+        fields = self._fields(request.telegram, _AUDIO_FIELDS)
+        self._default(fields, request.telegram, "duration", music.duration_seconds)
+        self._default(fields, request.telegram, "title", music.title)
+        self._default(fields, request.telegram, "performer", music.author)
+        audio, cover, thumbnail = await self._download_with_prepared_thumbnail(
+            audio_descriptor,
+            music.cover,
+            f"{audio_descriptor.asset_id}_thumbnail.jpg",
+        )
         extra_files: list[BinaryIO] = []
         try:
-            fields = self._fields(request.telegram, _AUDIO_FIELDS)
-            self._default(fields, request.telegram, "duration", music.duration_seconds)
-            self._default(fields, request.telegram, "title", music.title)
-            self._default(fields, request.telegram, "performer", music.author)
             fields["audio"] = "attach://audio_file"
             filename = filename_for_type(audio_descriptor.filename, audio.content_type)
             uploads = [TelegramUpload("audio_file", audio.file, filename, audio.content_type)]
-            thumbnail = await self._thumbnail(cover, f"{audio_descriptor.asset_id}_thumbnail.jpg")
             if thumbnail is not None:
                 thumbnail_file, thumbnail_name = thumbnail
                 extra_files.append(thumbnail_file)
@@ -426,7 +664,7 @@ class TelegramDeliveryService:
                 uploads.append(
                     TelegramUpload("thumbnail_file", thumbnail_file, thumbnail_name, "image/jpeg")
                 )
-            response = await self._client.call("sendAudio", fields, uploads)
+            response = await self._call("sendAudio", fields, uploads)
             return TelegramDeliveryOutcome([response])
         finally:
             audio.file.close()
@@ -441,6 +679,8 @@ class TelegramDeliveryService:
         thumbnail: DownloadedAsset | None,
         *,
         document: bool,
+        converted_thumbnail: tuple[io.BytesIO, str] | None = None,
+        thumbnail_prepared: bool = False,
     ) -> tuple[_PreparedInstagramItem, list[BinaryIO]]:
         filename = filename_for_type(item.asset.filename, downloaded.content_type)
         if document:
@@ -464,10 +704,12 @@ class TelegramDeliveryService:
 
         extra_files: list[BinaryIO] = []
         prepared_thumbnail = None
-        converted = await self._thumbnail(
-            thumbnail,
-            f"{item.asset.asset_id}_thumbnail.jpg",
-        )
+        converted = converted_thumbnail
+        if not thumbnail_prepared:
+            converted = await self._thumbnail(
+                thumbnail,
+                f"{item.asset.asset_id}_thumbnail.jpg",
+            )
         if converted is not None:
             thumbnail_file, thumbnail_name = converted
             extra_files.append(thumbnail_file)
@@ -490,11 +732,33 @@ class TelegramDeliveryService:
         request: InstagramTelegramDeliveryRequest,
         item: InstagramMediaItem,
     ) -> TelegramDeliveryOutcome:
+        if request.delivery == "document":
+            fields = self._fields(request.telegram, _DOCUMENT_FIELDS)
+            self._default(
+                fields,
+                request.telegram,
+                "disable_content_type_detection",
+                True,
+            )
+        elif item.media_type == "image":
+            fields = self._fields(request.telegram, _PHOTO_FIELDS)
+        else:
+            fields = self._fields(request.telegram, _VIDEO_FIELDS)
+            self._default(fields, request.telegram, "supports_streaming", True)
         use_thumbnail = request.delivery == "media" and item.media_type == "video"
-        downloaded, thumbnail = await self._download_with_cover(
-            item.asset,
-            item.thumbnail if use_thumbnail else None,
-        )
+        if use_thumbnail:
+            (
+                downloaded,
+                thumbnail,
+                converted_thumbnail,
+            ) = await self._download_with_prepared_thumbnail(
+                item.asset,
+                item.thumbnail,
+                f"{item.asset.asset_id}_thumbnail.jpg",
+            )
+        else:
+            downloaded, thumbnail = await self._download_with_cover(item.asset, None)
+            converted_thumbnail = None
         extra_files: list[BinaryIO] = []
         try:
             prepared, owned_files = await self._prepare_instagram_item(
@@ -502,18 +766,13 @@ class TelegramDeliveryService:
                 downloaded,
                 thumbnail,
                 document=request.delivery == "document",
+                converted_thumbnail=converted_thumbnail,
+                thumbnail_prepared=use_thumbnail,
             )
             extra_files.extend(owned_files)
             if request.delivery == "document":
-                fields = self._fields(request.telegram, _DOCUMENT_FIELDS)
-                self._default(
-                    fields,
-                    request.telegram,
-                    "disable_content_type_detection",
-                    True,
-                )
                 fields["document"] = "attach://document_file"
-                response = await self._client.call(
+                response = await self._call(
                     "sendDocument",
                     fields,
                     [
@@ -528,9 +787,8 @@ class TelegramDeliveryService:
                 return TelegramDeliveryOutcome([response])
 
             if item.media_type == "image":
-                fields = self._fields(request.telegram, _PHOTO_FIELDS)
                 fields["photo"] = "attach://photo_file"
-                response = await self._client.call(
+                response = await self._call(
                     "sendPhoto",
                     fields,
                     [
@@ -544,8 +802,6 @@ class TelegramDeliveryService:
                 )
                 return TelegramDeliveryOutcome([response])
 
-            fields = self._fields(request.telegram, _VIDEO_FIELDS)
-            self._default(fields, request.telegram, "supports_streaming", True)
             fields["video"] = "attach://video_file"
             uploads = [
                 TelegramUpload(
@@ -566,13 +822,15 @@ class TelegramDeliveryService:
                         prepared.thumbnail.content_type,
                     )
                 )
-            response = await self._client.call("sendVideo", fields, uploads)
+            response = await self._call("sendVideo", fields, uploads)
             return TelegramDeliveryOutcome([response])
         finally:
             downloaded.file.close()
             if thumbnail is not None:
                 thumbnail.file.close()
             _close_files(extra_files)
+            if converted_thumbnail is not None:
+                converted_thumbnail[0].close()
 
     async def _deliver_instagram_carousel(
         self,
@@ -581,18 +839,57 @@ class TelegramDeliveryService:
     ) -> TelegramDeliveryOutcome:
         document = request.delivery == "document"
 
+        item_fields = set(_ALBUM_CAPTION_FIELDS)
+        if document:
+            item_fields.add("disable_content_type_detection")
+        else:
+            item_fields |= (
+                _ALBUM_MEDIA_FIRST_FIELDS | _ALBUM_MEDIA_ITEM_FIELDS | _ALBUM_VIDEO_FIELDS
+            )
+        fields = self._fields(request.telegram, _MEDIA_GROUP_FIELDS | item_fields)
+        first_item_fields = {
+            name: fields.pop(name)
+            for name in _ALBUM_CAPTION_FIELDS | _ALBUM_MEDIA_FIRST_FIELDS
+            if name in fields
+        }
+        all_media_fields = {
+            name: fields.pop(name) for name in _ALBUM_MEDIA_ITEM_FIELDS if name in fields
+        }
+        video_fields = {name: fields.pop(name) for name in _ALBUM_VIDEO_FIELDS if name in fields}
+        disable_content_type_detection = fields.pop(
+            "disable_content_type_detection",
+            True,
+        )
+
         async def download_item(
             item: InstagramMediaItem,
-        ) -> tuple[DownloadedAsset, DownloadedAsset | None]:
+        ) -> tuple[
+            DownloadedAsset,
+            DownloadedAsset | None,
+            tuple[io.BytesIO, str] | None,
+        ]:
             cover = item.thumbnail if not document and item.media_type == "video" else None
-            return await self._download_with_cover(item.asset, cover)
+            if cover is not None:
+                return await self._download_with_prepared_thumbnail(
+                    item.asset,
+                    cover,
+                    f"{item.asset.asset_id}_thumbnail.jpg",
+                )
+            downloaded, downloaded_cover = await self._download_with_cover(item.asset, None)
+            return downloaded, downloaded_cover, None
 
         download_started_at = perf_counter()
         download_outcomes = await asyncio.gather(
             *[download_item(item) for item in extraction.media],
             return_exceptions=True,
         )
-        downloaded_items: list[tuple[DownloadedAsset, DownloadedAsset | None]] = []
+        downloaded_items: list[
+            tuple[
+                DownloadedAsset,
+                DownloadedAsset | None,
+                tuple[io.BytesIO, str] | None,
+            ]
+        ] = []
         download_failure: BaseException | None = None
         for download_outcome in download_outcomes:
             if isinstance(download_outcome, BaseException):
@@ -600,10 +897,12 @@ class TelegramDeliveryService:
             else:
                 downloaded_items.append(download_outcome)
         if download_failure is not None:
-            for media, thumbnail in downloaded_items:
+            for media, thumbnail, converted_thumbnail in downloaded_items:
                 media.file.close()
                 if thumbnail is not None:
                     thumbnail.file.close()
+                if converted_thumbnail is not None:
+                    converted_thumbnail[0].close()
             log_event(
                 logger,
                 "telegram.album_downloads.failed",
@@ -626,7 +925,7 @@ class TelegramDeliveryService:
             item_count=len(downloaded_items),
             output_bytes=sum(
                 media.size + (thumbnail.size if thumbnail is not None else 0)
-                for media, thumbnail in downloaded_items
+                for media, thumbnail, _converted_thumbnail in downloaded_items
             ),
             elapsed_ms=elapsed_ms(download_started_at),
             success=True,
@@ -642,6 +941,8 @@ class TelegramDeliveryService:
                         downloaded[0],
                         downloaded[1],
                         document=document,
+                        converted_thumbnail=downloaded[2],
+                        thumbnail_prepared=True,
                     )
                     for item, downloaded in zip(
                         extraction.media,
@@ -683,30 +984,6 @@ class TelegramDeliveryService:
                 conversion_count=len(extra_files),
                 elapsed_ms=elapsed_ms(preparation_started_at),
                 success=True,
-            )
-
-            item_fields = set(_ALBUM_CAPTION_FIELDS)
-            if document:
-                item_fields.add("disable_content_type_detection")
-            else:
-                item_fields |= (
-                    _ALBUM_MEDIA_FIRST_FIELDS | _ALBUM_MEDIA_ITEM_FIELDS | _ALBUM_VIDEO_FIELDS
-                )
-            fields = self._fields(request.telegram, _MEDIA_GROUP_FIELDS | item_fields)
-            first_item_fields = {
-                name: fields.pop(name)
-                for name in _ALBUM_CAPTION_FIELDS | _ALBUM_MEDIA_FIRST_FIELDS
-                if name in fields
-            }
-            all_media_fields = {
-                name: fields.pop(name) for name in _ALBUM_MEDIA_ITEM_FIELDS if name in fields
-            }
-            video_fields = {
-                name: fields.pop(name) for name in _ALBUM_VIDEO_FIELDS if name in fields
-            }
-            disable_content_type_detection = fields.pop(
-                "disable_content_type_detection",
-                True,
             )
 
             calls: list[TelegramCallResponse] = []
@@ -764,7 +1041,7 @@ class TelegramDeliveryService:
                     media_payload.append(media_item)
                 batch_fields["media"] = media_payload
                 batch_started_at = perf_counter()
-                response = await self._client.call("sendMediaGroup", batch_fields, uploads)
+                response = await self._call("sendMediaGroup", batch_fields, uploads)
                 calls.append(response)
                 log_event(
                     logger,
@@ -784,10 +1061,12 @@ class TelegramDeliveryService:
                     break
             return TelegramDeliveryOutcome(calls)
         finally:
-            for media, thumbnail in downloaded_items:
+            for media, thumbnail, converted_thumbnail in downloaded_items:
                 media.file.close()
                 if thumbnail is not None:
                     thumbnail.file.close()
+                if converted_thumbnail is not None:
+                    converted_thumbnail[0].close()
             _close_files(extra_files)
 
     async def _prepare_slideshow_item(
@@ -799,15 +1078,37 @@ class TelegramDeliveryService:
         downloaded.file.seek(0)
         prefix = downloaded.file.read(32)
         downloaded.file.seek(0)
-        if is_native_telegram_photo(prefix) and await self._images.native_photo_is_compliant(
-            downloaded.file,
-            downloaded.size,
-            downloaded.content_type,
-            downloaded.declared_content_type,
-        ):
-            return _PreparedUpload(downloaded.file, filename, downloaded.content_type), None
+        detected = detect_image_format(prefix)
+        if detected in {"jpeg", "png", "webp"}:
+            compliant = is_native_telegram_photo(prefix) and (
+                await self._images.native_photo_is_compliant(
+                    downloaded.file,
+                    downloaded.size,
+                    downloaded.content_type,
+                    downloaded.declared_content_type,
+                )
+            )
+            if compliant:
+                return _PreparedUpload(downloaded.file, filename, downloaded.content_type), None
+            data = await self._images.read_file(downloaded.file)
+            normalized = await self._images.normalize_photo(data, filename)
+            normalized_file = io.BytesIO(normalized.data)
+            return (
+                _PreparedUpload(
+                    normalized_file,
+                    normalized.filename,
+                    normalized.content_type,
+                ),
+                normalized_file,
+            )
+        if detected not in {"heic", "heif", "avif", "tiff", "bmp", "gif"}:
+            raise ImageConversionError(f"Unsupported or corrupt Telegram photo format: {detected}")
         data = await self._images.read_file(downloaded.file)
-        converted = await self._images.convert_photo(data, filename)
+        converted = (
+            await self._images.convert_photo(data, filename)
+            if detected in {"heic", "heif"}
+            else await self._images.normalize_photo(data, filename)
+        )
         converted_file = io.BytesIO(converted.data)
         return (
             _PreparedUpload(converted_file, converted.filename, converted.content_type),
@@ -908,7 +1209,7 @@ class TelegramDeliveryService:
                     single_call_fields = dict(fields)
                     single_call_fields["disable_content_type_detection"] = True
                     single_call_fields["document"] = "attach://media_0"
-                    response = await self._client.call(
+                    response = await self._call(
                         "sendDocument",
                         single_call_fields,
                         [TelegramUpload("media_0", item.file, item.filename, item.content_type)],
@@ -916,7 +1217,7 @@ class TelegramDeliveryService:
                 else:
                     single_call_fields = dict(fields)
                     single_call_fields["photo"] = "attach://media_0"
-                    response = await self._client.call(
+                    response = await self._call(
                         "sendPhoto",
                         single_call_fields,
                         [TelegramUpload("media_0", item.file, item.filename, item.content_type)],
@@ -945,7 +1246,7 @@ class TelegramDeliveryService:
                     )
                 batch_fields["media"] = media
                 batch_started_at = perf_counter()
-                response = await self._client.call("sendMediaGroup", batch_fields, uploads)
+                response = await self._call("sendMediaGroup", batch_fields, uploads)
                 calls.append(response)
                 log_event(
                     logger,

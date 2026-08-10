@@ -96,6 +96,10 @@ class TikTokAdapter:
             ),
             headers={"User-Agent": TIKTOK_USER_AGENT},
         )
+        # Short-link resolution used to create and tear down a client (and its
+        # proxy/TLS connection) for every request. Keep one pool per configured
+        # proxy instead; AsyncClient is designed to be shared by concurrent tasks.
+        self._proxy_http: dict[str, httpx.AsyncClient] = {}
         self.cookies_path: str | None = None
         if settings.ytdlp_cookies:
             path = Path(settings.ytdlp_cookies).expanduser().resolve()
@@ -125,13 +129,20 @@ class TikTokAdapter:
             choice = proxy_session.get()
             try:
                 if choice.url:
-                    async with httpx.AsyncClient(
-                        proxy=choice.url,
-                        follow_redirects=False,
-                        timeout=httpx.Timeout(15, connect=5, read=10),
-                        headers={"User-Agent": TIKTOK_USER_AGENT},
-                    ) as client:
-                        resolved = await self._follow_tiktok_redirects(client, url)
+                    client = self._proxy_http.get(choice.url)
+                    if client is None:
+                        client = httpx.AsyncClient(
+                            proxy=choice.url,
+                            follow_redirects=False,
+                            timeout=httpx.Timeout(15, connect=5, read=10),
+                            limits=httpx.Limits(
+                                max_connections=self.settings.http_max_connections,
+                                max_keepalive_connections=self.settings.http_max_connections,
+                            ),
+                            headers={"User-Agent": TIKTOK_USER_AGENT},
+                        )
+                        self._proxy_http[choice.url] = client
+                    resolved = await self._follow_tiktok_redirects(client, url)
                 else:
                     resolved = await self._follow_tiktok_redirects(self._http, url)
                 log_event(
@@ -171,18 +182,20 @@ class TikTokAdapter:
         current = url
         for _ in range(6):
             validate_tiktok_url(current)
-            response = await client.get(current, follow_redirects=False)
-            if response.is_redirect:
-                location = response.headers.get("location")
-                if not location:
-                    raise InvalidLinkError("TikTok redirect did not include a destination")
-                destination = urljoin(current, location)
-                validate_tiktok_url(destination)
-                current = destination
-                continue
-            response.raise_for_status()
-            validate_tiktok_url(current)
-            return current
+            # Read response headers only. The final request preserves status and
+            # redirect validation without downloading TikTok's large HTML body.
+            async with client.stream("GET", current, follow_redirects=False) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise InvalidLinkError("TikTok redirect did not include a destination")
+                    destination = str(urljoin(current, location))
+                    validate_tiktok_url(destination)
+                    current = destination
+                    continue
+                response.raise_for_status()
+                validate_tiktok_url(current)
+                return current
         raise InvalidLinkError("TikTok URL redirected too many times")
 
     @staticmethod
@@ -340,5 +353,9 @@ class TikTokAdapter:
             raise ExtractionError("TikTok metadata extraction failed") from last_error
 
     async def close(self) -> None:
-        await self._http.aclose()
+        await asyncio.gather(
+            self._http.aclose(),
+            *(client.aclose() for client in self._proxy_http.values()),
+        )
+        self._proxy_http.clear()
         self._executor.shutdown(wait=False, cancel_futures=True)

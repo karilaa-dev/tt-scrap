@@ -36,8 +36,9 @@ class Settings(BaseSettings):
     download_retry_base_delay: float = Field(default=1.0, ge=0, le=30)
 
     instagram_max_attempts: int = Field(default=3, ge=1, le=10)
-    instagram_request_timeout_seconds: float = Field(default=2.0, gt=0, le=60)
-    instagram_retry_delay_seconds: float = Field(default=0.5, ge=0, le=30)
+    instagram_concurrency: int = Field(default=4, ge=1, le=64)
+    instagram_request_timeout_seconds: float = Field(default=3.0, gt=0, le=60)
+    instagram_retry_delay_seconds: float = Field(default=0.1, ge=0, le=30)
 
     cache_ttl_seconds: int = Field(default=600, ge=30, le=86_400)
     cache_max_entries: int = Field(default=10_000, ge=100, le=1_000_000)
@@ -48,15 +49,17 @@ class Settings(BaseSettings):
     executor_workers: int = Field(default=32, ge=1, le=256)
     http_max_connections: int = Field(default=128, ge=1, le=2048)
     spool_threshold_bytes: int = Field(default=16 * 1024 * 1024, ge=1024)
-    download_chunk_bytes: int = Field(default=64 * 1024, ge=1024)
+    download_chunk_bytes: int = Field(default=256 * 1024, ge=1024)
     max_asset_bytes: int = Field(default=0, ge=0)
     max_video_duration: int = Field(default=0, ge=0)
     upstream_download_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
 
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_api_base_url: str = "https://api.telegram.org"
+    telegram_pipeline_concurrency: int = Field(default=32, ge=1, le=1024)
     telegram_upload_concurrency: int = Field(default=20, ge=1, le=256)
     telegram_upload_timeout_seconds: float = Field(default=600.0, gt=0, le=3_600)
+    telegram_thumbnail_wait_seconds: float = Field(default=1.5, ge=0, le=30)
     image_conversion_workers: int = Field(default=0, ge=0, le=256)
 
     @field_validator("log_level")

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from io import BytesIO
 
 import pytest
@@ -12,11 +14,12 @@ from tt_scrap.media import AssetDownloader
 from tt_scrap.media.downloader import (
     DownloadedAsset,
     _close_curl_response,
+    _RetryableDownload,
     detect_content_type,
     filename_for_type,
 )
 from tt_scrap.models import AssetFetchContext, AuxiliaryAssetFetchContext
-from tt_scrap.proxy import ProxyManager
+from tt_scrap.proxy import ProxyChoice, ProxyManager
 
 
 def test_content_type_detection_and_filename() -> None:
@@ -49,6 +52,56 @@ async def test_curl_stream_cleanup_aborts_and_awaits_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tiktok_relay_normalizes_curl_response_headers(settings, monkeypatch) -> None:
+    payload = b"\x00\x00\x00\x18ftypisomstreamed-video"
+
+    class QuitSignal:
+        def set(self) -> None:
+            return None
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.status_code = 200
+            self.headers = {
+                "Content-Type": "video/mp4",
+                "Content-Length": str(len(payload)),
+            }
+            self.quit_now = QuitSignal()
+
+        async def aiter_content(self, chunk_size: int):
+            assert chunk_size == settings.download_chunk_bytes
+            yield payload
+
+        async def aclose(self) -> None:
+            return None
+
+    class FakeSession:
+        async def get(self, *args, **kwargs):
+            assert kwargs["stream"] is True
+            return FakeResponse()
+
+    downloader = AssetDownloader(settings, ProxyManager())
+    monkeypatch.setattr(downloader, "_curl_session", lambda proxy: FakeSession())
+    try:
+        async with downloader.stream(
+            AssetFetchContext(
+                platform="tiktok",
+                upstream_url="https://cdn.test/video",
+                filename="video.mp4",
+                kind="video",
+            )
+        ) as streamed:
+            assert streamed is not None
+            received = b"".join([chunk async for chunk in streamed.chunks])
+
+        assert streamed.size == len(payload)
+        assert streamed.content_type == "video/mp4"
+        assert received == payload
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
 @respx.mock
 async def test_instagram_asset_retries_and_verifies(settings) -> None:
     route = respx.get("https://cdn.test/image").mock(
@@ -76,6 +129,265 @@ async def test_instagram_asset_retries_and_verifies(settings) -> None:
         assert result.content_type == "image/png"
         assert result.file.read() == b"\x89PNG\r\n\x1a\nvalid"
         result.file.close()
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_length_delimited_asset_can_be_relayed_without_spooling(settings) -> None:
+    payload = b"\x00\x00\x00\x18ftypisomstreamed-video"
+    route = respx.get("https://cdn.test/video").mock(
+        return_value=Response(
+            200,
+            content=payload,
+            headers={"Content-Type": "video/mp4", "Content-Length": str(len(payload))},
+        )
+    )
+    downloader = AssetDownloader(settings, ProxyManager())
+    try:
+        async with downloader.stream(
+            AssetFetchContext(
+                platform="instagram",
+                upstream_url="https://cdn.test/video",
+                filename="video.mp4",
+                kind="video",
+            )
+        ) as streamed:
+            assert streamed is not None
+            received = b"".join([chunk async for chunk in streamed.chunks])
+
+        assert route.call_count == 1
+        assert streamed.size == len(payload)
+        assert streamed.content_type == "video/mp4"
+        assert received == payload
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_truncated_relay_records_failure_for_verified_fallback(settings) -> None:
+    payload = b"short"
+    respx.get("https://cdn.test/truncated-relay").mock(
+        return_value=Response(
+            200,
+            content=payload,
+            headers={"Content-Type": "video/mp4", "Content-Length": "10"},
+        )
+    )
+    downloader = AssetDownloader(settings, ProxyManager())
+    context = AssetFetchContext(
+        platform="instagram",
+        upstream_url="https://cdn.test/truncated-relay",
+        filename="video.mp4",
+        kind="video",
+    )
+    try:
+        async with downloader.stream(context) as streamed:
+            assert streamed is not None
+            with pytest.raises(_RetryableDownload, match="Truncated asset"):
+                _ = b"".join([chunk async for chunk in streamed.chunks])
+        assert streamed.failure is not None
+        assert not streamed.completed
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_idle_relay_releases_download_limits_for_cover_preparation(settings) -> None:
+    video_payload = b"video-payload"
+    cover_payload = b"\xff\xd8\xffcover"
+    respx.get("https://cdn.test/relay-video").mock(
+        return_value=Response(
+            200,
+            content=video_payload,
+            headers={
+                "Content-Type": "video/mp4",
+                "Content-Length": str(len(video_payload)),
+            },
+        )
+    )
+    respx.get("https://cdn.test/relay-cover").mock(
+        return_value=Response(
+            200,
+            content=cover_payload,
+            headers={
+                "Content-Type": "image/jpeg",
+                "Content-Length": str(len(cover_payload)),
+            },
+        )
+    )
+    settings.download_concurrency = 1
+    settings.slideshow_concurrency = 1
+    downloader = AssetDownloader(settings, ProxyManager())
+    video = AssetFetchContext(
+        platform="instagram",
+        upstream_url="https://cdn.test/relay-video",
+        filename="video.mp4",
+        kind="video",
+        extraction_id="same-extraction",
+    )
+    cover = AssetFetchContext(
+        platform="instagram",
+        upstream_url="https://cdn.test/relay-cover",
+        filename="cover.jpg",
+        kind="cover",
+        extraction_id="same-extraction",
+    )
+    try:
+        async with downloader.stream(video) as streamed:
+            assert streamed is not None
+            downloaded_cover = await asyncio.wait_for(downloader.download(cover), timeout=0.2)
+            downloaded_cover.file.close()
+            received = b"".join([chunk async for chunk in streamed.chunks])
+        assert received == video_payload
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_abandoned_relay_cancels_feeder_and_releases_limits(settings) -> None:
+    payload = b"\x00\x00\x00\x18ftypisom" + (b"x" * 32)
+    respx.get("https://cdn.test/abandoned-relay").mock(
+        return_value=Response(
+            200,
+            content=payload,
+            headers={"Content-Type": "video/mp4", "Content-Length": str(len(payload))},
+        )
+    )
+    followup_payload = b"\xff\xd8\xfffollowup"
+    respx.get("https://cdn.test/followup").mock(
+        return_value=Response(
+            200,
+            content=followup_payload,
+            headers={
+                "Content-Type": "image/jpeg",
+                "Content-Length": str(len(followup_payload)),
+            },
+        )
+    )
+    settings.download_chunk_bytes = 1
+    settings.download_concurrency = 1
+    settings.slideshow_concurrency = 1
+    downloader = AssetDownloader(settings, ProxyManager())
+
+    async def consume_one_chunk() -> None:
+        async with downloader.stream(
+            AssetFetchContext(
+                platform="instagram",
+                upstream_url="https://cdn.test/abandoned-relay",
+                filename="video.mp4",
+                kind="video",
+                extraction_id="same-extraction",
+            )
+        ) as streamed:
+            assert streamed is not None
+            assert await anext(streamed.chunks)
+
+    try:
+        await asyncio.wait_for(consume_one_chunk(), timeout=0.2)
+        followup = await asyncio.wait_for(
+            downloader.download(
+                AssetFetchContext(
+                    platform="instagram",
+                    upstream_url="https://cdn.test/followup",
+                    filename="cover.jpg",
+                    kind="cover",
+                    extraction_id="same-extraction",
+                )
+            ),
+            timeout=0.2,
+        )
+        followup.file.close()
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_download_closes_partial_spool(settings, monkeypatch) -> None:
+    spool = BytesIO()
+    started = asyncio.Event()
+    never_complete = asyncio.Event()
+    downloader = AssetDownloader(settings, ProxyManager())
+
+    async def fake_download_once(*args, **kwargs):
+        started.set()
+        await never_complete.wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(
+        "tt_scrap.media.downloader.tempfile.SpooledTemporaryFile",
+        lambda *args, **kwargs: spool,
+    )
+    monkeypatch.setattr(downloader, "_download_once", fake_download_once)
+    task = asyncio.create_task(
+        downloader._download_single(
+            AssetFetchContext(
+                platform="instagram",
+                upstream_url="https://cdn.test/slow-cover",
+                filename="cover.jpg",
+                kind="cover",
+            ),
+            compute_sha256=False,
+        )
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert spool.closed
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_rolled_spool_writes_do_not_block_the_event_loop(settings) -> None:
+    payload = b"large-enough-to-roll"
+    respx.get("https://cdn.test/large").mock(
+        return_value=Response(
+            200,
+            content=payload,
+            headers={"Content-Type": "video/mp4", "Content-Length": str(len(payload))},
+        )
+    )
+    settings.spool_threshold_bytes = 1
+    downloader = AssetDownloader(settings, ProxyManager())
+    main_thread = threading.get_ident()
+
+    class SlowSpool(BytesIO):
+        write_thread: int | None = None
+
+        def write(self, data: bytes) -> int:
+            self.write_thread = threading.get_ident()
+            time.sleep(0.03)
+            return super().write(data)
+
+    spool = SlowSpool()
+    context = AssetFetchContext(
+        platform="instagram",
+        upstream_url="https://cdn.test/large",
+        filename="large.mp4",
+        kind="video",
+    )
+    download_task = asyncio.create_task(
+        downloader._download_once(
+            context,
+            ProxyChoice(slot=None, url=None),
+            spool,
+            context.upstream_url,
+            compute_sha256=False,
+        )
+    )
+    try:
+        await asyncio.sleep(0.005)
+        assert not download_task.done()
+        await download_task
+        assert spool.write_thread != main_thread
     finally:
         await downloader.close()
 
@@ -181,5 +493,59 @@ async def test_adaptive_video_and_audio_download_concurrently_then_remux(
         assert {call.kind for call in calls} == {"video", "audio"}
         assert result.file.read() == b"muxed"
         result.file.close()
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+async def test_adaptive_tracks_share_the_global_transfer_limit(settings, monkeypatch) -> None:
+    settings.download_concurrency = 2
+    downloader = AssetDownloader(settings, ProxyManager())
+    active = 0
+    peak = 0
+    payload = b"track"
+
+    async def fake_download_once(
+        context,
+        proxy,
+        spool,
+        upstream_url,
+        *,
+        compute_sha256,
+    ):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.02)
+        spool.write(payload)
+        active -= 1
+        content_type = "audio/mp4" if context.kind == "audio" else "video/mp4"
+        return content_type, len(payload), None, len(payload), payload
+
+    async def fake_remux(video, audio, *, compute_sha256=True):
+        return DownloadedAsset(BytesIO(b"muxed"), 5, None, "video/mp4")
+
+    monkeypatch.setattr(downloader, "_download_once", fake_download_once)
+    monkeypatch.setattr(downloader, "_remux_copy", fake_remux)
+    contexts = [
+        AssetFetchContext(
+            platform="tiktok",
+            upstream_url=f"https://cdn.test/video-{index}",
+            filename="video.mp4",
+            kind="video",
+            audio=AuxiliaryAssetFetchContext(
+                upstream_url=f"https://cdn.test/audio-{index}",
+                declared_content_type="audio/mp4",
+            ),
+        )
+        for index in range(2)
+    ]
+    try:
+        results = await asyncio.gather(
+            *(downloader.download(context, compute_sha256=False) for context in contexts)
+        )
+        assert peak == 2
+        for result in results:
+            result.file.close()
     finally:
         await downloader.close()

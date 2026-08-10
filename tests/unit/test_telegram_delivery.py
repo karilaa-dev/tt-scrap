@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+from collections.abc import AsyncIterable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 
 from tt_scrap.cache import CacheStore
-from tt_scrap.media import ConvertedImage, DownloadedAsset
+from tt_scrap.errors import ImageConversionError, NetworkError
+from tt_scrap.media import ConvertedImage, DownloadedAsset, StreamedAsset
 from tt_scrap.models import (
     AssetDescriptor,
     AssetFetchContext,
@@ -32,6 +36,28 @@ class FakeDownloader:
         payload, content_type = self.payloads[context.upstream_url]
         return DownloadedAsset(io.BytesIO(payload), len(payload), None, content_type)
 
+    @asynccontextmanager
+    async def stream(self, context: AssetFetchContext):
+        yield None
+
+
+class StreamingDownloader(FakeDownloader):
+    def __init__(self, payloads: dict[str, tuple[bytes, str]]) -> None:
+        super().__init__(payloads)
+        self.stream_calls: list[str] = []
+
+    @asynccontextmanager
+    async def stream(self, context: AssetFetchContext):
+        self.stream_calls.append(context.upstream_url)
+        payload, content_type = self.payloads[context.upstream_url]
+
+        async def chunks():
+            midpoint = max(1, len(payload) // 2)
+            yield payload[:midpoint]
+            yield payload[midpoint:]
+
+        yield StreamedAsset(chunks(), len(payload), content_type)
+
 
 class FakeImages:
     def __init__(self) -> None:
@@ -48,10 +74,14 @@ class FakeImages:
         self.photo_conversions += 1
         return ConvertedImage(b"\xff\xd8\xffconverted", "converted.jpg", "image/jpeg", 10, 10)
 
+    async def normalize_photo(self, data: bytes, filename: str) -> ConvertedImage:
+        self.photo_conversions += 1
+        return ConvertedImage(b"\xff\xd8\xffnormalized", "normalized.jpg", "image/jpeg", 10, 10)
+
     async def native_photo_is_compliant(
         self, file, size, detected_content_type, declared_content_type
     ) -> bool:
-        return declared_content_type in {None, detected_content_type}
+        return True
 
     async def prepare_thumbnail(self, data: bytes, filename: str) -> ConvertedImage:
         self.thumbnail_conversions += 1
@@ -66,8 +96,13 @@ class FailingImages(FakeImages):
 
     async def convert_photo(self, data: bytes, filename: str) -> ConvertedImage:
         if self.fail_photo:
-            raise ValueError("corrupt image")
+            raise ImageConversionError("corrupt image")
         return await super().convert_photo(data, filename)
+
+    async def normalize_photo(self, data: bytes, filename: str) -> ConvertedImage:
+        if self.fail_photo:
+            raise ImageConversionError("corrupt image")
+        return await super().normalize_photo(data, filename)
 
     async def prepare_thumbnail(self, data: bytes, filename: str) -> ConvertedImage:
         if self.fail_thumbnail:
@@ -85,8 +120,11 @@ class FakeTelegramClient:
     async def call(self, method, fields, uploads) -> TelegramCallResponse:
         uploaded: dict[str, bytes] = {}
         for upload in uploads:
-            upload.file.seek(0)
-            uploaded[upload.field_name] = upload.file.read()
+            if isinstance(upload.file, AsyncIterable):
+                uploaded[upload.field_name] = b"".join([chunk async for chunk in upload.file])
+            else:
+                upload.file.seek(0)
+                uploaded[upload.field_name] = upload.file.read()
         copied_fields = json.loads(json.dumps(fields))
         self.calls.append((method, copied_fields, uploaded))
         status = (
@@ -204,6 +242,302 @@ async def test_video_upload_infers_metadata_and_attaches_thumbnail(settings) -> 
 
 
 @pytest.mark.asyncio
+async def test_video_relays_upstream_bytes_into_telegram_upload(settings) -> None:
+    cache = CacheStore(600, 100)
+    video = await descriptor(cache, "video", "video")
+    cover = await descriptor(cache, "cover", "cover")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/video/123",
+        resolved_url="https://www.tiktok.com/@a/video/123",
+        content_type="video",
+        media=[video],
+        cover=cover,
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+    downloader = StreamingDownloader(
+        {"video": (b"streamed-video", "video/mp4"), "cover": (b"cover", "image/jpeg")}
+    )
+    client = FakeTelegramClient()
+
+    await service(settings, cache, extraction, downloader, client).deliver(request())
+
+    assert downloader.stream_calls == ["video"]
+    assert downloader.calls == ["cover"]
+    assert client.calls[0][2]["video_file"] == b"streamed-video"
+
+
+@pytest.mark.asyncio
+async def test_relay_prepares_cover_before_consuming_video_stream(settings) -> None:
+    cache = CacheStore(600, 100)
+    video = await descriptor(cache, "video", "video")
+    cover = await descriptor(cache, "cover", "cover")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/video/123",
+        resolved_url="https://www.tiktok.com/@a/video/123",
+        content_type="video",
+        media=[video],
+        cover=cover,
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+
+    class OrderedDownloader(StreamingDownloader):
+        cover_ready = False
+        stream_opened = False
+
+        async def download(self, context, *, compute_sha256=True):
+            assert self.stream_opened
+            result = await super().download(context, compute_sha256=compute_sha256)
+            if context.upstream_url == "cover":
+                self.cover_ready = True
+            return result
+
+        @asynccontextmanager
+        async def stream(self, context):
+            self.stream_opened = True
+
+            async def chunks():
+                assert self.cover_ready
+                yield b"streamed-video"
+
+            yield StreamedAsset(chunks(), len(b"streamed-video"), "video/mp4")
+
+    downloader = OrderedDownloader(
+        {"video": (b"streamed-video", "video/mp4"), "cover": (b"cover", "image/jpeg")}
+    )
+    client = FakeTelegramClient()
+
+    await service(settings, cache, extraction, downloader, client).deliver(request())
+
+    assert "thumbnail_file" in client.calls[0][2]
+
+
+@pytest.mark.asyncio
+async def test_interrupted_relay_retries_with_verified_download(settings) -> None:
+    cache = CacheStore(600, 100)
+    video = await descriptor(cache, "video", "video")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/video/123",
+        resolved_url="https://www.tiktok.com/@a/video/123",
+        content_type="video",
+        media=[video],
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+
+    class InterruptedRelayDownloader(FakeDownloader):
+        @asynccontextmanager
+        async def stream(self, context):
+            streamed: StreamedAsset
+
+            async def chunks():
+                yield b"partial-"
+                failure = NetworkError("upstream interrupted")
+                streamed.failure = failure
+                raise failure
+
+            streamed = StreamedAsset(chunks(), 14, "video/mp4")
+            yield streamed
+
+    downloader = InterruptedRelayDownloader({"video": (b"verified-video", "video/mp4")})
+    client = FakeTelegramClient()
+
+    await service(settings, cache, extraction, downloader, client).deliver(request())
+
+    assert downloader.calls == ["video"]
+    assert client.calls[0][2]["video_file"] == b"verified-video"
+
+
+@pytest.mark.asyncio
+async def test_video_relay_does_not_wait_for_a_slow_source_cover(settings) -> None:
+    cache = CacheStore(600, 100)
+    video = await descriptor(cache, "video", "video")
+    cover = await descriptor(cache, "cover", "cover")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/video/123",
+        resolved_url="https://www.tiktok.com/@a/video/123",
+        content_type="video",
+        media=[video],
+        cover=cover,
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+
+    class SlowCoverDownloader(StreamingDownloader):
+        async def download(self, context, *, compute_sha256=True):
+            if context.upstream_url == "cover":
+                await asyncio.sleep(1)
+            return await super().download(context, compute_sha256=compute_sha256)
+
+    downloader = SlowCoverDownloader(
+        {"video": (b"streamed-video", "video/mp4"), "cover": (b"cover", "image/jpeg")}
+    )
+    client = FakeTelegramClient()
+    settings.telegram_thumbnail_wait_seconds = 0.01
+
+    await asyncio.wait_for(
+        service(settings, cache, extraction, downloader, client).deliver(request()),
+        timeout=0.5,
+    )
+
+    assert client.calls[0][2] == {"video_file": b"streamed-video"}
+    assert "thumbnail" not in client.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_downloads_continue_while_telegram_upload_slot_is_busy(settings) -> None:
+    cache = CacheStore(600, 100)
+    image = await descriptor(cache, "image", "image")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/photo/123",
+        resolved_url="https://www.tiktok.com/@a/photo/123",
+        content_type="slideshow",
+        media=[image],
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+    both_downloaded = asyncio.Event()
+
+    class SignalingDownloader(FakeDownloader):
+        async def download(self, context, *, compute_sha256=True):
+            result = await super().download(context, compute_sha256=compute_sha256)
+            if len(self.calls) == 2:
+                both_downloaded.set()
+            return result
+
+    class GatedTelegramClient(FakeTelegramClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.active = 0
+            self.peak = 0
+
+        async def call(self, method, fields, uploads):
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            self.started.set()
+            await self.release.wait()
+            try:
+                return await super().call(method, fields, uploads)
+            finally:
+                self.active -= 1
+
+    settings.telegram_pipeline_concurrency = 4
+    settings.telegram_upload_concurrency = 1
+    downloader = SignalingDownloader({"image": (b"\xff\xd8\xffimage", "image/jpeg")})
+    client = GatedTelegramClient()
+    delivery = service(settings, cache, extraction, downloader, client)
+    tasks = [asyncio.create_task(delivery.deliver(request())) for _ in range(2)]
+
+    await asyncio.wait_for(client.started.wait(), timeout=1)
+    await asyncio.wait_for(both_downloaded.wait(), timeout=1)
+    client.release.set()
+    await asyncio.gather(*tasks)
+
+    assert client.peak == 1
+    assert downloader.calls == ["image", "image"]
+
+
+@pytest.mark.asyncio
+async def test_relay_setup_does_not_reserve_a_telegram_upload_slot(settings) -> None:
+    cache = CacheStore(600, 100)
+    video = await descriptor(cache, "video", "video")
+    cover = await descriptor(cache, "cover", "cover")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/video/123",
+        resolved_url="https://www.tiktok.com/@a/video/123",
+        content_type="video",
+        media=[video],
+        cover=cover,
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+
+    class SignalingDownloader(StreamingDownloader):
+        def __init__(self, payloads):
+            super().__init__(payloads)
+            self.stream_opened = asyncio.Event()
+            self.cover_ready = asyncio.Event()
+
+        @asynccontextmanager
+        async def stream(self, context):
+            self.stream_opened.set()
+            async with super().stream(context) as streamed:
+                yield streamed
+
+        async def download(self, context, *, compute_sha256=True):
+            result = await super().download(context, compute_sha256=compute_sha256)
+            if context.upstream_url == "cover":
+                self.cover_ready.set()
+            return result
+
+    settings.telegram_upload_concurrency = 1
+    downloader = SignalingDownloader(
+        {"video": (b"streamed-video", "video/mp4"), "cover": (b"cover", "image/jpeg")}
+    )
+    client = FakeTelegramClient()
+    delivery = service(settings, cache, extraction, downloader, client)
+
+    async with delivery._upload_slot():
+        task = asyncio.create_task(delivery.deliver(request()))
+        await asyncio.wait_for(downloader.stream_opened.wait(), timeout=1)
+        await asyncio.wait_for(downloader.cover_ready.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert client.calls == []
+
+    await asyncio.wait_for(task, timeout=1)
+    assert client.calls[0][0] == "sendVideo"
+
+
+@pytest.mark.asyncio
+async def test_telegram_api_calls_respect_upload_concurrency(settings) -> None:
+    cache = CacheStore(600, 100)
+    image = await descriptor(cache, "image", "image")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/photo/123",
+        resolved_url="https://www.tiktok.com/@a/photo/123",
+        content_type="slideshow",
+        media=[image],
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+
+    class SlowTelegramClient(FakeTelegramClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.peak = 0
+
+        async def call(self, method, fields, uploads):
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            await asyncio.sleep(0.02)
+            try:
+                return await super().call(method, fields, uploads)
+            finally:
+                self.active -= 1
+
+    settings.telegram_pipeline_concurrency = 8
+    settings.telegram_upload_concurrency = 2
+    downloader = FakeDownloader({"image": (b"\xff\xd8\xffimage", "image/jpeg")})
+    client = SlowTelegramClient()
+    delivery = service(settings, cache, extraction, downloader, client)
+
+    await asyncio.gather(*(delivery.deliver(request()) for _ in range(8)))
+
+    assert client.peak == 2
+
+
+@pytest.mark.asyncio
 async def test_video_document_mode_skips_cover_and_metadata(settings) -> None:
     cache = CacheStore(600, 100)
     video = await descriptor(cache, "video", "video")
@@ -286,6 +620,127 @@ async def test_single_image_slideshow_attaches_caption_to_photo(settings) -> Non
     assert fields["caption"] == "source"
     assert fields["parse_mode"] == "HTML"
     assert uploads["media_0"] == b"\xff\xd8\xffimage"
+
+
+@pytest.mark.parametrize(
+    ("payload", "content_type"),
+    [
+        (b"\xff\xd8\xfforiginal-jpeg", "image/jpeg"),
+        (b"\x89PNG\r\n\x1a\noriginal-png", "image/png"),
+        (b"RIFFxxxxWEBPoriginal-webp", "image/webp"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_native_slideshow_images_are_uploaded_byte_for_byte(
+    settings, payload: bytes, content_type: str
+) -> None:
+    cache = CacheStore(600, 100)
+    image = await descriptor(cache, "image-0", "image")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/photo/123",
+        resolved_url="https://www.tiktok.com/@a/photo/123",
+        content_type="slideshow",
+        media=[image],
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+    images = FakeImages()
+    client = FakeTelegramClient()
+
+    await service(
+        settings,
+        cache,
+        extraction,
+        FakeDownloader({"image-0": (payload, content_type)}),
+        client,
+        images,
+    ).deliver(request())
+
+    assert client.calls[0][2]["media_0"] == payload
+    assert images.photo_conversions == 0
+
+
+@pytest.mark.asyncio
+async def test_noncompliant_native_slide_is_normalized_before_upload(settings) -> None:
+    cache = CacheStore(600, 100)
+    image = await descriptor(cache, "image-0", "image")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/photo/123",
+        resolved_url="https://www.tiktok.com/@a/photo/123",
+        content_type="slideshow",
+        media=[image],
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+
+    class NoncompliantImages(FakeImages):
+        async def native_photo_is_compliant(
+            self, file, size, detected_content_type, declared_content_type
+        ) -> bool:
+            return False
+
+    images = NoncompliantImages()
+    client = FakeTelegramClient()
+    await service(
+        settings,
+        cache,
+        extraction,
+        FakeDownloader({"image-0": (b"\xff\xd8\xffoversized", "image/jpeg")}),
+        client,
+        images,
+    ).deliver(request())
+
+    assert client.calls[0][2]["media_0"] == b"\xff\xd8\xffnormalized"
+    assert images.photo_conversions == 1
+
+
+@pytest.mark.asyncio
+async def test_thumbnail_preparation_overlaps_video_download(settings) -> None:
+    cache = CacheStore(600, 100)
+    video = await descriptor(cache, "video", "video")
+    cover = await descriptor(cache, "cover", "cover")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/video/123",
+        resolved_url="https://www.tiktok.com/@a/video/123",
+        content_type="video",
+        media=[video],
+        cover=cover,
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+    thumbnail_ready = asyncio.Event()
+
+    class GatedDownloader(FakeDownloader):
+        async def download(self, context, *, compute_sha256=True):
+            if context.upstream_url == "video":
+                await asyncio.wait_for(thumbnail_ready.wait(), timeout=1)
+            return await super().download(context, compute_sha256=compute_sha256)
+
+    class SignalingImages(FakeImages):
+        async def prepare_thumbnail(self, data: bytes, filename: str) -> ConvertedImage:
+            result = await super().prepare_thumbnail(data, filename)
+            thumbnail_ready.set()
+            return result
+
+    client = FakeTelegramClient()
+    await asyncio.wait_for(
+        service(
+            settings,
+            cache,
+            extraction,
+            GatedDownloader(
+                {"video": (b"video-data", "video/mp4"), "cover": (b"cover", "image/jpeg")}
+            ),
+            client,
+            SignalingImages(),
+        ).deliver(request()),
+        timeout=1,
+    )
+
+    assert client.calls[0][0] == "sendVideo"
 
 
 @pytest.mark.asyncio
@@ -404,17 +859,19 @@ async def test_corrupt_unsupported_slide_fails_before_first_album(settings) -> N
     )
     client = FakeTelegramClient()
 
-    with pytest.raises(ValueError, match="corrupt image"):
+    images = FailingImages(photo=True)
+    with pytest.raises(ImageConversionError, match="corrupt image"):
         await service(
             settings,
             cache,
             extraction,
             downloader,
             client,
-            FailingImages(photo=True),
+            images,
         ).deliver(request())
 
     assert client.calls == []
+    assert images.photo_conversions == 0
 
 
 @pytest.mark.asyncio

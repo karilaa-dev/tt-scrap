@@ -291,7 +291,7 @@ class TikTokService:
         self.adapter = TikTokAdapter(settings, proxy_manager)
         self.proxy_manager = proxy_manager
         self._key_lock_guard = asyncio.Lock()
-        self._key_locks: dict[str, tuple[asyncio.Lock, int]] = {}
+        self._key_locks: dict[str, tuple[asyncio.Lock, int, int | None]] = {}
 
     def _ensure_key_locks(self) -> None:
         # A few unit tests construct the service without __init__ to inject a
@@ -300,26 +300,44 @@ class TikTokService:
             self._key_lock_guard = asyncio.Lock()
             self._key_locks = {}
 
-    @asynccontextmanager
-    async def _key_lock(self, key: str) -> AsyncIterator[None]:
+    async def _key_fresh_generation(self, key: str) -> int | None:
+        """Return fresh-work state only while a keyed request group is active."""
         self._ensure_key_locks()
         async with self._key_lock_guard:
-            lock, users = self._key_locks.get(key, (asyncio.Lock(), 0))
-            self._key_locks[key] = (lock, users + 1)
+            state = self._key_locks.get(key)
+            return state[2] if state is not None else None
+
+    async def _mark_key_fresh(self, key: str) -> None:
+        """Record that the current lock holder completed real provider work."""
+        async with self._key_lock_guard:
+            lock, users, generation = self._key_locks[key]
+            self._key_locks[key] = (
+                lock,
+                users,
+                0 if generation is None else generation + 1,
+            )
+
+    @asynccontextmanager
+    async def _key_lock(self, key: str) -> AsyncIterator[bool]:
+        self._ensure_key_locks()
+        async with self._key_lock_guard:
+            lock, users, fresh_generation = self._key_locks.get(key, (asyncio.Lock(), 0, None))
+            joined = users > 0
+            self._key_locks[key] = (lock, users + 1, fresh_generation)
         acquired = False
         try:
             await lock.acquire()
             acquired = True
-            yield
+            yield joined
         finally:
             if acquired:
                 lock.release()
             async with self._key_lock_guard:
-                current, users = self._key_locks[key]
+                current, users, fresh_generation = self._key_locks[key]
                 if users == 1:
                     del self._key_locks[key]
                 else:
-                    self._key_locks[key] = (current, users - 1)
+                    self._key_locks[key] = (current, users - 1, fresh_generation)
 
     def _expires_at(self) -> datetime:
         return datetime.now(UTC) + timedelta(seconds=self.settings.cache_ttl_seconds)
@@ -382,14 +400,20 @@ class TikTokService:
         source_url = source_url.strip()
         validate_tiktok_url(source_url)
         cache_key = self.cache.metadata_key("tiktok-resolution", source_url)
+        baseline_generation = await self._key_fresh_generation(cache_key) if refresh else None
         if not refresh:
             cached = await self.cache.get_model(cache_key, TikTokResolutionResponse)
             if cached:
                 self._log_resolution(cached, started_at, cache_hit=True, cache_scope="url")
                 return cached
 
-        async with self._key_lock(cache_key):
-            if not refresh:
+        async with self._key_lock(cache_key) as joined:
+            refreshed_by_joined_request = (
+                joined
+                and refresh
+                and await self._key_fresh_generation(cache_key) != baseline_generation
+            )
+            if not refresh or refreshed_by_joined_request:
                 cached = await self.cache.get_model(cache_key, TikTokResolutionResponse)
                 if cached:
                     self._log_resolution(
@@ -412,6 +436,7 @@ class TikTokService:
                 response,
                 ttl_seconds=self.settings.tiktok_info_cache_ttl_seconds,
             )
+            await self._mark_key_fresh(cache_key)
             self._log_resolution(response, started_at, cache_hit=False)
             return response
 
@@ -462,14 +487,22 @@ class TikTokService:
         source_url = source_url.strip()
         validate_tiktok_url(source_url)
         url_cache_key = self.cache.metadata_key("tiktok-url", source_url)
+        baseline_url_generation = (
+            await self._key_fresh_generation(url_cache_key) if refresh else None
+        )
         if not refresh:
             cached = await self.cache.get_model(url_cache_key, TikTokExtractionResponse)
             if cached:
                 self._log_extraction(cached, started_at, cache_hit=True, cache_scope="url")
                 return cached
 
-        async with self._key_lock(url_cache_key):
-            if not refresh:
+        async with self._key_lock(url_cache_key) as joined_url:
+            refreshed_by_joined_url = (
+                joined_url
+                and refresh
+                and await self._key_fresh_generation(url_cache_key) != baseline_url_generation
+            )
+            if not refresh or refreshed_by_joined_url:
                 cached = await self.cache.get_model(url_cache_key, TikTokExtractionResponse)
                 if cached:
                     self._log_extraction(
@@ -484,6 +517,9 @@ class TikTokService:
             resolved_url = resolution.resolved_url
             video_id = resolution.source_id
             video_cache_key = self.cache.metadata_key("tiktok", video_id)
+            baseline_video_generation = (
+                await self._key_fresh_generation(video_cache_key) if refresh else None
+            )
             if not refresh:
                 cached, remaining_ttl = await self.cache.get_model_with_ttl(
                     video_cache_key, TikTokExtractionResponse
@@ -505,8 +541,14 @@ class TikTokService:
                     )
                     return response
 
-            async with self._key_lock(video_cache_key):
-                if not refresh:
+            async with self._key_lock(video_cache_key) as joined_video:
+                refreshed_by_joined_video = (
+                    joined_video
+                    and refresh
+                    and await self._key_fresh_generation(video_cache_key)
+                    != baseline_video_generation
+                )
+                if not refresh or refreshed_by_joined_video:
                     cached, remaining_ttl = await self.cache.get_model_with_ttl(
                         video_cache_key, TikTokExtractionResponse
                     )
@@ -519,6 +561,8 @@ class TikTokService:
                             response,
                             ttl_seconds=remaining_ttl,
                         )
+                        if refreshed_by_joined_video:
+                            await self._mark_key_fresh(url_cache_key)
                         self._log_extraction(
                             response,
                             started_at,
@@ -544,6 +588,8 @@ class TikTokService:
                     response,
                     ttl_seconds=ttl,
                 )
+                await self._mark_key_fresh(video_cache_key)
+                await self._mark_key_fresh(url_cache_key)
                 self._log_extraction(response, started_at, cache_hit=False)
                 return response
 

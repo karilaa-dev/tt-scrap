@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import io
+from concurrent.futures import Future
 
 import pytest
 from PIL import Image, JpegImagePlugin
 from pillow_heif import from_pillow
 
+from tt_scrap.errors import ImageConversionError
 from tt_scrap.media.images import (
     ImagePreparationService,
     detect_image_format,
@@ -54,10 +56,43 @@ def test_image_worker_count_reserves_one_cpu(
 
 
 @pytest.mark.asyncio
-async def test_unsupported_photo_is_converted_to_baseline_jpeg(settings) -> None:
+async def test_warm_starts_only_one_process_pool_worker(settings) -> None:
+    class RecordingExecutor:
+        def __init__(self) -> None:
+            self.submissions = 0
+
+        def submit(self, function, *args, **kwargs):
+            self.submissions += 1
+            future: Future[None] = Future()
+            try:
+                future.set_result(function(*args, **kwargs))
+            except BaseException as exc:
+                future.set_exception(exc)
+            return future
+
+        def shutdown(self, wait=True, *, cancel_futures=False) -> None:
+            return None
+
+    service = ImagePreparationService(settings.model_copy(update={"image_conversion_workers": 8}))
+    service._executor.shutdown(wait=True, cancel_futures=True)
+    executor = RecordingExecutor()
+    service._executor = executor  # type: ignore[assignment]
+    try:
+        await service.warm()
+    finally:
+        await service.close()
+
+    assert executor.submissions == 1
+
+
+@pytest.mark.asyncio
+async def test_heic_photo_is_converted_to_baseline_jpeg(settings) -> None:
+    image = Image.new("RGB", (640, 480), "navy")
+    source = io.BytesIO()
+    from_pillow(image).save(source)
     service = ImagePreparationService(settings.model_copy(update={"image_conversion_workers": 1}))
     try:
-        result = await service.convert_photo(image_bytes("BMP"), "slide.bmp")
+        result = await service.convert_photo(source.getvalue(), "slide.heic")
     finally:
         await service.close()
 
@@ -71,21 +106,21 @@ async def test_unsupported_photo_is_converted_to_baseline_jpeg(settings) -> None
 
 
 @pytest.mark.asyncio
-async def test_heif_and_avif_are_decoded_by_persistent_workers(settings) -> None:
+async def test_only_heic_and_heif_are_accepted_for_photo_conversion(settings) -> None:
     image = Image.new("RGB", (64, 48), "navy")
     heif = io.BytesIO()
     from_pillow(image).save(heif)
-    avif = io.BytesIO()
-    image.save(avif, format="AVIF")
     service = ImagePreparationService(settings.model_copy(update={"image_conversion_workers": 1}))
     try:
         heif_result = await service.convert_photo(heif.getvalue(), "slide.heic")
-        avif_result = await service.convert_photo(avif.getvalue(), "slide.avif")
+        with pytest.raises(ImageConversionError, match="Only HEIC/HEIF"):
+            await service.convert_photo(image_bytes("BMP"), "slide.bmp")
+        with pytest.raises(ImageConversionError, match="Only HEIC/HEIF"):
+            await service.convert_photo(image_bytes("AVIF"), "slide.avif")
     finally:
         await service.close()
 
     assert heif_result.data.startswith(b"\xff\xd8\xff")
-    assert avif_result.data.startswith(b"\xff\xd8\xff")
 
 
 @pytest.mark.asyncio
@@ -118,14 +153,14 @@ async def test_compliant_thumbnail_is_returned_without_reencoding(settings) -> N
 
 
 @pytest.mark.asyncio
-async def test_native_photo_validation_is_header_only_and_checks_mime_and_limits(settings) -> None:
+async def test_native_photo_validation_ignores_declared_mime_but_checks_limits(settings) -> None:
     source = image_bytes("PNG", size=(100, 100))
     service = ImagePreparationService(settings.model_copy(update={"image_conversion_workers": 1}))
     try:
         assert await service.native_photo_is_compliant(
             io.BytesIO(source), len(source), "image/png", "image/png; charset=binary"
         )
-        assert not await service.native_photo_is_compliant(
+        assert await service.native_photo_is_compliant(
             io.BytesIO(source), len(source), "image/png", "image/jpeg"
         )
         panoramic = image_bytes("PNG", size=(2100, 100))
@@ -140,15 +175,66 @@ async def test_native_photo_validation_is_header_only_and_checks_mime_and_limits
 
 
 @pytest.mark.asyncio
-async def test_exif_orientation_is_applied_during_conversion(settings) -> None:
+async def test_noncompliant_native_photo_is_normalized_to_fit_telegram(settings) -> None:
+    panoramic = image_bytes("PNG", size=(2100, 100))
+    service = ImagePreparationService(settings.model_copy(update={"image_conversion_workers": 1}))
+    try:
+        result = await service.normalize_photo(panoramic, "panorama.png")
+    finally:
+        await service.close()
+
+    assert result.filename == "panorama.jpg"
+    assert result.content_type == "image/jpeg"
+    assert max(result.width / result.height, result.height / result.width) <= 20
+    assert len(result.data) < 10_000_000
+
+
+@pytest.mark.asyncio
+async def test_animated_native_photo_is_flattened_during_normalization(settings) -> None:
+    frames = [Image.new("RGB", (80, 40), color) for color in ("navy", "orange")]
+    source = io.BytesIO()
+    frames[0].save(source, format="WEBP", save_all=True, append_images=frames[1:], duration=50)
+    service = ImagePreparationService(settings.model_copy(update={"image_conversion_workers": 1}))
+    try:
+        result = await service.normalize_photo(source.getvalue(), "animated.webp")
+    finally:
+        await service.close()
+
+    with Image.open(io.BytesIO(result.data)) as normalized:
+        assert normalized.format == "JPEG"
+        assert not getattr(normalized, "is_animated", False)
+
+
+@pytest.mark.asyncio
+async def test_other_decodable_photo_formats_are_normalized(settings) -> None:
+    service = ImagePreparationService(settings.model_copy(update={"image_conversion_workers": 1}))
+    try:
+        results = [
+            await service.normalize_photo(image_bytes(format_name), f"slide.{extension}")
+            for format_name, extension in (
+                ("AVIF", "avif"),
+                ("TIFF", "tiff"),
+                ("BMP", "bmp"),
+                ("GIF", "gif"),
+            )
+        ]
+    finally:
+        await service.close()
+
+    assert all(result.data.startswith(b"\xff\xd8\xff") for result in results)
+    assert all(result.content_type == "image/jpeg" for result in results)
+
+
+@pytest.mark.asyncio
+async def test_exif_orientation_is_applied_during_heic_conversion(settings) -> None:
     image = Image.new("RGB", (80, 40), "navy")
     exif = Image.Exif()
     exif[274] = 6
     source = io.BytesIO()
-    image.save(source, format="TIFF", exif=exif)
+    from_pillow(image).save(source, exif=exif.tobytes())
     service = ImagePreparationService(settings.model_copy(update={"image_conversion_workers": 1}))
     try:
-        result = await service.convert_photo(source.getvalue(), "oriented.tiff")
+        result = await service.convert_photo(source.getvalue(), "oriented.heic")
     finally:
         await service.close()
 
@@ -157,10 +243,13 @@ async def test_exif_orientation_is_applied_during_conversion(settings) -> None:
 
 @pytest.mark.asyncio
 async def test_process_conversion_keeps_event_loop_responsive(settings) -> None:
-    source = image_bytes("BMP", size=(1200, 900))
+    image = Image.new("RGB", (1200, 900), "navy")
+    encoded = io.BytesIO()
+    from_pillow(image).save(encoded)
+    source = encoded.getvalue()
     service = ImagePreparationService(settings.model_copy(update={"image_conversion_workers": 1}))
     tasks = [
-        asyncio.create_task(service.convert_photo(source, f"slide-{index}.bmp"))
+        asyncio.create_task(service.convert_photo(source, f"slide-{index}.heic"))
         for index in range(2)
     ]
     heartbeat_ticks = 0

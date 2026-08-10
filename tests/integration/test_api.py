@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -11,6 +12,7 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
+import tt_scrap.app as app_module
 from tt_scrap.app import create_app
 from tt_scrap.media import DownloadedAsset
 from tt_scrap.models import AssetFetchContext, TikTokResolutionResponse
@@ -21,10 +23,18 @@ from tt_scrap.telegram import TelegramCallResponse, TelegramDeliveryOutcome
 class FakeDownloader:
     def __init__(self, payload: bytes) -> None:
         self.payload = payload
+        self.read_limits: list[int] = []
 
     async def download(self, context: AssetFetchContext) -> DownloadedAsset:
+        read_limits = self.read_limits
+
+        class TrackingFile(io.BytesIO):
+            def read(self, size: int = -1) -> bytes:
+                read_limits.append(size)
+                return super().read(size)
+
         return DownloadedAsset(
-            file=io.BytesIO(self.payload),
+            file=TrackingFile(self.payload),
             size=len(self.payload),
             sha256=hashlib.sha256(self.payload).hexdigest(),
             content_type="image/jpeg",
@@ -46,13 +56,36 @@ class FakeTelegramDelivery:
 
 
 @pytest.mark.asyncio
+async def test_lifespan_does_not_wait_for_image_worker_warmup(settings, monkeypatch) -> None:
+    warm_started = asyncio.Event()
+    release_warm = asyncio.Event()
+
+    class SlowWarmImages(app_module.ImagePreparationService):
+        async def warm(self) -> None:
+            warm_started.set()
+            await release_warm.wait()
+
+    monkeypatch.setattr(app_module, "ImagePreparationService", SlowWarmImages)
+    app = create_app(settings)
+
+    async def run_lifespan() -> None:
+        async with app.router.lifespan_context(app):
+            await warm_started.wait()
+            release_warm.set()
+
+    await asyncio.wait_for(run_lifespan(), timeout=0.5)
+
+
+@pytest.mark.asyncio
 async def test_health_auth_validation_and_asset_delivery(settings) -> None:
+    settings.download_chunk_bytes = 4
     app = create_app(settings)
     async with app.router.lifespan_context(app):
         original = app.state.asset_downloader
         await original.close()
         payload = b"\xff\xd8\xfftest-image"
-        app.state.asset_downloader = FakeDownloader(payload)
+        fake_downloader = FakeDownloader(payload)
+        app.state.asset_downloader = fake_downloader
         token = await app.state.cache.store_asset(
             AssetFetchContext(
                 platform="instagram",
@@ -95,6 +128,7 @@ async def test_health_auth_validation_and_asset_delivery(settings) -> None:
         assert asset.headers["content-disposition"].endswith('filename="photo.jpg"')
         assert asset.headers["x-content-sha256"] == hashlib.sha256(payload).hexdigest()
         assert "cdn.test" not in asset.text
+        assert fake_downloader.read_limits and set(fake_downloader.read_limits) == {4}
 
 
 @pytest.mark.asyncio

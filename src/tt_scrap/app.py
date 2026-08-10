@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -102,9 +103,10 @@ because doing so can duplicate Telegram messages.
 
 TikTok slideshows and Instagram carousels are prepared fully before the first
 Telegram call, retain their original order, and are partitioned into valid albums of
-2-10 items. Supported photo formats pass through; unsupported formats are converted
-asynchronously to baseline JPEG. Document mode preserves original image formats.
-Video and audio covers are normalized to Telegram-compatible JPEG thumbnails.
+2-10 items. Static JPEG, PNG, and WebP pass through byte-for-byte. Only HEIC/HEIF
+photos are converted asynchronously to baseline JPEG; other unsupported formats are
+rejected before upload. Document mode preserves original image formats. Video and
+audio covers are normalized to Telegram-compatible JPEG thumbnails when possible.
 """.strip()
 
 _OPENAPI_TAGS = [
@@ -167,10 +169,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.telegram_client,
             instagram=app.state.instagram,
         )
+        image_warm_task = asyncio.create_task(app.state.image_preparation.warm())
         logger.info("tt-scrap started")
         try:
             yield
         finally:
+            if not image_warm_task.done():
+                image_warm_task.cancel()
+            await asyncio.gather(image_warm_task, return_exceptions=True)
             await app.state.telegram_client.close()
             await app.state.image_preparation.close()
             await app.state.instagram.close()

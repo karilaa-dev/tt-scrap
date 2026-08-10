@@ -54,10 +54,14 @@ class FakeImages:
         self.photo_conversions += 1
         return ConvertedImage(b"\xff\xd8\xffconverted", "converted.jpg", "image/jpeg", 10, 10)
 
+    async def normalize_photo(self, data: bytes, filename: str) -> ConvertedImage:
+        self.photo_conversions += 1
+        return ConvertedImage(b"\xff\xd8\xffnormalized", "normalized.jpg", "image/jpeg", 10, 10)
+
     async def native_photo_is_compliant(
         self, file, size, detected_content_type, declared_content_type
     ) -> bool:
-        return declared_content_type in {None, detected_content_type}
+        return True
 
     async def prepare_thumbnail(self, data: bytes, filename: str) -> ConvertedImage:
         self.thumbnail_conversions += 1
@@ -171,7 +175,7 @@ def service(
 
 
 @pytest.mark.asyncio
-async def test_single_instagram_image_is_converted_and_sent_as_photo(settings) -> None:
+async def test_single_instagram_heic_image_is_converted_and_sent_as_photo(settings) -> None:
     cache = CacheStore(600, 100)
     image = await descriptor(cache, "image", "image", 0)
     extraction = InstagramExtractionResponse(
@@ -182,7 +186,7 @@ async def test_single_instagram_image_is_converted_and_sent_as_photo(settings) -
         media=[InstagramMediaItem(position=0, media_type="image", asset=image)],
         expires_at=datetime.now(UTC) + timedelta(minutes=10),
     )
-    downloader = FakeDownloader({"image": (b"BMunsupported", "image/bmp")})
+    downloader = FakeDownloader({"image": (b"\x00\x00\x00\x18ftypheicunsupported", "image/heic")})
     images = FakeImages()
     client = FakeTelegramClient()
     delivery, instagram = service(settings, cache, extraction, downloader, client, images)
@@ -271,7 +275,7 @@ async def test_mixed_instagram_carousel_preserves_order_caption_and_thumbnail(se
             "first": (b"\xff\xd8\xfffirst", "image/jpeg"),
             "video": (b"video-data", "video/mp4"),
             "thumbnail": (b"thumbnail-data", "image/webp"),
-            "last": (b"BMlast", "image/bmp"),
+            "last": (b"\x00\x00\x00\x18ftypheiclast", "image/heic"),
         }
     )
     client = FakeTelegramClient()

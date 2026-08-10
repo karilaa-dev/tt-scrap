@@ -8,9 +8,10 @@ import logging
 import random
 import tempfile
 import threading
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
+from functools import partial
 from time import perf_counter
 from typing import BinaryIO, cast
 
@@ -53,6 +54,24 @@ class DownloadedAsset:
     sha256: str | None
     content_type: str
     declared_content_type: str | None = None
+
+
+@dataclass(slots=True)
+class StreamedAsset:
+    chunks: AsyncIterator[bytes]
+    size: int
+    content_type: str
+    declared_content_type: str | None = None
+    completed: bool = False
+    failure: BaseException | None = None
+
+
+@dataclass(slots=True)
+class _OpenStream:
+    chunks: AsyncIterator[bytes]
+    status_code: int
+    headers: Mapping[str, str]
+    close: Callable[[], Awaitable[None]]
 
 
 def detect_content_type(prefix: bytes, declared: str | None) -> str:
@@ -112,6 +131,7 @@ class AssetDownloader:
         self.settings = settings
         self.proxy_manager = proxy_manager
         self._semaphore = asyncio.Semaphore(settings.download_concurrency)
+        self._transfer_semaphore = asyncio.Semaphore(settings.download_concurrency)
         self._http = httpx.AsyncClient(
             follow_redirects=True,
             timeout=httpx.Timeout(settings.upstream_download_timeout_seconds),
@@ -164,6 +184,269 @@ class AssetDownloader:
         if context.platform != "tiktok" or self.settings.proxy_data_only:
             return ProxyChoice(slot=None, url=None)
         return self.proxy_manager.from_slot(context.proxy_slot)
+
+    @staticmethod
+    def _request_headers(context: AssetFetchContext) -> dict[str, str]:
+        headers = {"Accept": "*/*"}
+        if context.referer:
+            headers.update(
+                {
+                    "Referer": context.referer,
+                    "Origin": "https://www.tiktok.com",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                }
+            )
+        return headers
+
+    async def _open_stream(
+        self,
+        context: AssetFetchContext,
+        proxy: ProxyChoice,
+        upstream_url: str,
+    ) -> _OpenStream:
+        headers = self._request_headers(context)
+        if context.platform == "tiktok":
+            curl_response = await self._curl_session(proxy.url).get(
+                upstream_url,
+                headers=headers,
+                cookies=context.cookies,
+                timeout=self.settings.upstream_download_timeout_seconds,
+                allow_redirects=True,
+                stream=True,
+            )
+            return _OpenStream(
+                chunks=curl_response.aiter_content(self.settings.download_chunk_bytes),
+                status_code=curl_response.status_code,
+                headers={
+                    key.lower(): value
+                    for key, value in curl_response.headers.items()
+                    if value is not None
+                },
+                close=partial(_close_curl_response, curl_response),
+            )
+
+        request = self._http.build_request("GET", upstream_url, headers=headers)
+        http_response = await self._http.send(request, stream=True, follow_redirects=True)
+        return _OpenStream(
+            chunks=http_response.aiter_bytes(self.settings.download_chunk_bytes),
+            status_code=http_response.status_code,
+            headers=dict(http_response.headers),
+            close=http_response.aclose,
+        )
+
+    @asynccontextmanager
+    async def stream(self, context: AssetFetchContext) -> AsyncIterator[StreamedAsset | None]:
+        """Relay an unmodified, length-delimited asset without first spooling it.
+
+        Separate audio/video tracks still require a complete download and remux. Assets
+        without a reliable Content-Length use the verified spool path as well.
+        """
+        if context.audio is not None:
+            yield None
+            return
+
+        started_at = perf_counter()
+        async with AsyncExitStack() as opening_limits:
+            await opening_limits.enter_async_context(self._semaphore)
+            await opening_limits.enter_async_context(self._group_limit(context.extraction_id))
+            await opening_limits.enter_async_context(self._transfer_semaphore)
+            queue_wait = elapsed_ms(started_at)
+            proxy = self._initial_proxy(context)
+            upstream_urls = [context.upstream_url, *context.alternate_upstream_urls]
+            opened: _OpenStream | None = None
+            first_chunk: bytes | None = None
+            expected_length: int | None = None
+            declared: str | None = None
+            last_error: Exception | None = None
+            attempt_started_at = started_at
+
+            for attempt in range(1, self.settings.download_max_retries + 1):
+                attempt_started_at = perf_counter()
+                try:
+                    opened = await self._open_stream(
+                        context,
+                        proxy,
+                        upstream_urls[(attempt - 1) % len(upstream_urls)],
+                    )
+                    if opened.status_code not in {200, 206}:
+                        if opened.status_code in _RETRYABLE_STATUSES:
+                            raise _RetryableDownload(f"Retryable HTTP {opened.status_code}")
+                        raise NetworkError(f"Upstream asset returned HTTP {opened.status_code}")
+                    length = opened.headers.get("content-length")
+                    encoding = opened.headers.get("content-encoding", "identity").lower()
+                    if not length or not length.isdigit() or encoding not in {"", "identity"}:
+                        await opened.close()
+                        opened = None
+                        yield None
+                        return
+                    expected_length = int(length)
+                    if expected_length <= 0:
+                        raise _RetryableDownload("Upstream returned an empty asset")
+                    if (
+                        self.settings.max_asset_bytes
+                        and expected_length > self.settings.max_asset_bytes
+                    ):
+                        raise AssetTooLargeError("Asset exceeds MAX_ASSET_BYTES")
+                    async for candidate in opened.chunks:
+                        if candidate:
+                            first_chunk = candidate
+                            break
+                    if first_chunk is None:
+                        raise _RetryableDownload("Upstream returned an empty asset")
+                    declared = opened.headers.get("content-type") or context.declared_content_type
+                    break
+                except AssetTooLargeError:
+                    if opened is not None:
+                        await opened.close()
+                    raise
+                except NetworkError as exc:
+                    if opened is not None:
+                        await opened.close()
+                        opened = None
+                    if len(upstream_urls) > 1 and attempt < self.settings.download_max_retries:
+                        last_error = exc
+                    else:
+                        raise
+                except (TimeoutError, httpx.TimeoutException) as exc:
+                    if opened is not None:
+                        await opened.close()
+                        opened = None
+                    last_error = exc
+                except (CurlError, httpx.HTTPError, _RetryableDownload) as exc:
+                    if opened is not None:
+                        await opened.close()
+                        opened = None
+                    last_error = exc
+
+                if attempt < self.settings.download_max_retries:
+                    if context.platform == "tiktok" and not self.settings.proxy_data_only:
+                        proxy = self.proxy_manager.rotate(proxy)
+                    delay = self.settings.download_retry_base_delay * (2 ** (attempt - 1))
+                    delay += random.random() * delay * 0.1
+                    await asyncio.sleep(delay)
+
+            if opened is None or first_chunk is None or expected_length is None:
+                if isinstance(last_error, (TimeoutError, httpx.TimeoutException)):
+                    raise UpstreamTimeoutError("Asset stream timed out") from last_error
+                raise NetworkError(
+                    f"Asset stream failed after {self.settings.download_max_retries} attempts"
+                ) from last_error
+
+            # The caller may prepare a cover before it starts consuming the relay.
+            # Release download limits while the upstream connection is idle, then
+            # reacquire them when multipart consumption actually begins.
+            await opening_limits.aclose()
+            queue: asyncio.Queue[bytes | BaseException | None] = asyncio.Queue(maxsize=4)
+            producer: asyncio.Task[None] | None = None
+            consumer_completed = False
+
+            async def chunks() -> AsyncGenerator[bytes]:
+                nonlocal consumer_completed, producer
+                async with (
+                    self._semaphore,
+                    self._group_limit(context.extraction_id),
+                    self._transfer_semaphore,
+                ):
+                    producer = asyncio.create_task(produce())
+                    while True:
+                        item = await queue.get()
+                        if item is None:
+                            consumer_completed = True
+                            return
+                        if isinstance(item, BaseException):
+                            raise item
+                        yield item
+
+            content_type = detect_content_type(first_chunk[:32], declared)
+            relay_chunks = chunks()
+            streamed = StreamedAsset(
+                chunks=relay_chunks,
+                size=expected_length,
+                content_type=content_type,
+                declared_content_type=declared,
+            )
+
+            async def produce() -> None:
+                size = 0
+                try:
+                    for chunk in (first_chunk,):
+                        size += len(chunk)
+                        if size > expected_length:
+                            raise _RetryableDownload("Upstream returned more bytes than declared")
+                        await queue.put(chunk)
+                    async for chunk in opened.chunks:
+                        if not chunk:
+                            continue
+                        size += len(chunk)
+                        if size > expected_length:
+                            raise _RetryableDownload("Upstream returned more bytes than declared")
+                        await queue.put(chunk)
+                    if size != expected_length:
+                        raise _RetryableDownload(
+                            f"Truncated asset: expected {expected_length} bytes, got {size}"
+                        )
+                    log_event(
+                        logger,
+                        "media.upstream_relay.completed",
+                        message="Upstream media relayed to the delivery client",
+                        platform=context.platform,
+                        media_type=context.kind,
+                        attempt=attempt,
+                        proxy_used=proxy.url is not None,
+                        output_bytes=size,
+                        content_type=detect_content_type(first_chunk[:32], declared),
+                        elapsed_ms=elapsed_ms(attempt_started_at),
+                        success=True,
+                    )
+                    streamed.completed = True
+                    await queue.put(None)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as exc:
+                    streamed.failure = exc
+                    log_event(
+                        logger,
+                        "media.upstream_relay.failed",
+                        level=logging.WARNING,
+                        message="Upstream media relay failed during transfer",
+                        platform=context.platform,
+                        media_type=context.kind,
+                        attempt=attempt,
+                        proxy_used=proxy.url is not None,
+                        elapsed_ms=elapsed_ms(attempt_started_at),
+                        error_type=type(exc).__name__,
+                        success=False,
+                    )
+                    await queue.put(exc)
+
+            try:
+                yield streamed
+                if consumer_completed:
+                    log_event(
+                        logger,
+                        "media.asset.completed",
+                        message="Media asset relayed without intermediate spooling",
+                        platform=context.platform,
+                        media_type=context.kind,
+                        uses_separate_audio=False,
+                        compute_sha256=False,
+                        queue_wait_ms=queue_wait,
+                        output_bytes=expected_length,
+                        content_type=content_type,
+                        elapsed_ms=elapsed_ms(started_at),
+                        success=True,
+                    )
+            finally:
+                if producer is not None:
+                    if not producer.done():
+                        producer.cancel()
+                    await asyncio.gather(producer, return_exceptions=True)
+                await relay_chunks.aclose()
+                await opened.close()
 
     async def download(
         self, context: AssetFetchContext, *, compute_sha256: bool = True
@@ -219,14 +502,16 @@ class AssetDownloader:
                 max_size=self.settings.spool_threshold_bytes, mode="w+b"
             )
             binary_spool = cast(BinaryIO, spool)
+            retain_spool = False
             try:
-                declared, expected_length, digest, size, prefix = await self._download_once(
-                    context,
-                    proxy,
-                    binary_spool,
-                    upstream_urls[(attempt - 1) % len(upstream_urls)],
-                    compute_sha256=compute_sha256,
-                )
+                async with self._transfer_semaphore:
+                    declared, expected_length, digest, size, prefix = await self._download_once(
+                        context,
+                        proxy,
+                        binary_spool,
+                        upstream_urls[(attempt - 1) % len(upstream_urls)],
+                        compute_sha256=compute_sha256,
+                    )
                 if size == 0:
                     raise _RetryableDownload("Upstream returned an empty asset")
                 if expected_length is not None and size != expected_length:
@@ -255,12 +540,11 @@ class AssetDownloader:
                     elapsed_ms=elapsed_ms(attempt_started_at),
                     success=True,
                 )
+                retain_spool = True
                 return result
             except AssetTooLargeError:
-                spool.close()
                 raise
             except NetworkError as exc:
-                spool.close()
                 if len(upstream_urls) > 1 and attempt < self.settings.download_max_retries:
                     last_error = exc
                 else:
@@ -280,11 +564,12 @@ class AssetDownloader:
                     )
                     raise
             except (TimeoutError, httpx.TimeoutException) as exc:
-                spool.close()
                 last_error = exc
             except (CurlError, httpx.HTTPError, _RetryableDownload) as exc:
-                spool.close()
                 last_error = exc
+            finally:
+                if not retain_spool:
+                    spool.close()
             if attempt < self.settings.download_max_retries:
                 if context.platform == "tiktok" and not self.settings.proxy_data_only:
                     proxy = self.proxy_manager.rotate(proxy)
@@ -523,25 +808,14 @@ class AssetDownloader:
         *,
         compute_sha256: bool,
     ) -> tuple[str | None, int | None, str | None, int, bytes]:
-        headers = {"Accept": "*/*"}
-        if context.referer:
-            headers.update(
-                {
-                    "Referer": context.referer,
-                    "Origin": "https://www.tiktok.com",
-                    "User-Agent": (
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    ),
-                }
-            )
+        headers = self._request_headers(context)
         digest = hashlib.sha256() if compute_sha256 else None
         prefix = bytearray()
         size = 0
+        disk_backed = False
 
         async def consume(chunks: object) -> None:
-            nonlocal size
+            nonlocal disk_backed, size
             async for chunk in chunks:  # type: ignore[attr-defined]
                 if not chunk:
                     continue
@@ -552,7 +826,11 @@ class AssetDownloader:
                     prefix.extend(chunk[: 32 - len(prefix)])
                 if digest is not None:
                     digest.update(chunk)
-                spool.write(chunk)
+                if disk_backed or size > self.settings.spool_threshold_bytes:
+                    disk_backed = True
+                    await asyncio.to_thread(spool.write, chunk)
+                else:
+                    spool.write(chunk)
 
         if context.platform == "tiktok":
             curl_response = None
