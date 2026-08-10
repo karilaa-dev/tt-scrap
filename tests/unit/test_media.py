@@ -249,6 +249,103 @@ async def test_idle_relay_releases_download_limits_for_cover_preparation(setting
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_abandoned_relay_cancels_feeder_and_releases_limits(settings) -> None:
+    payload = b"\x00\x00\x00\x18ftypisom" + (b"x" * 32)
+    respx.get("https://cdn.test/abandoned-relay").mock(
+        return_value=Response(
+            200,
+            content=payload,
+            headers={"Content-Type": "video/mp4", "Content-Length": str(len(payload))},
+        )
+    )
+    followup_payload = b"\xff\xd8\xfffollowup"
+    respx.get("https://cdn.test/followup").mock(
+        return_value=Response(
+            200,
+            content=followup_payload,
+            headers={
+                "Content-Type": "image/jpeg",
+                "Content-Length": str(len(followup_payload)),
+            },
+        )
+    )
+    settings.download_chunk_bytes = 1
+    settings.download_concurrency = 1
+    settings.slideshow_concurrency = 1
+    downloader = AssetDownloader(settings, ProxyManager())
+
+    async def consume_one_chunk() -> None:
+        async with downloader.stream(
+            AssetFetchContext(
+                platform="instagram",
+                upstream_url="https://cdn.test/abandoned-relay",
+                filename="video.mp4",
+                kind="video",
+                extraction_id="same-extraction",
+            )
+        ) as streamed:
+            assert streamed is not None
+            assert await anext(streamed.chunks)
+
+    try:
+        await asyncio.wait_for(consume_one_chunk(), timeout=0.2)
+        followup = await asyncio.wait_for(
+            downloader.download(
+                AssetFetchContext(
+                    platform="instagram",
+                    upstream_url="https://cdn.test/followup",
+                    filename="cover.jpg",
+                    kind="cover",
+                    extraction_id="same-extraction",
+                )
+            ),
+            timeout=0.2,
+        )
+        followup.file.close()
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_download_closes_partial_spool(settings, monkeypatch) -> None:
+    spool = BytesIO()
+    started = asyncio.Event()
+    never_complete = asyncio.Event()
+    downloader = AssetDownloader(settings, ProxyManager())
+
+    async def fake_download_once(*args, **kwargs):
+        started.set()
+        await never_complete.wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(
+        "tt_scrap.media.downloader.tempfile.SpooledTemporaryFile",
+        lambda *args, **kwargs: spool,
+    )
+    monkeypatch.setattr(downloader, "_download_once", fake_download_once)
+    task = asyncio.create_task(
+        downloader._download_single(
+            AssetFetchContext(
+                platform="instagram",
+                upstream_url="https://cdn.test/slow-cover",
+                filename="cover.jpg",
+                kind="cover",
+            ),
+            compute_sha256=False,
+        )
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert spool.closed
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_rolled_spool_writes_do_not_block_the_event_loop(settings) -> None:
     payload = b"large-enough-to-roll"
     respx.get("https://cdn.test/large").mock(

@@ -8,7 +8,7 @@ import logging
 import random
 import tempfile
 import threading
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -342,9 +342,10 @@ class AssetDownloader:
             await opening_limits.aclose()
             queue: asyncio.Queue[bytes | BaseException | None] = asyncio.Queue(maxsize=4)
             producer: asyncio.Task[None] | None = None
+            consumer_completed = False
 
-            async def chunks() -> AsyncIterator[bytes]:
-                nonlocal producer
+            async def chunks() -> AsyncGenerator[bytes]:
+                nonlocal consumer_completed, producer
                 async with (
                     self._semaphore,
                     self._group_limit(context.extraction_id),
@@ -354,14 +355,16 @@ class AssetDownloader:
                     while True:
                         item = await queue.get()
                         if item is None:
+                            consumer_completed = True
                             return
                         if isinstance(item, BaseException):
                             raise item
                         yield item
 
             content_type = detect_content_type(first_chunk[:32], declared)
+            relay_chunks = chunks()
             streamed = StreamedAsset(
-                chunks=chunks(),
+                chunks=relay_chunks,
                 size=expected_length,
                 content_type=content_type,
                 declared_content_type=declared,
@@ -422,9 +425,7 @@ class AssetDownloader:
 
             try:
                 yield streamed
-                if producer is not None:
-                    await producer
-                if streamed.completed:
+                if consumer_completed:
                     log_event(
                         logger,
                         "media.asset.completed",
@@ -444,6 +445,7 @@ class AssetDownloader:
                     if not producer.done():
                         producer.cancel()
                     await asyncio.gather(producer, return_exceptions=True)
+                await relay_chunks.aclose()
                 await opened.close()
 
     async def download(
@@ -500,6 +502,7 @@ class AssetDownloader:
                 max_size=self.settings.spool_threshold_bytes, mode="w+b"
             )
             binary_spool = cast(BinaryIO, spool)
+            retain_spool = False
             try:
                 async with self._transfer_semaphore:
                     declared, expected_length, digest, size, prefix = await self._download_once(
@@ -537,12 +540,11 @@ class AssetDownloader:
                     elapsed_ms=elapsed_ms(attempt_started_at),
                     success=True,
                 )
+                retain_spool = True
                 return result
             except AssetTooLargeError:
-                spool.close()
                 raise
             except NetworkError as exc:
-                spool.close()
                 if len(upstream_urls) > 1 and attempt < self.settings.download_max_retries:
                     last_error = exc
                 else:
@@ -562,11 +564,12 @@ class AssetDownloader:
                     )
                     raise
             except (TimeoutError, httpx.TimeoutException) as exc:
-                spool.close()
                 last_error = exc
             except (CurlError, httpx.HTTPError, _RetryableDownload) as exc:
-                spool.close()
                 last_error = exc
+            finally:
+                if not retain_spool:
+                    spool.close()
             if attempt < self.settings.download_max_retries:
                 if context.platform == "tiktok" and not self.settings.proxy_data_only:
                     proxy = self.proxy_manager.rotate(proxy)
