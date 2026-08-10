@@ -1,6 +1,6 @@
 [project]
 name = "tt-scrap"
-version = "1.1.0"
+version = "1.2.0"
 description = "Authenticated TikTok/Instagram extraction and Telegram delivery API"
 readme = "README.md"
 license = { file = "LICENSE.md" }
