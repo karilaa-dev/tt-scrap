@@ -60,7 +60,8 @@ are:
 | `IMAGE_CONVERSION_WORKERS` | Image process cap; default 0 uses available CPU cores minus one |
 | `TELEGRAM_BOT_TOKEN` | Bot credential; an empty value disables direct delivery |
 | `TELEGRAM_API_BASE_URL` | Telegram Bot API base URL, including custom/local servers |
-| `TELEGRAM_UPLOAD_CONCURRENCY` | Maximum concurrent delivery pipelines; default 20 |
+| `TELEGRAM_PIPELINE_CONCURRENCY` | Maximum concurrent extraction/preparation pipelines; default 64 |
+| `TELEGRAM_UPLOAD_CONCURRENCY` | Maximum concurrent Telegram API uploads; default 20 |
 | `TELEGRAM_UPLOAD_TIMEOUT_SECONDS` | Per Telegram upload timeout; default 600 seconds |
 | `TELEGRAM_THUMBNAIL_WAIT_SECONDS` | Soft cover-preparation budget for relayed videos; default 1.5 seconds |
 | `MAX_VIDEO_DURATION` | Maximum duration in seconds; zero disables it |
@@ -181,6 +182,12 @@ Telegram upload and avoids an intermediate spool. Separate audio/video tracks,
 unknown-length assets, and transformed media keep the verified download/remux
 fallback. Relay covers have a short soft deadline; Telegram generates the preview
 when the source cover is slower than that budget.
+
+Preparation pipelines and Telegram API uploads have independent concurrency limits,
+so a slow upload does not stop later requests from extracting and downloading. All
+upstream track transfers share `DOWNLOAD_CONCURRENCY`, including adaptive video and
+audio pairs. Spools that roll to disk are written outside the event loop, and asset
+responses use `DOWNLOAD_CHUNK_BYTES` to reduce per-chunk scheduling overhead.
 
 ### Deliver Instagram media to Telegram
 

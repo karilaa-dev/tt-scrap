@@ -297,6 +297,102 @@ async def test_video_relay_does_not_wait_for_a_slow_source_cover(settings) -> No
 
 
 @pytest.mark.asyncio
+async def test_downloads_continue_while_telegram_upload_slot_is_busy(settings) -> None:
+    cache = CacheStore(600, 100)
+    image = await descriptor(cache, "image", "image")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/photo/123",
+        resolved_url="https://www.tiktok.com/@a/photo/123",
+        content_type="slideshow",
+        media=[image],
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+    both_downloaded = asyncio.Event()
+
+    class SignalingDownloader(FakeDownloader):
+        async def download(self, context, *, compute_sha256=True):
+            result = await super().download(context, compute_sha256=compute_sha256)
+            if len(self.calls) == 2:
+                both_downloaded.set()
+            return result
+
+    class GatedTelegramClient(FakeTelegramClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.active = 0
+            self.peak = 0
+
+        async def call(self, method, fields, uploads):
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            self.started.set()
+            await self.release.wait()
+            try:
+                return await super().call(method, fields, uploads)
+            finally:
+                self.active -= 1
+
+    settings.telegram_pipeline_concurrency = 4
+    settings.telegram_upload_concurrency = 1
+    downloader = SignalingDownloader({"image": (b"\xff\xd8\xffimage", "image/jpeg")})
+    client = GatedTelegramClient()
+    delivery = service(settings, cache, extraction, downloader, client)
+    tasks = [asyncio.create_task(delivery.deliver(request())) for _ in range(2)]
+
+    await asyncio.wait_for(client.started.wait(), timeout=1)
+    await asyncio.wait_for(both_downloaded.wait(), timeout=1)
+    client.release.set()
+    await asyncio.gather(*tasks)
+
+    assert client.peak == 1
+    assert downloader.calls == ["image", "image"]
+
+
+@pytest.mark.asyncio
+async def test_telegram_api_calls_respect_upload_concurrency(settings) -> None:
+    cache = CacheStore(600, 100)
+    image = await descriptor(cache, "image", "image")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/photo/123",
+        resolved_url="https://www.tiktok.com/@a/photo/123",
+        content_type="slideshow",
+        media=[image],
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+
+    class SlowTelegramClient(FakeTelegramClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.peak = 0
+
+        async def call(self, method, fields, uploads):
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            await asyncio.sleep(0.02)
+            try:
+                return await super().call(method, fields, uploads)
+            finally:
+                self.active -= 1
+
+    settings.telegram_pipeline_concurrency = 8
+    settings.telegram_upload_concurrency = 2
+    downloader = FakeDownloader({"image": (b"\xff\xd8\xffimage", "image/jpeg")})
+    client = SlowTelegramClient()
+    delivery = service(settings, cache, extraction, downloader, client)
+
+    await asyncio.gather(*(delivery.deliver(request()) for _ in range(8)))
+
+    assert client.peak == 2
+
+
+@pytest.mark.asyncio
 async def test_video_document_mode_skips_cover_and_metadata(settings) -> None:
     cache = CacheStore(600, 100)
     video = await descriptor(cache, "video", "video")

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from io import BytesIO
 
 import pytest
@@ -16,7 +18,7 @@ from tt_scrap.media.downloader import (
     filename_for_type,
 )
 from tt_scrap.models import AssetFetchContext, AuxiliaryAssetFetchContext
-from tt_scrap.proxy import ProxyManager
+from tt_scrap.proxy import ProxyChoice, ProxyManager
 
 
 def test_content_type_detection_and_filename() -> None:
@@ -108,6 +110,54 @@ async def test_length_delimited_asset_can_be_relayed_without_spooling(settings) 
         assert streamed.size == len(payload)
         assert streamed.content_type == "video/mp4"
         assert received == payload
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_rolled_spool_writes_do_not_block_the_event_loop(settings) -> None:
+    payload = b"large-enough-to-roll"
+    respx.get("https://cdn.test/large").mock(
+        return_value=Response(
+            200,
+            content=payload,
+            headers={"Content-Type": "video/mp4", "Content-Length": str(len(payload))},
+        )
+    )
+    settings.spool_threshold_bytes = 1
+    downloader = AssetDownloader(settings, ProxyManager())
+    main_thread = threading.get_ident()
+
+    class SlowSpool(BytesIO):
+        write_thread: int | None = None
+
+        def write(self, data: bytes) -> int:
+            self.write_thread = threading.get_ident()
+            time.sleep(0.03)
+            return super().write(data)
+
+    spool = SlowSpool()
+    context = AssetFetchContext(
+        platform="instagram",
+        upstream_url="https://cdn.test/large",
+        filename="large.mp4",
+        kind="video",
+    )
+    download_task = asyncio.create_task(
+        downloader._download_once(
+            context,
+            ProxyChoice(slot=None, url=None),
+            spool,
+            context.upstream_url,
+            compute_sha256=False,
+        )
+    )
+    try:
+        await asyncio.sleep(0.005)
+        assert not download_task.done()
+        await download_task
+        assert spool.write_thread != main_thread
     finally:
         await downloader.close()
 
@@ -213,5 +263,59 @@ async def test_adaptive_video_and_audio_download_concurrently_then_remux(
         assert {call.kind for call in calls} == {"video", "audio"}
         assert result.file.read() == b"muxed"
         result.file.close()
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+async def test_adaptive_tracks_share_the_global_transfer_limit(settings, monkeypatch) -> None:
+    settings.download_concurrency = 2
+    downloader = AssetDownloader(settings, ProxyManager())
+    active = 0
+    peak = 0
+    payload = b"track"
+
+    async def fake_download_once(
+        context,
+        proxy,
+        spool,
+        upstream_url,
+        *,
+        compute_sha256,
+    ):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.02)
+        spool.write(payload)
+        active -= 1
+        content_type = "audio/mp4" if context.kind == "audio" else "video/mp4"
+        return content_type, len(payload), None, len(payload), payload
+
+    async def fake_remux(video, audio, *, compute_sha256=True):
+        return DownloadedAsset(BytesIO(b"muxed"), 5, None, "video/mp4")
+
+    monkeypatch.setattr(downloader, "_download_once", fake_download_once)
+    monkeypatch.setattr(downloader, "_remux_copy", fake_remux)
+    contexts = [
+        AssetFetchContext(
+            platform="tiktok",
+            upstream_url=f"https://cdn.test/video-{index}",
+            filename="video.mp4",
+            kind="video",
+            audio=AuxiliaryAssetFetchContext(
+                upstream_url=f"https://cdn.test/audio-{index}",
+                declared_content_type="audio/mp4",
+            ),
+        )
+        for index in range(2)
+    ]
+    try:
+        results = await asyncio.gather(
+            *(downloader.download(context, compute_sha256=False) for context in contexts)
+        )
+        assert peak == 2
+        for result in results:
+            result.file.close()
     finally:
         await downloader.close()

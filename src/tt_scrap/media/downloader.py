@@ -129,6 +129,7 @@ class AssetDownloader:
         self.settings = settings
         self.proxy_manager = proxy_manager
         self._semaphore = asyncio.Semaphore(settings.download_concurrency)
+        self._transfer_semaphore = asyncio.Semaphore(settings.download_concurrency)
         self._http = httpx.AsyncClient(
             follow_redirects=True,
             timeout=httpx.Timeout(settings.upstream_download_timeout_seconds),
@@ -245,7 +246,11 @@ class AssetDownloader:
             return
 
         started_at = perf_counter()
-        async with self._semaphore, self._group_limit(context.extraction_id):
+        async with (
+            self._semaphore,
+            self._group_limit(context.extraction_id),
+            self._transfer_semaphore,
+        ):
             queue_wait = elapsed_ms(started_at)
             proxy = self._initial_proxy(context)
             upstream_urls = [context.upstream_url, *context.alternate_upstream_urls]
@@ -462,13 +467,14 @@ class AssetDownloader:
             )
             binary_spool = cast(BinaryIO, spool)
             try:
-                declared, expected_length, digest, size, prefix = await self._download_once(
-                    context,
-                    proxy,
-                    binary_spool,
-                    upstream_urls[(attempt - 1) % len(upstream_urls)],
-                    compute_sha256=compute_sha256,
-                )
+                async with self._transfer_semaphore:
+                    declared, expected_length, digest, size, prefix = await self._download_once(
+                        context,
+                        proxy,
+                        binary_spool,
+                        upstream_urls[(attempt - 1) % len(upstream_urls)],
+                        compute_sha256=compute_sha256,
+                    )
                 if size == 0:
                     raise _RetryableDownload("Upstream returned an empty asset")
                 if expected_length is not None and size != expected_length:
@@ -769,9 +775,10 @@ class AssetDownloader:
         digest = hashlib.sha256() if compute_sha256 else None
         prefix = bytearray()
         size = 0
+        disk_backed = False
 
         async def consume(chunks: object) -> None:
-            nonlocal size
+            nonlocal disk_backed, size
             async for chunk in chunks:  # type: ignore[attr-defined]
                 if not chunk:
                     continue
@@ -782,7 +789,11 @@ class AssetDownloader:
                     prefix.extend(chunk[: 32 - len(prefix)])
                 if digest is not None:
                     digest.update(chunk)
-                spool.write(chunk)
+                if disk_backed or size > self.settings.spool_threshold_bytes:
+                    disk_backed = True
+                    await asyncio.to_thread(spool.write, chunk)
+                else:
+                    spool.write(chunk)
 
         if context.platform == "tiktok":
             curl_response = None

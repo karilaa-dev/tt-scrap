@@ -146,8 +146,23 @@ class TelegramDeliveryService:
         self._images = images
         self._client = client
         self._instagram = instagram
-        self._pipeline_limit = asyncio.Semaphore(settings.telegram_upload_concurrency)
+        self._pipeline_limit = asyncio.Semaphore(settings.telegram_pipeline_concurrency)
+        self._upload_limit = asyncio.Semaphore(settings.telegram_upload_concurrency)
         self._thumbnail_wait_seconds = settings.telegram_thumbnail_wait_seconds
+
+    @asynccontextmanager
+    async def _upload_slot(self) -> AsyncIterator[None]:
+        async with self._upload_limit:
+            yield
+
+    async def _call(
+        self,
+        method: str,
+        fields: dict[str, Any],
+        uploads: list[TelegramUpload],
+    ) -> TelegramCallResponse:
+        async with self._upload_slot():
+            return await self._client.call(method, fields, uploads)
 
     async def deliver(self, request: TikTokTelegramDeliveryRequest) -> TelegramDeliveryOutcome:
         if not self._client.configured:
@@ -278,6 +293,14 @@ class TelegramDeliveryService:
         context = await self._cache.get_asset(descriptor.asset_id)
         async with self._downloader.stream(context) as streamed:
             yield streamed
+
+    @asynccontextmanager
+    async def _stream_for_upload(
+        self, descriptor: AssetDescriptor
+    ) -> AsyncIterator[StreamedAsset | None]:
+        async with self._upload_slot():
+            async with self._stream(descriptor) as streamed:
+                yield streamed
 
     async def _download_with_cover(
         self, media: AssetDescriptor, cover: AssetDescriptor | None
@@ -427,7 +450,7 @@ class TelegramDeliveryService:
                 "disable_content_type_detection",
                 True,
             )
-            async with self._stream(extraction.media[0]) as streamed:
+            async with self._stream_for_upload(extraction.media[0]) as streamed:
                 if streamed is not None:
                     filename = filename_for_type(
                         extraction.media[0].filename,
@@ -452,7 +475,7 @@ class TelegramDeliveryService:
             try:
                 filename = filename_for_type(extraction.media[0].filename, video.content_type)
                 fields["document"] = "attach://document_file"
-                response = await self._client.call(
+                response = await self._call(
                     "sendDocument",
                     fields,
                     [TelegramUpload("document_file", video.file, filename, video.content_type)],
@@ -466,7 +489,7 @@ class TelegramDeliveryService:
         self._default(fields, request.telegram, "width", extraction.width)
         self._default(fields, request.telegram, "height", extraction.height)
         self._default(fields, request.telegram, "supports_streaming", True)
-        async with self._stream(extraction.media[0]) as streamed:
+        async with self._stream_for_upload(extraction.media[0]) as streamed:
             if streamed is not None:
                 cover: DownloadedAsset | None = None
                 thumbnail: tuple[io.BytesIO, str] | None = None
@@ -552,7 +575,7 @@ class TelegramDeliveryService:
                 uploads.append(
                     TelegramUpload("thumbnail_file", thumbnail_file, thumbnail_name, "image/jpeg")
                 )
-            response = await self._client.call("sendVideo", fields, uploads)
+            response = await self._call("sendVideo", fields, uploads)
             return TelegramDeliveryOutcome([response])
         finally:
             video.file.close()
@@ -609,7 +632,7 @@ class TelegramDeliveryService:
                 uploads.append(
                     TelegramUpload("thumbnail_file", thumbnail_file, thumbnail_name, "image/jpeg")
                 )
-            response = await self._client.call("sendAudio", fields, uploads)
+            response = await self._call("sendAudio", fields, uploads)
             return TelegramDeliveryOutcome([response])
         finally:
             audio.file.close()
@@ -717,7 +740,7 @@ class TelegramDeliveryService:
             extra_files.extend(owned_files)
             if request.delivery == "document":
                 fields["document"] = "attach://document_file"
-                response = await self._client.call(
+                response = await self._call(
                     "sendDocument",
                     fields,
                     [
@@ -733,7 +756,7 @@ class TelegramDeliveryService:
 
             if item.media_type == "image":
                 fields["photo"] = "attach://photo_file"
-                response = await self._client.call(
+                response = await self._call(
                     "sendPhoto",
                     fields,
                     [
@@ -767,7 +790,7 @@ class TelegramDeliveryService:
                         prepared.thumbnail.content_type,
                     )
                 )
-            response = await self._client.call("sendVideo", fields, uploads)
+            response = await self._call("sendVideo", fields, uploads)
             return TelegramDeliveryOutcome([response])
         finally:
             downloaded.file.close()
@@ -986,7 +1009,7 @@ class TelegramDeliveryService:
                     media_payload.append(media_item)
                 batch_fields["media"] = media_payload
                 batch_started_at = perf_counter()
-                response = await self._client.call("sendMediaGroup", batch_fields, uploads)
+                response = await self._call("sendMediaGroup", batch_fields, uploads)
                 calls.append(response)
                 log_event(
                     logger,
@@ -1142,7 +1165,7 @@ class TelegramDeliveryService:
                     single_call_fields = dict(fields)
                     single_call_fields["disable_content_type_detection"] = True
                     single_call_fields["document"] = "attach://media_0"
-                    response = await self._client.call(
+                    response = await self._call(
                         "sendDocument",
                         single_call_fields,
                         [TelegramUpload("media_0", item.file, item.filename, item.content_type)],
@@ -1150,7 +1173,7 @@ class TelegramDeliveryService:
                 else:
                     single_call_fields = dict(fields)
                     single_call_fields["photo"] = "attach://media_0"
-                    response = await self._client.call(
+                    response = await self._call(
                         "sendPhoto",
                         single_call_fields,
                         [TelegramUpload("media_0", item.file, item.filename, item.content_type)],
@@ -1179,7 +1202,7 @@ class TelegramDeliveryService:
                     )
                 batch_fields["media"] = media
                 batch_started_at = perf_counter()
-                response = await self._client.call("sendMediaGroup", batch_fields, uploads)
+                response = await self._call("sendMediaGroup", batch_fields, uploads)
                 calls.append(response)
                 log_event(
                     logger,

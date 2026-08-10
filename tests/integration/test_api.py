@@ -21,10 +21,18 @@ from tt_scrap.telegram import TelegramCallResponse, TelegramDeliveryOutcome
 class FakeDownloader:
     def __init__(self, payload: bytes) -> None:
         self.payload = payload
+        self.read_limits: list[int] = []
 
     async def download(self, context: AssetFetchContext) -> DownloadedAsset:
+        read_limits = self.read_limits
+
+        class TrackingFile(io.BytesIO):
+            def read(self, size: int = -1) -> bytes:
+                read_limits.append(size)
+                return super().read(size)
+
         return DownloadedAsset(
-            file=io.BytesIO(self.payload),
+            file=TrackingFile(self.payload),
             size=len(self.payload),
             sha256=hashlib.sha256(self.payload).hexdigest(),
             content_type="image/jpeg",
@@ -47,12 +55,14 @@ class FakeTelegramDelivery:
 
 @pytest.mark.asyncio
 async def test_health_auth_validation_and_asset_delivery(settings) -> None:
+    settings.download_chunk_bytes = 4
     app = create_app(settings)
     async with app.router.lifespan_context(app):
         original = app.state.asset_downloader
         await original.close()
         payload = b"\xff\xd8\xfftest-image"
-        app.state.asset_downloader = FakeDownloader(payload)
+        fake_downloader = FakeDownloader(payload)
+        app.state.asset_downloader = fake_downloader
         token = await app.state.cache.store_asset(
             AssetFetchContext(
                 platform="instagram",
@@ -95,6 +105,7 @@ async def test_health_auth_validation_and_asset_delivery(settings) -> None:
         assert asset.headers["content-disposition"].endswith('filename="photo.jpg"')
         assert asset.headers["x-content-sha256"] == hashlib.sha256(payload).hexdigest()
         assert "cdn.test" not in asset.text
+        assert fake_downloader.read_limits and set(fake_downloader.read_limits) == {4}
 
 
 @pytest.mark.asyncio
