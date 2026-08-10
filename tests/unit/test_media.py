@@ -52,6 +52,56 @@ async def test_curl_stream_cleanup_aborts_and_awaits_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tiktok_relay_normalizes_curl_response_headers(settings, monkeypatch) -> None:
+    payload = b"\x00\x00\x00\x18ftypisomstreamed-video"
+
+    class QuitSignal:
+        def set(self) -> None:
+            return None
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.status_code = 200
+            self.headers = {
+                "Content-Type": "video/mp4",
+                "Content-Length": str(len(payload)),
+            }
+            self.quit_now = QuitSignal()
+
+        async def aiter_content(self, chunk_size: int):
+            assert chunk_size == settings.download_chunk_bytes
+            yield payload
+
+        async def aclose(self) -> None:
+            return None
+
+    class FakeSession:
+        async def get(self, *args, **kwargs):
+            assert kwargs["stream"] is True
+            return FakeResponse()
+
+    downloader = AssetDownloader(settings, ProxyManager())
+    monkeypatch.setattr(downloader, "_curl_session", lambda proxy: FakeSession())
+    try:
+        async with downloader.stream(
+            AssetFetchContext(
+                platform="tiktok",
+                upstream_url="https://cdn.test/video",
+                filename="video.mp4",
+                kind="video",
+            )
+        ) as streamed:
+            assert streamed is not None
+            received = b"".join([chunk async for chunk in streamed.chunks])
+
+        assert streamed.size == len(payload)
+        assert streamed.content_type == "video/mp4"
+        assert received == payload
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
 @respx.mock
 async def test_instagram_asset_retries_and_verifies(settings) -> None:
     route = respx.get("https://cdn.test/image").mock(

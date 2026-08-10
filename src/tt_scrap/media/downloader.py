@@ -222,7 +222,9 @@ class AssetDownloader:
                 chunks=curl_response.aiter_content(self.settings.download_chunk_bytes),
                 status_code=curl_response.status_code,
                 headers={
-                    key: value for key, value in curl_response.headers.items() if value is not None
+                    key.lower(): value
+                    for key, value in curl_response.headers.items()
+                    if value is not None
                 },
                 close=partial(_close_curl_response, curl_response),
             )

@@ -60,7 +60,7 @@ are:
 | `IMAGE_CONVERSION_WORKERS` | Image process cap; default 0 uses available CPU cores minus one |
 | `TELEGRAM_BOT_TOKEN` | Bot credential; an empty value disables direct delivery |
 | `TELEGRAM_API_BASE_URL` | Telegram Bot API base URL, including custom/local servers |
-| `TELEGRAM_PIPELINE_CONCURRENCY` | Maximum concurrent extraction/preparation pipelines; default 64 |
+| `TELEGRAM_PIPELINE_CONCURRENCY` | Maximum concurrent extraction/preparation pipelines; default 32 |
 | `TELEGRAM_UPLOAD_CONCURRENCY` | Maximum concurrent Telegram API uploads; default 20 |
 | `TELEGRAM_UPLOAD_TIMEOUT_SECONDS` | Per Telegram upload timeout; default 600 seconds |
 | `TELEGRAM_THUMBNAIL_WAIT_SECONDS` | Soft cover-preparation budget for relayed videos; default 1.5 seconds |
