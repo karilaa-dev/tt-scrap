@@ -182,23 +182,20 @@ class TikTokAdapter:
         current = url
         for _ in range(6):
             validate_tiktok_url(current)
-            response = await client.get(current, follow_redirects=False)
-            if response.is_redirect:
-                location = response.headers.get("location")
-                if not location:
-                    raise InvalidLinkError("TikTok redirect did not include a destination")
-                destination = str(urljoin(current, location))
-                validate_tiktok_url(destination)
-                # TikTok share links normally redirect straight to a canonical
-                # post URL. Once the destination contains the numeric post ID,
-                # fetching the large final HTML page adds no validation value.
-                if _ID_RE.search(destination):
-                    return destination
-                current = destination
-                continue
-            response.raise_for_status()
-            validate_tiktok_url(current)
-            return current
+            # Read response headers only. The final request preserves status and
+            # redirect validation without downloading TikTok's large HTML body.
+            async with client.stream("GET", current, follow_redirects=False) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise InvalidLinkError("TikTok redirect did not include a destination")
+                    destination = str(urljoin(current, location))
+                    validate_tiktok_url(destination)
+                    current = destination
+                    continue
+                response.raise_for_status()
+                validate_tiktok_url(current)
+                return current
         raise InvalidLinkError("TikTok URL redirected too many times")
 
     @staticmethod

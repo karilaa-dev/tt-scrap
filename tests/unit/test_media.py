@@ -14,6 +14,7 @@ from tt_scrap.media import AssetDownloader
 from tt_scrap.media.downloader import (
     DownloadedAsset,
     _close_curl_response,
+    _RetryableDownload,
     detect_content_type,
     filename_for_type,
 )
@@ -110,6 +111,88 @@ async def test_length_delimited_asset_can_be_relayed_without_spooling(settings) 
         assert streamed.size == len(payload)
         assert streamed.content_type == "video/mp4"
         assert received == payload
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_truncated_relay_records_failure_for_verified_fallback(settings) -> None:
+    payload = b"short"
+    respx.get("https://cdn.test/truncated-relay").mock(
+        return_value=Response(
+            200,
+            content=payload,
+            headers={"Content-Type": "video/mp4", "Content-Length": "10"},
+        )
+    )
+    downloader = AssetDownloader(settings, ProxyManager())
+    context = AssetFetchContext(
+        platform="instagram",
+        upstream_url="https://cdn.test/truncated-relay",
+        filename="video.mp4",
+        kind="video",
+    )
+    try:
+        async with downloader.stream(context) as streamed:
+            assert streamed is not None
+            with pytest.raises(_RetryableDownload, match="Truncated asset"):
+                _ = b"".join([chunk async for chunk in streamed.chunks])
+        assert streamed.failure is not None
+        assert not streamed.completed
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_idle_relay_releases_download_limits_for_cover_preparation(settings) -> None:
+    video_payload = b"video-payload"
+    cover_payload = b"\xff\xd8\xffcover"
+    respx.get("https://cdn.test/relay-video").mock(
+        return_value=Response(
+            200,
+            content=video_payload,
+            headers={
+                "Content-Type": "video/mp4",
+                "Content-Length": str(len(video_payload)),
+            },
+        )
+    )
+    respx.get("https://cdn.test/relay-cover").mock(
+        return_value=Response(
+            200,
+            content=cover_payload,
+            headers={
+                "Content-Type": "image/jpeg",
+                "Content-Length": str(len(cover_payload)),
+            },
+        )
+    )
+    settings.download_concurrency = 1
+    settings.slideshow_concurrency = 1
+    downloader = AssetDownloader(settings, ProxyManager())
+    video = AssetFetchContext(
+        platform="instagram",
+        upstream_url="https://cdn.test/relay-video",
+        filename="video.mp4",
+        kind="video",
+        extraction_id="same-extraction",
+    )
+    cover = AssetFetchContext(
+        platform="instagram",
+        upstream_url="https://cdn.test/relay-cover",
+        filename="cover.jpg",
+        kind="cover",
+        extraction_id="same-extraction",
+    )
+    try:
+        async with downloader.stream(video) as streamed:
+            assert streamed is not None
+            downloaded_cover = await asyncio.wait_for(downloader.download(cover), timeout=0.2)
+            downloaded_cover.file.close()
+            received = b"".join([chunk async for chunk in streamed.chunks])
+        assert received == video_payload
     finally:
         await downloader.close()
 

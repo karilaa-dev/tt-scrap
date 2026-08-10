@@ -144,6 +144,37 @@ async def test_native_photo_validation_ignores_declared_mime_but_checks_limits(s
 
 
 @pytest.mark.asyncio
+async def test_noncompliant_native_photo_is_normalized_to_fit_telegram(settings) -> None:
+    panoramic = image_bytes("PNG", size=(2100, 100))
+    service = ImagePreparationService(settings.model_copy(update={"image_conversion_workers": 1}))
+    try:
+        result = await service.normalize_photo(panoramic, "panorama.png")
+    finally:
+        await service.close()
+
+    assert result.filename == "panorama.jpg"
+    assert result.content_type == "image/jpeg"
+    assert max(result.width / result.height, result.height / result.width) <= 20
+    assert len(result.data) < 10_000_000
+
+
+@pytest.mark.asyncio
+async def test_animated_native_photo_is_flattened_during_normalization(settings) -> None:
+    frames = [Image.new("RGB", (80, 40), color) for color in ("navy", "orange")]
+    source = io.BytesIO()
+    frames[0].save(source, format="WEBP", save_all=True, append_images=frames[1:], duration=50)
+    service = ImagePreparationService(settings.model_copy(update={"image_conversion_workers": 1}))
+    try:
+        result = await service.normalize_photo(source.getvalue(), "animated.webp")
+    finally:
+        await service.close()
+
+    with Image.open(io.BytesIO(result.data)) as normalized:
+        assert normalized.format == "JPEG"
+        assert not getattr(normalized, "is_animated", False)
+
+
+@pytest.mark.asyncio
 async def test_exif_orientation_is_applied_during_heic_conversion(settings) -> None:
     image = Image.new("RGB", (80, 40), "navy")
     exif = Image.Exif()

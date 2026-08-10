@@ -100,7 +100,22 @@ async def test_short_url_follows_redirect_to_full_tiktok_post(settings) -> None:
         assert resolved == full_url
         assert adapter.extract_id(resolved) == "1234567890123456789"
         assert short_route.call_count == 1
-        assert full_route.call_count == 0
+        assert full_route.call_count == 1
+    finally:
+        await adapter.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_short_url_rejects_removed_canonical_post(settings) -> None:
+    short_url = "https://vt.tiktok.com/REMOVED/"
+    full_url = "https://www.tiktok.com/@creator/video/1234567890123456789"
+    respx.get(short_url).mock(return_value=Response(302, headers={"Location": full_url}))
+    respx.get(full_url).mock(return_value=Response(404))
+    adapter = TikTokAdapter(settings, ProxyManager())
+    try:
+        with pytest.raises(InvalidLinkError):
+            await adapter.resolve_url(short_url, ProxySession(ProxyManager()))
     finally:
         await adapter.close()
 

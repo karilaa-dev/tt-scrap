@@ -209,9 +209,10 @@ bytes. HEIC/HEIF photos and usable video thumbnails use the same asynchronous
 conversion pipeline as TikTok. Carousel captions are placed on the first item of
 the first album batch.
 
-Slideshow photo mode passes static JPEG, PNG, and WebP through byte-for-byte. Only
+Slideshow photo mode passes Telegram-compliant static JPEG, PNG, and WebP through
+byte-for-byte. Oversized, extreme-aspect, or animated native photos are normalized;
 HEIC/HEIF photos are converted concurrently to baseline JPEG in persistent image
-worker processes; other unsupported photo formats fail before the first Telegram
+worker processes. Other unsupported photo formats fail before the first Telegram
 call. A gallery is prepared completely before its first album is sent; albums are
 then sent sequentially in groups of 2–10 while preserving order. Document mode
 preserves original media bytes and skips photo/thumbnail conversion.

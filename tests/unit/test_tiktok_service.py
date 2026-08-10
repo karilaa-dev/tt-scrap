@@ -591,6 +591,41 @@ async def test_concurrent_refreshes_share_one_fresh_extraction(settings) -> None
 
 
 @pytest.mark.asyncio
+async def test_refresh_does_not_reuse_stale_cache_rewritten_by_joined_request(settings) -> None:
+    payload = {
+        "video": {
+            "playAddr": "https://video.cdn.test/media",
+            "width": 720,
+            "height": 1280,
+            "duration": 5,
+        }
+    }
+    service, cache = make_service(settings, payload)
+    first_url = "https://www.tiktok.com/@creator/video/123"
+    joined_url = "https://www.tiktok.com/@other/video/123"
+    stale = await service.extract_url(first_url)
+    joined_key = cache.metadata_key("tiktok-url", joined_url)
+
+    async with service._key_lock(joined_key):
+        refresh_task = asyncio.create_task(service.extract_url(joined_url, refresh=True))
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if service._key_locks[joined_key][1] == 2:
+                break
+        assert service._key_locks[joined_key][1] == 2
+        await cache.set_model(
+            joined_key,
+            stale.model_copy(update={"source_url": joined_url}),
+            ttl_seconds=settings.tiktok_info_cache_ttl_seconds,
+        )
+
+    refreshed = await refresh_task
+
+    assert refreshed.extraction_id != stale.extraction_id
+    assert service.adapter.calls == 2
+
+
+@pytest.mark.asyncio
 async def test_slideshow_preserves_order(settings) -> None:
     payload = {
         "imagePost": {

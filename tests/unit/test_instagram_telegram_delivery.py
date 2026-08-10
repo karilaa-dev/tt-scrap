@@ -54,6 +54,10 @@ class FakeImages:
         self.photo_conversions += 1
         return ConvertedImage(b"\xff\xd8\xffconverted", "converted.jpg", "image/jpeg", 10, 10)
 
+    async def normalize_photo(self, data: bytes, filename: str) -> ConvertedImage:
+        self.photo_conversions += 1
+        return ConvertedImage(b"\xff\xd8\xffnormalized", "normalized.jpg", "image/jpeg", 10, 10)
+
     async def native_photo_is_compliant(
         self, file, size, detected_content_type, declared_content_type
     ) -> bool:

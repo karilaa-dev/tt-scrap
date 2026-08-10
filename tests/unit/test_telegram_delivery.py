@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from tt_scrap.cache import CacheStore
-from tt_scrap.errors import ImageConversionError
+from tt_scrap.errors import ImageConversionError, NetworkError
 from tt_scrap.media import ConvertedImage, DownloadedAsset, StreamedAsset
 from tt_scrap.models import (
     AssetDescriptor,
@@ -73,6 +73,10 @@ class FakeImages:
     async def convert_photo(self, data: bytes, filename: str) -> ConvertedImage:
         self.photo_conversions += 1
         return ConvertedImage(b"\xff\xd8\xffconverted", "converted.jpg", "image/jpeg", 10, 10)
+
+    async def normalize_photo(self, data: bytes, filename: str) -> ConvertedImage:
+        self.photo_conversions += 1
+        return ConvertedImage(b"\xff\xd8\xffnormalized", "normalized.jpg", "image/jpeg", 10, 10)
 
     async def native_photo_is_compliant(
         self, file, size, detected_content_type, declared_content_type
@@ -257,6 +261,90 @@ async def test_video_relays_upstream_bytes_into_telegram_upload(settings) -> Non
     assert downloader.stream_calls == ["video"]
     assert downloader.calls == ["cover"]
     assert client.calls[0][2]["video_file"] == b"streamed-video"
+
+
+@pytest.mark.asyncio
+async def test_relay_prepares_cover_before_consuming_video_stream(settings) -> None:
+    cache = CacheStore(600, 100)
+    video = await descriptor(cache, "video", "video")
+    cover = await descriptor(cache, "cover", "cover")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/video/123",
+        resolved_url="https://www.tiktok.com/@a/video/123",
+        content_type="video",
+        media=[video],
+        cover=cover,
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+
+    class OrderedDownloader(StreamingDownloader):
+        cover_ready = False
+        stream_opened = False
+
+        async def download(self, context, *, compute_sha256=True):
+            assert self.stream_opened
+            result = await super().download(context, compute_sha256=compute_sha256)
+            if context.upstream_url == "cover":
+                self.cover_ready = True
+            return result
+
+        @asynccontextmanager
+        async def stream(self, context):
+            self.stream_opened = True
+
+            async def chunks():
+                assert self.cover_ready
+                yield b"streamed-video"
+
+            yield StreamedAsset(chunks(), len(b"streamed-video"), "video/mp4")
+
+    downloader = OrderedDownloader(
+        {"video": (b"streamed-video", "video/mp4"), "cover": (b"cover", "image/jpeg")}
+    )
+    client = FakeTelegramClient()
+
+    await service(settings, cache, extraction, downloader, client).deliver(request())
+
+    assert "thumbnail_file" in client.calls[0][2]
+
+
+@pytest.mark.asyncio
+async def test_interrupted_relay_retries_with_verified_download(settings) -> None:
+    cache = CacheStore(600, 100)
+    video = await descriptor(cache, "video", "video")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/video/123",
+        resolved_url="https://www.tiktok.com/@a/video/123",
+        content_type="video",
+        media=[video],
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+
+    class InterruptedRelayDownloader(FakeDownloader):
+        @asynccontextmanager
+        async def stream(self, context):
+            streamed: StreamedAsset
+
+            async def chunks():
+                yield b"partial-"
+                failure = NetworkError("upstream interrupted")
+                streamed.failure = failure
+                raise failure
+
+            streamed = StreamedAsset(chunks(), 14, "video/mp4")
+            yield streamed
+
+    downloader = InterruptedRelayDownloader({"video": (b"verified-video", "video/mp4")})
+    client = FakeTelegramClient()
+
+    await service(settings, cache, extraction, downloader, client).deliver(request())
+
+    assert downloader.calls == ["video"]
+    assert client.calls[0][2]["video_file"] == b"verified-video"
 
 
 @pytest.mark.asyncio
@@ -514,6 +602,41 @@ async def test_native_slideshow_images_are_uploaded_byte_for_byte(
 
     assert client.calls[0][2]["media_0"] == payload
     assert images.photo_conversions == 0
+
+
+@pytest.mark.asyncio
+async def test_noncompliant_native_slide_is_normalized_before_upload(settings) -> None:
+    cache = CacheStore(600, 100)
+    image = await descriptor(cache, "image-0", "image")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/photo/123",
+        resolved_url="https://www.tiktok.com/@a/photo/123",
+        content_type="slideshow",
+        media=[image],
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+
+    class NoncompliantImages(FakeImages):
+        async def native_photo_is_compliant(
+            self, file, size, detected_content_type, declared_content_type
+        ) -> bool:
+            return False
+
+    images = NoncompliantImages()
+    client = FakeTelegramClient()
+    await service(
+        settings,
+        cache,
+        extraction,
+        FakeDownloader({"image-0": (b"\xff\xd8\xffoversized", "image/jpeg")}),
+        client,
+        images,
+    ).deliver(request())
+
+    assert client.calls[0][2]["media_0"] == b"\xff\xd8\xffnormalized"
+    assert images.photo_conversions == 1
 
 
 @pytest.mark.asyncio

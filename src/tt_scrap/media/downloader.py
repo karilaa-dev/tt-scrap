@@ -9,7 +9,7 @@ import random
 import tempfile
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
 from time import perf_counter
@@ -62,6 +62,8 @@ class StreamedAsset:
     size: int
     content_type: str
     declared_content_type: str | None = None
+    completed: bool = False
+    failure: BaseException | None = None
 
 
 @dataclass(slots=True)
@@ -246,11 +248,10 @@ class AssetDownloader:
             return
 
         started_at = perf_counter()
-        async with (
-            self._semaphore,
-            self._group_limit(context.extraction_id),
-            self._transfer_semaphore,
-        ):
+        async with AsyncExitStack() as opening_limits:
+            await opening_limits.enter_async_context(self._semaphore)
+            await opening_limits.enter_async_context(self._group_limit(context.extraction_id))
+            await opening_limits.enter_async_context(self._transfer_semaphore)
             queue_wait = elapsed_ms(started_at)
             proxy = self._initial_proxy(context)
             upstream_urls = [context.upstream_url, *context.alternate_upstream_urls]
@@ -333,7 +334,36 @@ class AssetDownloader:
                     f"Asset stream failed after {self.settings.download_max_retries} attempts"
                 ) from last_error
 
+            # The caller may prepare a cover before it starts consuming the relay.
+            # Release download limits while the upstream connection is idle, then
+            # reacquire them when multipart consumption actually begins.
+            await opening_limits.aclose()
             queue: asyncio.Queue[bytes | BaseException | None] = asyncio.Queue(maxsize=4)
+            producer: asyncio.Task[None] | None = None
+
+            async def chunks() -> AsyncIterator[bytes]:
+                nonlocal producer
+                async with (
+                    self._semaphore,
+                    self._group_limit(context.extraction_id),
+                    self._transfer_semaphore,
+                ):
+                    producer = asyncio.create_task(produce())
+                    while True:
+                        item = await queue.get()
+                        if item is None:
+                            return
+                        if isinstance(item, BaseException):
+                            raise item
+                        yield item
+
+            content_type = detect_content_type(first_chunk[:32], declared)
+            streamed = StreamedAsset(
+                chunks=chunks(),
+                size=expected_length,
+                content_type=content_type,
+                declared_content_type=declared,
+            )
 
             async def produce() -> None:
                 size = 0
@@ -367,49 +397,51 @@ class AssetDownloader:
                         elapsed_ms=elapsed_ms(attempt_started_at),
                         success=True,
                     )
+                    streamed.completed = True
                     await queue.put(None)
                 except asyncio.CancelledError:
                     raise
                 except BaseException as exc:
+                    streamed.failure = exc
+                    log_event(
+                        logger,
+                        "media.upstream_relay.failed",
+                        level=logging.WARNING,
+                        message="Upstream media relay failed during transfer",
+                        platform=context.platform,
+                        media_type=context.kind,
+                        attempt=attempt,
+                        proxy_used=proxy.url is not None,
+                        elapsed_ms=elapsed_ms(attempt_started_at),
+                        error_type=type(exc).__name__,
+                        success=False,
+                    )
                     await queue.put(exc)
 
-            async def chunks() -> AsyncIterator[bytes]:
-                while True:
-                    item = await queue.get()
-                    if item is None:
-                        return
-                    if isinstance(item, BaseException):
-                        raise item
-                    yield item
-
-            producer = asyncio.create_task(produce())
-            content_type = detect_content_type(first_chunk[:32], declared)
             try:
-                yield StreamedAsset(
-                    chunks=chunks(),
-                    size=expected_length,
-                    content_type=content_type,
-                    declared_content_type=declared,
-                )
-                await producer
-                log_event(
-                    logger,
-                    "media.asset.completed",
-                    message="Media asset relayed without intermediate spooling",
-                    platform=context.platform,
-                    media_type=context.kind,
-                    uses_separate_audio=False,
-                    compute_sha256=False,
-                    queue_wait_ms=queue_wait,
-                    output_bytes=expected_length,
-                    content_type=content_type,
-                    elapsed_ms=elapsed_ms(started_at),
-                    success=True,
-                )
+                yield streamed
+                if producer is not None:
+                    await producer
+                if streamed.completed:
+                    log_event(
+                        logger,
+                        "media.asset.completed",
+                        message="Media asset relayed without intermediate spooling",
+                        platform=context.platform,
+                        media_type=context.kind,
+                        uses_separate_audio=False,
+                        compute_sha256=False,
+                        queue_wait_ms=queue_wait,
+                        output_bytes=expected_length,
+                        content_type=content_type,
+                        elapsed_ms=elapsed_ms(started_at),
+                        success=True,
+                    )
             finally:
-                if not producer.done():
-                    producer.cancel()
-                await asyncio.gather(producer, return_exceptions=True)
+                if producer is not None:
+                    if not producer.done():
+                        producer.cancel()
+                    await asyncio.gather(producer, return_exceptions=True)
                 await opened.close()
 
     async def download(

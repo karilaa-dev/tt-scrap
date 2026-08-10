@@ -149,9 +149,9 @@ def _encode_jpeg(image: Image.Image, *, quality: int, subsampling: int) -> bytes
     return output.getvalue()
 
 
-def _convert_photo_sync(data: bytes, filename: str) -> ConvertedImage:
-    if detect_image_format(data[:32]) not in _HEIC_PHOTO_FORMATS:
-        raise ValueError("Only HEIC/HEIF photos may be converted")
+def _normalize_photo_sync(data: bytes, filename: str) -> ConvertedImage:
+    if detect_image_format(data[:32]) not in _NATIVE_PHOTO_FORMATS | _HEIC_PHOTO_FORMATS:
+        raise ValueError("Only JPEG/PNG/WebP/HEIC/HEIF photos may be normalized")
     try:
         with Image.open(io.BytesIO(data)) as opened:
             opened.seek(0)
@@ -173,6 +173,12 @@ def _convert_photo_sync(data: bytes, filename: str) -> ConvertedImage:
             return ConvertedImage(encoded, f"{stem}.jpg", "image/jpeg", *image.size)
     except Exception as exc:
         raise ValueError("Unsupported or corrupt image") from exc
+
+
+def _convert_photo_sync(data: bytes, filename: str) -> ConvertedImage:
+    if detect_image_format(data[:32]) not in _HEIC_PHOTO_FORMATS:
+        raise ValueError("Only HEIC/HEIF photos may be converted")
+    return _normalize_photo_sync(data, filename)
 
 
 def _thumbnail_sync(data: bytes, filename: str) -> ConvertedImage:
@@ -364,6 +370,50 @@ class ImagePreparationService:
             logger,
             "image.photo_conversion.completed",
             message="Telegram photo conversion completed",
+            request_bytes=len(data),
+            output_bytes=len(result.data),
+            width=result.width,
+            height=result.height,
+            content_type=result.content_type,
+            fast_path=False,
+            queue_wait_ms=queue_wait,
+            elapsed_ms=elapsed_ms(started_at),
+            success=True,
+        )
+        return result
+
+    async def normalize_photo(self, data: bytes, filename: str) -> ConvertedImage:
+        """Resize or flatten a valid native photo that exceeds Telegram limits."""
+        started_at = perf_counter()
+        detected = detect_image_format(data[:32])
+        if detected not in _NATIVE_PHOTO_FORMATS:
+            raise ImageConversionError(
+                f"Only JPEG/PNG/WebP native photos are normalized; detected {detected}"
+            )
+        async with self._semaphore:
+            queue_wait = elapsed_ms(started_at)
+            loop = asyncio.get_running_loop()
+            try:
+                result = await loop.run_in_executor(
+                    self._executor, partial(_normalize_photo_sync, data, filename)
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                log_event(
+                    logger,
+                    "image.photo_normalization.failed",
+                    level=logging.WARNING,
+                    message="Native Telegram photo normalization failed",
+                    request_bytes=len(data),
+                    queue_wait_ms=queue_wait,
+                    elapsed_ms=elapsed_ms(started_at),
+                    error_type=type(exc).__name__,
+                    success=False,
+                )
+                raise ImageConversionError("Native Telegram photo normalization failed") from exc
+        log_event(
+            logger,
+            "image.photo_normalization.completed",
+            message="Native Telegram photo normalization completed",
             request_bytes=len(data),
             output_bytes=len(result.data),
             width=result.width,
