@@ -129,22 +129,26 @@ class InstagramService:
         key = self.settings.rapidapi_key.get_secret_value()
         if not key:
             raise ExtractionError("RAPIDAPI_KEY is not configured")
-        last_error: Exception | None = None
-        last_status: int | None = None
-        async with self._semaphore:
+
+        async def attempt_loop() -> dict[str, Any]:
+            last_error: Exception | None = None
+            last_status: int | None = None
+            retry_budget = min(5.0, self.settings.instagram_request_timeout_seconds)
+            backoff_spent = 0.0
             for attempt in range(1, self.settings.instagram_max_attempts + 1):
                 attempt_started_at = perf_counter()
                 attempt_status: int | None = None
                 attempt_retry_after: float | None = None
                 try:
-                    response = await self._http.get(
-                        f"https://{_RAPIDAPI_HOST}/convert",
-                        params={"url": source_url},
-                        headers={
-                            "X-Rapidapi-Key": key,
-                            "X-Rapidapi-Host": _RAPIDAPI_HOST,
-                        },
-                    )
+                    async with self._semaphore:
+                        response = await self._http.get(
+                            f"https://{_RAPIDAPI_HOST}/convert",
+                            params={"url": source_url},
+                            headers={
+                                "X-Rapidapi-Key": key,
+                                "X-Rapidapi-Host": _RAPIDAPI_HOST,
+                            },
+                        )
                     last_status = response.status_code
                     attempt_status = response.status_code
                     if response.status_code == 404:
@@ -153,7 +157,7 @@ class InstagramService:
                         try:
                             parsed_retry_after = float(response.headers.get("Retry-After", ""))
                             if parsed_retry_after >= 0:
-                                attempt_retry_after = min(parsed_retry_after, 30.0)
+                                attempt_retry_after = min(parsed_retry_after, retry_budget)
                         except ValueError:
                             pass
                         raise RateLimitError("Instagram API rate limit exceeded")
@@ -224,10 +228,17 @@ class InstagramService:
                         # instead of burning every retry in a few milliseconds.
                         delay = max(delay, attempt_retry_after or 1.0)
                     delay += random.random() * min(delay * 0.25, 0.25)
+                    remaining_backoff = retry_budget - backoff_spent
+                    if remaining_backoff <= 0:
+                        break
+                    delay = min(delay, remaining_backoff)
                     await asyncio.sleep(delay)
-        if last_status == 429:
-            raise RateLimitError("Instagram API rate limit exceeded") from last_error
-        raise NetworkError("Instagram extraction failed after retries") from last_error
+                    backoff_spent += delay
+            if last_status == 429:
+                raise RateLimitError("Instagram API rate limit exceeded") from last_error
+            raise NetworkError("Instagram extraction failed after retries") from last_error
+
+        return await attempt_loop()
 
     async def extract_url(
         self, source_url: str, *, refresh: bool = False

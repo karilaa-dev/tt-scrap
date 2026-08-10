@@ -41,6 +41,8 @@ _NATIVE_PHOTO_FORMATS = {"jpeg", "png", "webp"}
 _PHOTO_MAX_BYTES = 10 * 1024 * 1024
 _THUMBNAIL_MAX_BYTES = 200_000
 _HEIC_PHOTO_FORMATS = {"heic", "heif"}
+_FALLBACK_PHOTO_FORMATS = {"avif", "tiff", "bmp", "gif"}
+_NORMALIZABLE_PHOTO_FORMATS = _NATIVE_PHOTO_FORMATS | _HEIC_PHOTO_FORMATS | _FALLBACK_PHOTO_FORMATS
 _THUMBNAIL_INPUT_FORMATS = _NATIVE_PHOTO_FORMATS | _HEIC_PHOTO_FORMATS
 
 
@@ -150,8 +152,8 @@ def _encode_jpeg(image: Image.Image, *, quality: int, subsampling: int) -> bytes
 
 
 def _normalize_photo_sync(data: bytes, filename: str) -> ConvertedImage:
-    if detect_image_format(data[:32]) not in _NATIVE_PHOTO_FORMATS | _HEIC_PHOTO_FORMATS:
-        raise ValueError("Only JPEG/PNG/WebP/HEIC/HEIF photos may be normalized")
+    if detect_image_format(data[:32]) not in _NORMALIZABLE_PHOTO_FORMATS:
+        raise ValueError("Photo format cannot be normalized")
     try:
         with Image.open(io.BytesIO(data)) as opened:
             opened.seek(0)
@@ -383,13 +385,11 @@ class ImagePreparationService:
         return result
 
     async def normalize_photo(self, data: bytes, filename: str) -> ConvertedImage:
-        """Resize or flatten a valid native photo that exceeds Telegram limits."""
+        """Normalize a decodable source photo into a Telegram-compatible JPEG."""
         started_at = perf_counter()
         detected = detect_image_format(data[:32])
-        if detected not in _NATIVE_PHOTO_FORMATS:
-            raise ImageConversionError(
-                f"Only JPEG/PNG/WebP native photos are normalized; detected {detected}"
-            )
+        if detected not in _NATIVE_PHOTO_FORMATS | _FALLBACK_PHOTO_FORMATS:
+            raise ImageConversionError(f"Photo format cannot be normalized: {detected}")
         async with self._semaphore:
             queue_wait = elapsed_ms(started_at)
             loop = asyncio.get_running_loop()
@@ -402,18 +402,18 @@ class ImagePreparationService:
                     logger,
                     "image.photo_normalization.failed",
                     level=logging.WARNING,
-                    message="Native Telegram photo normalization failed",
+                    message="Telegram photo normalization failed",
                     request_bytes=len(data),
                     queue_wait_ms=queue_wait,
                     elapsed_ms=elapsed_ms(started_at),
                     error_type=type(exc).__name__,
                     success=False,
                 )
-                raise ImageConversionError("Native Telegram photo normalization failed") from exc
+                raise ImageConversionError("Telegram photo normalization failed") from exc
         log_event(
             logger,
             "image.photo_normalization.completed",
-            message="Native Telegram photo normalization completed",
+            message="Telegram photo normalization completed",
             request_bytes=len(data),
             output_bytes=len(result.data),
             width=result.width,

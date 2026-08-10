@@ -211,11 +211,12 @@ the first album batch.
 
 Slideshow photo mode passes Telegram-compliant static JPEG, PNG, and WebP through
 byte-for-byte. Oversized, extreme-aspect, or animated native photos are normalized;
-HEIC/HEIF photos are converted concurrently to baseline JPEG in persistent image
-worker processes. Other unsupported photo formats fail before the first Telegram
-call. A gallery is prepared completely before its first album is sent; albums are
-then sent sequentially in groups of 2–10 while preserving order. Document mode
-preserves original media bytes and skips photo/thumbnail conversion.
+HEIC/HEIF and other decodable source formats such as AVIF, GIF, TIFF, and BMP are
+converted concurrently to baseline JPEG in persistent image worker processes.
+Corrupt or unknown formats fail before the first Telegram call. A gallery is prepared
+completely before its first album is sent; albums are then sent sequentially in groups
+of 2–10 while preserving order. Document mode preserves original media bytes and
+skips photo/thumbnail conversion.
 
 To compare JPEG and PNG conversion cost for a representative HEIC/HEIF input
 without putting benchmarking work in the request path:

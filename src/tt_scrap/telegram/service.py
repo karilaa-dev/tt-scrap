@@ -294,14 +294,6 @@ class TelegramDeliveryService:
         async with self._downloader.stream(context) as streamed:
             yield streamed
 
-    @asynccontextmanager
-    async def _stream_for_upload(
-        self, descriptor: AssetDescriptor
-    ) -> AsyncIterator[StreamedAsset | None]:
-        async with self._upload_slot():
-            async with self._stream(descriptor) as streamed:
-                yield streamed
-
     async def _download_with_cover(
         self, media: AssetDescriptor, cover: AssetDescriptor | None
     ) -> tuple[DownloadedAsset, DownloadedAsset | None]:
@@ -444,7 +436,7 @@ class TelegramDeliveryService:
         extraction: TikTokExtractionResponse,
         fields: dict[str, Any],
     ) -> TelegramDeliveryOutcome | None:
-        async with self._stream_for_upload(extraction.media[0]) as streamed:
+        async with self._stream(extraction.media[0]) as streamed:
             if streamed is None:
                 return None
             cover: DownloadedAsset | None = None
@@ -495,7 +487,7 @@ class TelegramDeliveryService:
                         )
                     )
                 try:
-                    response = await self._client.call("sendVideo", fields, uploads)
+                    response = await self._call("sendVideo", fields, uploads)
                 except Exception:
                     if streamed.failure is None:
                         raise
@@ -527,7 +519,7 @@ class TelegramDeliveryService:
                 "disable_content_type_detection",
                 True,
             )
-            async with self._stream_for_upload(extraction.media[0]) as streamed:
+            async with self._stream(extraction.media[0]) as streamed:
                 if streamed is not None:
                     filename = filename_for_type(
                         extraction.media[0].filename,
@@ -535,7 +527,7 @@ class TelegramDeliveryService:
                     )
                     fields["document"] = "attach://document_file"
                     try:
-                        response = await self._client.call(
+                        response = await self._call(
                             "sendDocument",
                             fields,
                             [
@@ -1109,12 +1101,14 @@ class TelegramDeliveryService:
                 ),
                 normalized_file,
             )
-        if detected not in {"heic", "heif"}:
-            raise ImageConversionError(
-                f"Unsupported Telegram photo format: {detected}; only HEIC/HEIF is converted"
-            )
+        if detected not in {"heic", "heif", "avif", "tiff", "bmp", "gif"}:
+            raise ImageConversionError(f"Unsupported or corrupt Telegram photo format: {detected}")
         data = await self._images.read_file(downloaded.file)
-        converted = await self._images.convert_photo(data, filename)
+        converted = (
+            await self._images.convert_photo(data, filename)
+            if detected in {"heic", "heif"}
+            else await self._images.normalize_photo(data, filename)
+        )
         converted_file = io.BytesIO(converted.data)
         return (
             _PreparedUpload(converted_file, converted.filename, converted.content_type),

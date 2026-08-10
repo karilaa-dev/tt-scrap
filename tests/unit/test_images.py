@@ -175,6 +175,26 @@ async def test_animated_native_photo_is_flattened_during_normalization(settings)
 
 
 @pytest.mark.asyncio
+async def test_other_decodable_photo_formats_are_normalized(settings) -> None:
+    service = ImagePreparationService(settings.model_copy(update={"image_conversion_workers": 1}))
+    try:
+        results = [
+            await service.normalize_photo(image_bytes(format_name), f"slide.{extension}")
+            for format_name, extension in (
+                ("AVIF", "avif"),
+                ("TIFF", "tiff"),
+                ("BMP", "bmp"),
+                ("GIF", "gif"),
+            )
+        ]
+    finally:
+        await service.close()
+
+    assert all(result.data.startswith(b"\xff\xd8\xff") for result in results)
+    assert all(result.content_type == "image/jpeg" for result in results)
+
+
+@pytest.mark.asyncio
 async def test_exif_orientation_is_applied_during_heic_conversion(settings) -> None:
     image = Image.new("RGB", (80, 40), "navy")
     exif = Image.Exif()
