@@ -285,23 +285,34 @@ class ImagePreparationService:
         )
 
     async def warm(self) -> None:
-        """Start HEIC workers before the first request pays their spawn cost."""
+        """Warm one worker without eagerly materializing the full process pool."""
         started_at = perf_counter()
         loop = asyncio.get_running_loop()
-        await asyncio.gather(
-            *(
-                loop.run_in_executor(self._executor, _warm_image_worker)
-                for _ in range(self._workers)
+        try:
+            await loop.run_in_executor(self._executor, _warm_image_worker)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_event(
+                logger,
+                "image.worker_pool.warm_failed",
+                level=logging.WARNING,
+                message="Image conversion worker warm-up failed",
+                pool_capacity=self._workers,
+                elapsed_ms=elapsed_ms(started_at),
+                error_type=type(exc).__name__,
+                success=False,
             )
-        )
-        log_event(
-            logger,
-            "image.worker_pool.warmed",
-            message="Image conversion worker pool warmed",
-            worker_count=self._workers,
-            elapsed_ms=elapsed_ms(started_at),
-            success=True,
-        )
+        else:
+            log_event(
+                logger,
+                "image.worker_pool.warmed",
+                message="Image conversion worker warmed",
+                warmed_workers=1,
+                pool_capacity=self._workers,
+                elapsed_ms=elapsed_ms(started_at),
+                success=True,
+            )
 
     async def read_file(self, file: BinaryIO) -> bytes:
         started_at = perf_counter()

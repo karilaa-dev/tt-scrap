@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -11,6 +12,7 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
+import tt_scrap.app as app_module
 from tt_scrap.app import create_app
 from tt_scrap.media import DownloadedAsset
 from tt_scrap.models import AssetFetchContext, TikTokResolutionResponse
@@ -51,6 +53,27 @@ class FakeTelegramDelivery:
 
     async def deliver_instagram(self, payload) -> TelegramDeliveryOutcome:
         return TelegramDeliveryOutcome(self.calls)
+
+
+@pytest.mark.asyncio
+async def test_lifespan_does_not_wait_for_image_worker_warmup(settings, monkeypatch) -> None:
+    warm_started = asyncio.Event()
+    release_warm = asyncio.Event()
+
+    class SlowWarmImages(app_module.ImagePreparationService):
+        async def warm(self) -> None:
+            warm_started.set()
+            await release_warm.wait()
+
+    monkeypatch.setattr(app_module, "ImagePreparationService", SlowWarmImages)
+    app = create_app(settings)
+
+    async def run_lifespan() -> None:
+        async with app.router.lifespan_context(app):
+            await warm_started.wait()
+            release_warm.set()
+
+    await asyncio.wait_for(run_lifespan(), timeout=0.5)
 
 
 @pytest.mark.asyncio

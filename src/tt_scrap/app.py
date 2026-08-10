@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -156,7 +157,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.proxy_manager = proxy_manager
         app.state.asset_downloader = AssetDownloader(configured_settings, proxy_manager)
         app.state.image_preparation = ImagePreparationService(configured_settings)
-        await app.state.image_preparation.warm()
         app.state.tiktok = TikTokService(configured_settings, cache, proxy_manager)
         app.state.instagram = InstagramService(configured_settings, cache)
         app.state.telegram_client = TelegramClient(configured_settings)
@@ -169,10 +169,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.telegram_client,
             instagram=app.state.instagram,
         )
+        image_warm_task = asyncio.create_task(app.state.image_preparation.warm())
         logger.info("tt-scrap started")
         try:
             yield
         finally:
+            if not image_warm_task.done():
+                image_warm_task.cancel()
+            await asyncio.gather(image_warm_task, return_exceptions=True)
             await app.state.telegram_client.close()
             await app.state.image_preparation.close()
             await app.state.instagram.close()

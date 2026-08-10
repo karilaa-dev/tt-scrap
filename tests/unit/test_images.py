@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+from concurrent.futures import Future
 
 import pytest
 from PIL import Image, JpegImagePlugin
@@ -52,6 +53,36 @@ def test_image_worker_count_reserves_one_cpu(
     configured_workers: int, available_cpus: int, expected: int
 ) -> None:
     assert image_worker_count(configured_workers, available_cpus) == expected
+
+
+@pytest.mark.asyncio
+async def test_warm_starts_only_one_process_pool_worker(settings) -> None:
+    class RecordingExecutor:
+        def __init__(self) -> None:
+            self.submissions = 0
+
+        def submit(self, function, *args, **kwargs):
+            self.submissions += 1
+            future: Future[None] = Future()
+            try:
+                future.set_result(function(*args, **kwargs))
+            except BaseException as exc:
+                future.set_exception(exc)
+            return future
+
+        def shutdown(self, wait=True, *, cancel_futures=False) -> None:
+            return None
+
+    service = ImagePreparationService(settings.model_copy(update={"image_conversion_workers": 8}))
+    service._executor.shutdown(wait=True, cancel_futures=True)
+    executor = RecordingExecutor()
+    service._executor = executor  # type: ignore[assignment]
+    try:
+        await service.warm()
+    finally:
+        await service.close()
+
+    assert executor.submissions == 1
 
 
 @pytest.mark.asyncio
