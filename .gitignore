@@ -33,6 +33,7 @@ htmlcov/
 
 # Local logs and editor/OS metadata
 *.log
+*.log.txt
 .DS_Store
 .idea/
 .vscode/

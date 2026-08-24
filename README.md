@@ -63,6 +63,7 @@ are:
 | `TELEGRAM_PIPELINE_CONCURRENCY` | Maximum concurrent extraction/preparation pipelines; default 32 |
 | `TELEGRAM_UPLOAD_CONCURRENCY` | Maximum concurrent Telegram API uploads; default 20 |
 | `TELEGRAM_UPLOAD_TIMEOUT_SECONDS` | Per Telegram upload timeout; default 600 seconds |
+| `TELEGRAM_UPLOAD_MAX_BYTES` | Per-file Telegram upload limit; default 50 MiB, zero disables it for a local Bot API server |
 | `TELEGRAM_THUMBNAIL_WAIT_SECONDS` | Soft cover-preparation budget for relayed videos; default 1.5 seconds |
 | `MAX_VIDEO_DURATION` | Maximum duration in seconds; zero disables it |
 | `MAX_ASSET_BYTES` | Maximum downloaded size; zero disables it |
