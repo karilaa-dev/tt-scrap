@@ -31,6 +31,7 @@ _STRUCTURED_FIELDS = {
     "error_type",
     "event",
     "fast_path",
+    "failure_reason",
     "height",
     "http_method",
     "item_count",

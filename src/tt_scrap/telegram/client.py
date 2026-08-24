@@ -12,7 +12,12 @@ from typing import Any, BinaryIO
 import aiohttp
 
 from ..config import Settings
-from ..errors import ConfigurationError, TelegramNetworkError, TelegramTimeoutError
+from ..errors import (
+    AssetTooLargeError,
+    ConfigurationError,
+    TelegramNetworkError,
+    TelegramTimeoutError,
+)
 from ..logging import elapsed_ms, log_event
 
 logger = logging.getLogger(__name__)
@@ -102,6 +107,7 @@ class TelegramClient:
     def __init__(self, settings: Settings) -> None:
         self._token = settings.telegram_bot_token.get_secret_value()
         self._base_url = settings.telegram_api_base_url
+        self._upload_max_bytes = settings.telegram_upload_max_bytes
         timeout = aiohttp.ClientTimeout(
             total=settings.telegram_upload_timeout_seconds,
             connect=min(30.0, settings.telegram_upload_timeout_seconds),
@@ -137,6 +143,22 @@ class TelegramClient:
             if all(size is not None for size in upload_sizes)
             else None
         )
+        if self._upload_max_bytes and any(
+            size is not None and size > self._upload_max_bytes for size in upload_sizes
+        ):
+            log_event(
+                logger,
+                "telegram.api_call.rejected",
+                level=logging.WARNING,
+                message="Telegram upload exceeds the configured size limit",
+                telegram_method=method,
+                success=False,
+                upload_count=len(uploads),
+                upload_bytes=upload_bytes,
+                error_type="AssetTooLargeError",
+                elapsed_ms=elapsed_ms(started_at),
+            )
+            raise AssetTooLargeError("Telegram upload exceeds TELEGRAM_UPLOAD_MAX_BYTES")
         form = aiohttp.FormData(quote_fields=False)
         for name, value in fields.items():
             if value is not None:

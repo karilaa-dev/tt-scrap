@@ -6,10 +6,15 @@ import pytest
 import respx
 import yt_dlp
 from httpx import Response
-from yt_dlp.networking._curlcffi import BROWSER_TARGETS
+from yt_dlp.utils import ExtractorError as YtdlpExtractorError
+from yt_dlp.version import __version__ as ytdlp_version
 
-from tt_scrap.errors import ContentDeletedError, InvalidLinkError
-from tt_scrap.platforms.tiktok.adapter import TikTokAdapter, YtdlpContext
+from tt_scrap.errors import ContentDeletedError, ContentPrivateError, InvalidLinkError
+from tt_scrap.platforms.tiktok.adapter import (
+    TikTokAdapter,
+    YtdlpContext,
+    _classify_ytdlp_error,
+)
 from tt_scrap.proxy import ProxyManager, ProxySession
 
 
@@ -30,16 +35,37 @@ class FakeExtractor:
         return {"cdn-token": FakeCookie("asset-cookie")}
 
 
-def test_pinned_ytdlp_has_required_private_api() -> None:
+def test_pinned_ytdlp_has_tiktok_webpage_fix_and_required_private_api() -> None:
+    assert tuple(map(int, ytdlp_version.split("."))) >= (2026, 8, 19)
     with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
         extractor = ydl.get_info_extractor("TikTok")
         assert hasattr(extractor, "_extract_web_data_and_status")
-    available_targets = {
-        target_name
-        for version_targets in BROWSER_TARGETS.values()
-        for target_name in version_targets
-    }
-    assert "chrome120" in available_targets
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "HTTP Error 429: Too Many Requests",
+        "Server returned status code: 429",
+    ),
+)
+def test_ytdlp_http_429_errors_are_classified_as_rate_limits(message: str) -> None:
+    assert _classify_ytdlp_error(Exception(message)) == "rate_limit"
+
+
+def test_ytdlp_video_id_containing_429_is_not_classified_as_rate_limit() -> None:
+    error = Exception("[TikTok] 123429456: Unable to extract webpage video data")
+
+    assert _classify_ytdlp_error(error) == "extraction"
+
+
+@pytest.mark.asyncio
+async def test_adapter_defers_tiktok_impersonation_to_ytdlp(settings) -> None:
+    adapter = TikTokAdapter(settings, ProxyManager())
+    try:
+        assert "impersonate" not in adapter._ydl_options(None)
+    finally:
+        await adapter.close()
 
 
 @pytest.mark.asyncio
@@ -158,6 +184,44 @@ async def test_deleted_content_is_not_retried(settings, monkeypatch) -> None:
     monkeypatch.setattr(adapter, "_extract_sync", fake_extract)
     try:
         with pytest.raises(ContentDeletedError):
+            await adapter.extract(
+                "https://www.tiktok.com/@_/video/123",
+                "123",
+                ProxySession(ProxyManager()),
+            )
+        assert calls == 1
+    finally:
+        await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_sensitive_content_extractor_error_is_not_retried(settings, monkeypatch) -> None:
+    calls = 0
+
+    class SensitiveExtractor:
+        def set_downloader(self, ydl: object) -> None:
+            return None
+
+        def _extract_web_data_and_status(self, url: str, video_id: str):
+            raise YtdlpExtractorError(
+                "This post may not be comfortable for some audiences. Log in for access"
+            )
+
+    class SensitiveYDL:
+        def __init__(self, options: dict[str, Any]) -> None:
+            nonlocal calls
+            calls += 1
+
+        def get_info_extractor(self, name: str) -> SensitiveExtractor:
+            return SensitiveExtractor()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", SensitiveYDL)
+    adapter = TikTokAdapter(settings, ProxyManager())
+    try:
+        with pytest.raises(ContentPrivateError):
             await adapter.extract(
                 "https://www.tiktok.com/@_/video/123",
                 "123",

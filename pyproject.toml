@@ -6,7 +6,7 @@ readme = "README.md"
 license = { file = "LICENSE.md" }
 requires-python = "==3.13.*"
 dependencies = [
-    # yt-dlp 2026.7.4 rejects curl-cffi 0.16; keep the newest supported 0.15.x.
+    # curl-cffi 0.15 is the transport version covered by the TikTok live probe.
     "aiohttp==3.13.3",
     "curl-cffi>=0.15.0,<0.16.0",
     "fastapi>=0.141.1,<0.142.0",
@@ -15,7 +15,7 @@ dependencies = [
     "pillow-heif==1.1.1",
     "pydantic-settings>=2.13.1,<3.0.0",
     "uvicorn[standard]>=0.52.1,<0.53.0",
-    "yt-dlp==2026.7.4",
+    "yt-dlp==2026.8.19",
 ]
 
 [dependency-groups]

@@ -7,6 +7,7 @@ import time
 from typing import Any, BinaryIO
 
 import pytest
+from httpx import AsyncClient, PoolTimeout
 
 from tt_scrap.config import Settings
 from tt_scrap.media import AssetDownloader
@@ -67,6 +68,42 @@ async def test_metadata_limit_uses_32_workers_without_blocking_loop(settings, mo
         await asyncio.gather(ticker(), *tasks)
         assert 1 < peak <= 32
         assert ticker_ran
+    finally:
+        await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_short_url_resolution_queues_before_http_pool_exhaustion(
+    settings, monkeypatch
+) -> None:
+    settings.http_max_connections = 1
+    settings.url_resolve_max_retries = 1
+    adapter = TikTokAdapter(settings, ProxyManager())
+    active = 0
+    peak = 0
+
+    async def fake_follow(client: AsyncClient, url: str) -> str:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            await asyncio.sleep(0.01)
+            if active > settings.http_max_connections:
+                raise PoolTimeout("connection pool exhausted")
+            return url
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(adapter, "_follow_tiktok_redirects", fake_follow)
+    urls = ["https://vm.tiktok.com/one/", "https://vt.tiktok.com/two/"]
+    try:
+        assert (
+            await asyncio.gather(
+                *(adapter.resolve_url(url, ProxySession(ProxyManager())) for url in urls)
+            )
+            == urls
+        )
+        assert peak == 1
     finally:
         await adapter.close()
 

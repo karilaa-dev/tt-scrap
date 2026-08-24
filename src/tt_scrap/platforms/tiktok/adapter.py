@@ -14,7 +14,6 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 import yt_dlp
-from yt_dlp.networking.impersonate import ImpersonateTarget
 
 from ...config import Settings
 from ...errors import (
@@ -37,6 +36,30 @@ TIKTOK_USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 _ID_RE = re.compile(r"/(?:video|photo)/(\d+)")
+_HTTP_429_RE = re.compile(r"\b(?:http(?:\s+error)?|status(?:\s+code)?)\s*[:=]?\s*429\b")
+
+
+def _classify_ytdlp_error(exc: Exception) -> str:
+    message = str(exc).lower()
+    if any(
+        phrase in message
+        for phrase in (
+            "log in",
+            "login",
+            "private",
+            "not be comfortable for some audiences",
+        )
+    ):
+        return "private"
+    if any(
+        phrase in message for phrase in ("rate limit", "too many requests")
+    ) or _HTTP_429_RE.search(message):
+        return "rate_limit"
+    if any(phrase in message for phrase in ("region", "geo", "country", "ip address is blocked")):
+        return "region"
+    if any(phrase in message for phrase in ("unavailable", "removed", "deleted")):
+        return "deleted"
+    return "extraction"
 
 
 def is_tiktok_host(host: str | None) -> bool:
@@ -87,6 +110,7 @@ class TikTokAdapter:
             max_workers=settings.executor_workers, thread_name_prefix="tiktok-extract"
         )
         self._semaphore = asyncio.Semaphore(settings.extraction_concurrency)
+        self._url_resolution_semaphore = asyncio.Semaphore(settings.http_max_connections)
         self._http = httpx.AsyncClient(
             follow_redirects=False,
             timeout=httpx.Timeout(15, connect=5, read=10),
@@ -127,24 +151,28 @@ class TikTokAdapter:
         for attempt in range(1, self.settings.url_resolve_max_retries + 1):
             attempt_started_at = perf_counter()
             choice = proxy_session.get()
+            queue_wait = 0.0
             try:
-                if choice.url:
-                    client = self._proxy_http.get(choice.url)
-                    if client is None:
-                        client = httpx.AsyncClient(
-                            proxy=choice.url,
-                            follow_redirects=False,
-                            timeout=httpx.Timeout(15, connect=5, read=10),
-                            limits=httpx.Limits(
-                                max_connections=self.settings.http_max_connections,
-                                max_keepalive_connections=self.settings.http_max_connections,
-                            ),
-                            headers={"User-Agent": TIKTOK_USER_AGENT},
-                        )
-                        self._proxy_http[choice.url] = client
-                    resolved = await self._follow_tiktok_redirects(client, url)
-                else:
-                    resolved = await self._follow_tiktok_redirects(self._http, url)
+                queue_started_at = perf_counter()
+                async with self._url_resolution_semaphore:
+                    queue_wait = elapsed_ms(queue_started_at)
+                    if choice.url:
+                        client = self._proxy_http.get(choice.url)
+                        if client is None:
+                            client = httpx.AsyncClient(
+                                proxy=choice.url,
+                                follow_redirects=False,
+                                timeout=httpx.Timeout(15, connect=5, read=10),
+                                limits=httpx.Limits(
+                                    max_connections=self.settings.http_max_connections,
+                                    max_keepalive_connections=self.settings.http_max_connections,
+                                ),
+                                headers={"User-Agent": TIKTOK_USER_AGENT},
+                            )
+                            self._proxy_http[choice.url] = client
+                        resolved = await self._follow_tiktok_redirects(client, url)
+                    else:
+                        resolved = await self._follow_tiktok_redirects(self._http, url)
                 log_event(
                     logger,
                     "tiktok.url_resolution.completed",
@@ -153,6 +181,7 @@ class TikTokAdapter:
                     fast_path=False,
                     attempt=attempt,
                     proxy_used=choice.url is not None,
+                    queue_wait_ms=queue_wait,
                     elapsed_ms=elapsed_ms(started_at),
                     success=True,
                 )
@@ -168,6 +197,7 @@ class TikTokAdapter:
                     platform="tiktok",
                     attempt=attempt,
                     proxy_used=choice.url is not None,
+                    queue_wait_ms=queue_wait,
                     elapsed_ms=elapsed_ms(attempt_started_at),
                     error_type=type(exc).__name__,
                     retrying=retrying,
@@ -210,7 +240,6 @@ class TikTokAdapter:
             "quiet": True,
             "no_warnings": True,
             "http_headers": {"User-Agent": TIKTOK_USER_AGENT},
-            "impersonate": ImpersonateTarget("chrome", "120", "macos", None),
         }
         if proxy:
             options["proxy"] = proxy
@@ -231,27 +260,21 @@ class TikTokAdapter:
                     "Installed yt-dlp is incompatible: TikTok private API is missing"
                 )
             data, status = extractor._extract_web_data_and_status(url, video_id)
-            if status in (10204, 10216):
-                return None, "deleted", None
-            if status == 10222:
+            if status == 10204:
+                return None, "region", None
+            if status in (10216, 10222):
                 return None, "private", None
             if not data:
-                return None, "extraction", None
+                return (
+                    None,
+                    f"status_{status}" if status not in (None, -1, 0) else "extraction",
+                    None,
+                )
             context = YtdlpContext(ydl, extractor, url, proxy_slot)
             ydl = None
             return data, status, context
-        except yt_dlp.utils.DownloadError as exc:
-            message = str(exc).lower()
-            if any(word in message for word in ("unavailable", "removed", "deleted")):
-                return None, "deleted", None
-            if "private" in message:
-                return None, "private", None
-            if any(word in message for word in ("rate", "too many", "429")):
-                return None, "rate_limit", None
-            if any(word in message for word in ("region", "geo", "country")):
-                return None, "region", None
-            logger.warning("yt-dlp TikTok extraction failed: %s", type(exc).__name__)
-            return None, "extraction", None
+        except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as exc:
+            return None, _classify_ytdlp_error(exc), None
         finally:
             if ydl is not None:
                 ydl.close()
@@ -321,6 +344,7 @@ class TikTokAdapter:
                         queue_wait_ms=queue_wait,
                         elapsed_ms=elapsed_ms(started_at),
                         error_type=type(exc).__name__,
+                        failure_reason=status,
                         retrying=False,
                         success=False,
                     )
@@ -341,6 +365,7 @@ class TikTokAdapter:
                     proxy_used=choice.url is not None,
                     elapsed_ms=elapsed_ms(attempt_started_at),
                     error_type=type(last_error).__name__,
+                    failure_reason=last_status or "exception",
                     retrying=retrying,
                     success=False,
                 )
