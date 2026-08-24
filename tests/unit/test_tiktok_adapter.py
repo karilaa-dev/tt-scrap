@@ -10,7 +10,11 @@ from yt_dlp.utils import ExtractorError as YtdlpExtractorError
 from yt_dlp.version import __version__ as ytdlp_version
 
 from tt_scrap.errors import ContentDeletedError, ContentPrivateError, InvalidLinkError
-from tt_scrap.platforms.tiktok.adapter import TikTokAdapter, YtdlpContext
+from tt_scrap.platforms.tiktok.adapter import (
+    TikTokAdapter,
+    YtdlpContext,
+    _classify_ytdlp_error,
+)
 from tt_scrap.proxy import ProxyManager, ProxySession
 
 
@@ -36,6 +40,23 @@ def test_pinned_ytdlp_has_tiktok_webpage_fix_and_required_private_api() -> None:
     with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
         extractor = ydl.get_info_extractor("TikTok")
         assert hasattr(extractor, "_extract_web_data_and_status")
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "HTTP Error 429: Too Many Requests",
+        "Server returned status code: 429",
+    ),
+)
+def test_ytdlp_http_429_errors_are_classified_as_rate_limits(message: str) -> None:
+    assert _classify_ytdlp_error(Exception(message)) == "rate_limit"
+
+
+def test_ytdlp_video_id_containing_429_is_not_classified_as_rate_limit() -> None:
+    error = Exception("[TikTok] 123429456: Unable to extract webpage video data")
+
+    assert _classify_ytdlp_error(error) == "extraction"
 
 
 @pytest.mark.asyncio

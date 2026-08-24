@@ -36,6 +36,7 @@ TIKTOK_USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 _ID_RE = re.compile(r"/(?:video|photo)/(\d+)")
+_HTTP_429_RE = re.compile(r"\b(?:http(?:\s+error)?|status(?:\s+code)?)\s*[:=]?\s*429\b")
 
 
 def _classify_ytdlp_error(exc: Exception) -> str:
@@ -50,7 +51,9 @@ def _classify_ytdlp_error(exc: Exception) -> str:
         )
     ):
         return "private"
-    if any(phrase in message for phrase in ("rate limit", "too many requests", "429")):
+    if any(
+        phrase in message for phrase in ("rate limit", "too many requests")
+    ) or _HTTP_429_RE.search(message):
         return "rate_limit"
     if any(phrase in message for phrase in ("region", "geo", "country", "ip address is blocked")):
         return "region"
