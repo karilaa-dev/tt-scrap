@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     proxy_include_host: bool = False
 
     url_resolve_max_retries: int = Field(default=3, ge=1, le=10)
+    url_resolve_timeout_seconds: float = Field(default=12.0, gt=0, le=120)
+    url_resolve_pool_timeout_seconds: float = Field(default=1.0, gt=0, le=15)
     video_info_max_retries: int = Field(default=3, ge=1, le=10)
     download_max_retries: int = Field(default=3, ge=1, le=10)
     download_retry_base_delay: float = Field(default=1.0, ge=0, le=30)
@@ -43,6 +45,7 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = Field(default=600, ge=30, le=86_400)
     cache_max_entries: int = Field(default=10_000, ge=100, le=1_000_000)
     tiktok_info_cache_ttl_seconds: int = Field(default=60, ge=1, le=3_600)
+    tiktok_resolution_cache_ttl_seconds: int = Field(default=600, ge=1, le=86_400)
     extraction_concurrency: int = Field(default=32, ge=1, le=512)
     download_concurrency: int = Field(default=64, ge=1, le=1024)
     slideshow_concurrency: int = Field(default=8, ge=1, le=64)

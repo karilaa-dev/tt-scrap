@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any, BinaryIO, Literal, cast
+from typing import Any, BinaryIO, Literal
 
 from ..cache import CacheStore
 from ..config import Settings
@@ -149,6 +149,7 @@ class TelegramDeliveryService:
         self._pipeline_limit = asyncio.Semaphore(settings.telegram_pipeline_concurrency)
         self._upload_limit = asyncio.Semaphore(settings.telegram_upload_concurrency)
         self._thumbnail_wait_seconds = settings.telegram_thumbnail_wait_seconds
+        self._upload_max_bytes = settings.telegram_upload_max_bytes
 
     @asynccontextmanager
     async def _upload_slot(self) -> AsyncIterator[None]:
@@ -286,42 +287,53 @@ class TelegramDeliveryService:
 
     async def _download(self, descriptor: AssetDescriptor) -> DownloadedAsset:
         context = await self._cache.get_asset(descriptor.asset_id)
-        return await self._downloader.download(context, compute_sha256=False)
+        return await self._downloader.download(
+            context,
+            compute_sha256=False,
+            # Photos can shrink during conversion; their final upload check
+            # remains authoritative. Videos/audio are copied or remuxed.
+            max_bytes=self._upload_max_bytes if context.kind in {"video", "audio"} else 0,
+        )
 
     @asynccontextmanager
     async def _stream(self, descriptor: AssetDescriptor) -> AsyncIterator[StreamedAsset | None]:
         context = await self._cache.get_asset(descriptor.asset_id)
-        async with self._downloader.stream(context) as streamed:
+        async with self._downloader.stream(context, max_bytes=self._upload_max_bytes) as streamed:
             yield streamed
 
     async def _download_with_cover(
         self, media: AssetDescriptor, cover: AssetDescriptor | None
     ) -> tuple[DownloadedAsset, DownloadedAsset | None]:
-        media_task = asyncio.create_task(self._download(media))
-        cover_task = asyncio.create_task(self._download(cover)) if cover is not None else None
-        tasks = [media_task, *([cover_task] if cover_task is not None else [])]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        media_result = results[0]
-        if isinstance(media_result, BaseException):
-            for result in results[1:]:
-                if isinstance(result, DownloadedAsset):
-                    result.file.close()
-            raise media_result
-        cover_result: DownloadedAsset | None = None
-        if len(results) > 1:
-            candidate = results[1]
-            if isinstance(candidate, DownloadedAsset):
-                cover_result = candidate
-            elif isinstance(candidate, BaseException):
+        async def optional_cover() -> DownloadedAsset | None:
+            if cover is None or self._thumbnail_wait_seconds == 0:
+                return None
+            try:
+                async with asyncio.timeout(self._thumbnail_wait_seconds):
+                    return await self._download(cover)
+            except Exception as exc:
                 log_event(
                     logger,
                     "telegram.thumbnail_download.failed",
                     level=logging.WARNING,
-                    message="Media cover download failed; Telegram will generate a preview",
-                    error_type=type(candidate).__name__,
+                    message="Media cover skipped; Telegram will generate a preview",
+                    error_type=type(exc).__name__,
                     success=False,
                 )
-        return media_result, cover_result
+                return None
+
+        media_task = asyncio.create_task(self._download(media))
+        cover_task = asyncio.create_task(optional_cover())
+        try:
+            media_result = await media_task
+            return media_result, await cover_task
+        except BaseException:
+            media_task.cancel()
+            cover_task.cancel()
+            results = await asyncio.gather(media_task, cover_task, return_exceptions=True)
+            for result in results:
+                if isinstance(result, DownloadedAsset):
+                    result.file.close()
+            raise
 
     async def _download_prepared_thumbnail(
         self,
@@ -352,49 +364,74 @@ class TelegramDeliveryService:
             raise
         return downloaded_cover, thumbnail
 
+    async def _bounded_thumbnail(
+        self,
+        cover: AssetDescriptor | None,
+        filename: str,
+    ) -> tuple[DownloadedAsset | None, tuple[io.BytesIO, str] | None]:
+        if cover is None or self._thumbnail_wait_seconds == 0:
+            return None, None
+        try:
+            async with asyncio.timeout(self._thumbnail_wait_seconds):
+                return await self._download_prepared_thumbnail(cover, filename)
+        except TimeoutError:
+            log_event(
+                logger,
+                "telegram.relay_thumbnail.skipped",
+                message="Slow source cover skipped; Telegram will generate a preview",
+                wait_seconds=self._thumbnail_wait_seconds,
+                success=True,
+            )
+            return None, None
+
+    @staticmethod
+    def _close_thumbnail(
+        result: tuple[DownloadedAsset | None, tuple[io.BytesIO, str] | None],
+    ) -> None:
+        cover, thumbnail = result
+        if cover is not None:
+            cover.file.close()
+        if thumbnail is not None:
+            thumbnail[0].close()
+
+    @asynccontextmanager
+    async def _background_thumbnail(
+        self,
+        cover: AssetDescriptor | None,
+        filename: str,
+    ) -> AsyncIterator[asyncio.Task[tuple[DownloadedAsset | None, tuple[io.BytesIO, str] | None]]]:
+        task = asyncio.create_task(self._bounded_thumbnail(cover, filename))
+        try:
+            yield task
+        finally:
+            if not task.done():
+                task.cancel()
+            result = (await asyncio.gather(task, return_exceptions=True))[0]
+            if isinstance(result, tuple):
+                self._close_thumbnail(result)
+
     async def _download_with_prepared_thumbnail(
         self,
         media: AssetDescriptor,
         cover: AssetDescriptor | None,
         thumbnail_filename: str,
-    ) -> tuple[
-        DownloadedAsset,
-        DownloadedAsset | None,
-        tuple[io.BytesIO, str] | None,
-    ]:
-        """Prepare a cover as soon as it downloads, while media keeps downloading."""
+    ) -> tuple[DownloadedAsset, DownloadedAsset | None, tuple[io.BytesIO, str] | None]:
+        """Overlap preparation, bound optional work, and stop it if the media fails."""
         media_task = asyncio.create_task(self._download(media))
-        cover_task = (
-            asyncio.create_task(self._download_prepared_thumbnail(cover, thumbnail_filename))
-            if cover is not None
-            else None
-        )
-        tasks = [media_task, *([cover_task] if cover_task is not None else [])]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        media_result = results[0]
-        if isinstance(media_result, BaseException):
-            for result in results[1:]:
-                if isinstance(result, tuple):
-                    downloaded_cover, result_thumbnail = cast(
-                        tuple[DownloadedAsset | None, tuple[io.BytesIO, str] | None],
-                        result,
-                    )
-                    if downloaded_cover is not None:
-                        downloaded_cover.file.close()
-                    if result_thumbnail is not None:
-                        result_thumbnail[0].close()
-            raise media_result
-
-        cover_result: DownloadedAsset | None = None
-        prepared_thumbnail: tuple[io.BytesIO, str] | None = None
-        if len(results) > 1:
-            candidate = results[1]
-            if isinstance(candidate, tuple):
-                cover_result, prepared_thumbnail = cast(
-                    tuple[DownloadedAsset | None, tuple[io.BytesIO, str] | None],
-                    candidate,
-                )
-        return cast(DownloadedAsset, media_result), cover_result, prepared_thumbnail
+        cover_task = asyncio.create_task(self._bounded_thumbnail(cover, thumbnail_filename))
+        try:
+            media_result = await media_task
+            cover_result, thumbnail = await cover_task
+            return media_result, cover_result, thumbnail
+        except BaseException:
+            media_task.cancel()
+            cover_task.cancel()
+            results = await asyncio.gather(media_task, cover_task, return_exceptions=True)
+            if isinstance(results[0], DownloadedAsset):
+                results[0].file.close()
+            if isinstance(results[1], tuple):
+                self._close_thumbnail(results[1])
+            raise
 
     async def _thumbnail(
         self, cover: DownloadedAsset | None, filename: str
@@ -436,77 +473,55 @@ class TelegramDeliveryService:
         extraction: TikTokExtractionResponse,
         fields: dict[str, Any],
     ) -> TelegramDeliveryOutcome | None:
-        async with self._stream(extraction.media[0]) as streamed:
+        # Cover preparation overlaps the CDN connection/TLS/response headers.
+        async with (
+            self._background_thumbnail(
+                extraction.cover, f"{extraction.source_id}_thumbnail.jpg"
+            ) as thumbnail_task,
+            self._stream(extraction.media[0]) as streamed,
+        ):
             if streamed is None:
                 return None
-            cover: DownloadedAsset | None = None
-            thumbnail: tuple[io.BytesIO, str] | None = None
-            if extraction.cover is not None and self._thumbnail_wait_seconds > 0:
-                try:
-                    cover, thumbnail = await asyncio.wait_for(
-                        self._download_prepared_thumbnail(
-                            extraction.cover,
-                            f"{extraction.source_id}_thumbnail.jpg",
-                        ),
-                        timeout=self._thumbnail_wait_seconds,
-                    )
-                except TimeoutError:
-                    log_event(
-                        logger,
-                        "telegram.relay_thumbnail.skipped",
-                        level=logging.INFO,
-                        message="Slow source cover skipped; Telegram will generate a preview",
-                        wait_seconds=self._thumbnail_wait_seconds,
-                        success=True,
-                    )
-            try:
-                filename = filename_for_type(
-                    extraction.media[0].filename,
+            _cover, thumbnail = await thumbnail_task
+            filename = filename_for_type(extraction.media[0].filename, streamed.content_type)
+            fields["video"] = "attach://video_file"
+            uploads = [
+                TelegramUpload(
+                    "video_file",
+                    streamed.chunks,
+                    filename,
                     streamed.content_type,
+                    size=streamed.size,
                 )
-                fields["video"] = "attach://video_file"
-                uploads = [
+            ]
+            if thumbnail is not None:
+                thumbnail_file, thumbnail_name = thumbnail
+                fields["thumbnail"] = "attach://thumbnail_file"
+                fields["cover"] = "attach://thumbnail_file"
+                uploads.append(
                     TelegramUpload(
-                        "video_file",
-                        streamed.chunks,
-                        filename,
-                        streamed.content_type,
-                        size=streamed.size,
+                        "thumbnail_file",
+                        thumbnail_file,
+                        thumbnail_name,
+                        "image/jpeg",
                     )
-                ]
-                if thumbnail is not None:
-                    thumbnail_file, thumbnail_name = thumbnail
-                    fields["thumbnail"] = "attach://thumbnail_file"
-                    fields["cover"] = "attach://thumbnail_file"
-                    uploads.append(
-                        TelegramUpload(
-                            "thumbnail_file",
-                            thumbnail_file,
-                            thumbnail_name,
-                            "image/jpeg",
-                        )
-                    )
-                try:
-                    response = await self._call("sendVideo", fields, uploads)
-                except Exception:
-                    if streamed.failure is None:
-                        raise
-                    log_event(
-                        logger,
-                        "telegram.relay.fallback",
-                        level=logging.WARNING,
-                        message="Interrupted media relay is retrying through verified spool",
-                        delivery="media",
-                        error_type=type(streamed.failure).__name__,
-                        success=False,
-                    )
-                    return None
-                return TelegramDeliveryOutcome([response])
-            finally:
-                if cover is not None:
-                    cover.file.close()
-                if thumbnail is not None:
-                    thumbnail[0].close()
+                )
+            try:
+                response = await self._call("sendVideo", fields, uploads)
+            except Exception:
+                if streamed.failure is None:
+                    raise
+                log_event(
+                    logger,
+                    "telegram.relay.fallback",
+                    level=logging.WARNING,
+                    message="Interrupted media relay is retrying through verified spool",
+                    delivery="media",
+                    error_type=type(streamed.failure).__name__,
+                    success=False,
+                )
+                return None
+            return TelegramDeliveryOutcome([response])
 
     async def _deliver_video(
         self, request: TikTokTelegramDeliveryRequest, extraction: TikTokExtractionResponse

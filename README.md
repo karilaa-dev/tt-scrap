@@ -56,6 +56,9 @@ are:
 | `PROXY_DATA_ONLY` | Bypass proxies for media downloads when `true` |
 | `CACHE_TTL_SECONDS` | Lifetime of asset contexts and tokens; default 600 seconds |
 | `TIKTOK_INFO_CACHE_TTL_SECONDS` | Absolute lifetime of extraction metadata; default 60 seconds |
+| `TIKTOK_RESOLUTION_CACHE_TTL_SECONDS` | Lifetime of successful URL-to-post-ID mappings; default 600 seconds |
+| `URL_RESOLVE_TIMEOUT_SECONDS` | Total resolution budget, including duplicate/capacity waits, redirects, and retries; default 12 seconds |
+| `URL_RESOLVE_POOL_TIMEOUT_SECONDS` | Wait for an HTTP connection before retiring a failed resolver pool; default 1 second |
 | `CACHE_MAX_ENTRIES` | Maximum in-memory cache entries; default 10,000 |
 | `IMAGE_CONVERSION_WORKERS` | Image process cap; default 0 uses available CPU cores minus one |
 | `TELEGRAM_BOT_TOKEN` | Bot credential; an empty value disables direct delivery |
@@ -64,7 +67,7 @@ are:
 | `TELEGRAM_UPLOAD_CONCURRENCY` | Maximum concurrent Telegram API uploads; default 20 |
 | `TELEGRAM_UPLOAD_TIMEOUT_SECONDS` | Per Telegram upload timeout; default 600 seconds |
 | `TELEGRAM_UPLOAD_MAX_BYTES` | Per-file Telegram upload limit; default 50 MiB, zero disables it for a local Bot API server |
-| `TELEGRAM_THUMBNAIL_WAIT_SECONDS` | Soft cover-preparation budget for relayed videos; default 1.5 seconds |
+| `TELEGRAM_THUMBNAIL_WAIT_SECONDS` | Optional cover budget, overlapping media preparation; default 1.5 seconds, zero skips covers |
 | `MAX_VIDEO_DURATION` | Maximum duration in seconds; zero disables it |
 | `MAX_ASSET_BYTES` | Maximum downloaded size; zero disables it |
 
@@ -74,8 +77,10 @@ sets a lower operator cap but cannot exceed that CPU-derived limit.
 
 The cache is bounded and exists only in the API process. It stores normalized
 metadata and upstream fetch context, never media bytes or request history. TikTok
-information entries use a non-sliding 60-second lifetime; asset contexts retain the
-longer asset TTL. Concurrent requests for the same TikTok are coalesced. All entries
+information entries use a non-sliding 60-second lifetime; resolved URL mappings use
+600 seconds and asset contexts retain the asset TTL. Concurrent requests for the
+same TikTok share successful or failed work. Failed results are discarded when the
+waiting group drains, so later requests can retry. All entries
 and asset tokens disappear on restart. Run exactly one Uvicorn worker; multiple
 workers would not share tokens or extraction IDs.
 
@@ -181,8 +186,17 @@ Length-delimited, unmodified TikTok videos are relayed into Telegram while the
 upstream response is still arriving. This overlaps the CDN download with the
 Telegram upload and avoids an intermediate spool. Separate audio/video tracks,
 unknown-length assets, and transformed media keep the verified download/remux
-fallback. Relay covers have a short soft deadline; Telegram generates the preview
-when the source cover is slower than that budget.
+fallback. Cover preparation starts alongside CDN connection setup and media
+downloads. Optional covers have a short deadline; Telegram generates the preview
+when a cover is slower than that budget. A failed media download cancels its cover
+work immediately.
+
+Video/audio preparation enforces the destination's upload byte limit before reading
+known oversized responses. Separate tracks share a combined budget, including when
+their lengths are unknown, and the final remuxed output is checked again. Failed
+attempts release their byte reservations before retrying. Direct asset downloads
+retain their separate `MAX_ASSET_BYTES` policy. Photos can shrink during conversion,
+so their final Telegram upload-size check remains authoritative.
 
 Preparation pipelines and Telegram API uploads have independent concurrency limits,
 so a slow upload does not stop later requests from extracting and downloading. All
@@ -296,8 +310,12 @@ docker compose logs --no-log-prefix tt-scrap \
         | {event, elapsed_ms, queue_wait_ms, status_code, output_bytes}'
 ```
 
-The largest `elapsed_ms` stage normally identifies the bottleneck. A large
-`queue_wait_ms` instead indicates that a configured concurrency pool is saturated.
+The largest `elapsed_ms` stage normally identifies the bottleneck. `queue_wait_ms`
+measures application semaphore waiting. HTTPX pool waiting is separate and appears
+as `PoolTimeout`. Resolver events include a credential-free `proxy_slot`; startup
+records include HTTPX/httpcore versions and effective resolution limits. Retired
+resolver pools report the number of users still draining. Metadata with no usable
+media emits `tiktok.normalization.failed` with a bounded `failure_reason`.
 Telegram failures include its safe error code, description, and `retry_after` value
 when provided, but never log the bot-token URL or Telegram success payload.
 
@@ -307,6 +325,26 @@ TikTok URL resolution, metadata extraction, and asset download each have their
 own three-attempt retry loop. A proxy stays sticky during a request flow and
 rotates after retryable failures. Permanent deleted, private, and region-blocked
 results fail immediately.
+
+Resolution uses a 12-second total budget and a 1-second HTTP pool wait by default.
+Transport failures retire the affected client; existing users finish before it
+closes and new requests use a fresh pool. Healthy clients continue to reuse their
+connections. Pool exhaustion returns `service_busy` with HTTP 503, timeouts return
+`upstream_timeout` with HTTP 504, and other transport failures return
+`upstream_network_error` with HTTP 502. Invalid URLs/redirects and upstream 400/404/410
+responses fail without repeated resolution attempts. Read-only callers should bound
+their own retries across these responses; Telegram delivery retains its existing
+rules against retrying ambiguous uploads.
+
+An offline regression probe exercises the real HTTPX CONNECT/TLS path:
+
+```bash
+uv run python scripts/diagnostics/repro_tiktok_proxy_pool.py
+```
+
+It needs `openssl` for an ephemeral test certificate and only contacts a local
+proxy. `--legacy` deliberately disables application recovery and reproduces the old
+pool exhaustion failure. It exits nonzero as a diagnostic control.
 
 Instagram RapidAPI requests and CDN downloads are direct by default. Network
 errors, rate limits, and server failures are retried; definitive missing/private

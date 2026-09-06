@@ -123,6 +123,7 @@ async def test_asset_limit_caps_64_concurrent_spools(settings, monkeypatch) -> N
         upstream_url: str,
         *,
         compute_sha256: bool,
+        budget=None,
     ) -> tuple[str, int, str | None, int, bytes]:
         nonlocal active, peak
         active += 1

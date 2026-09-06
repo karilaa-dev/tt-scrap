@@ -29,7 +29,7 @@ class FakeDownloader:
         self.calls: list[str] = []
 
     async def download(
-        self, context: AssetFetchContext, *, compute_sha256: bool = True
+        self, context: AssetFetchContext, *, compute_sha256: bool = True, max_bytes: int = 0
     ) -> DownloadedAsset:
         assert not compute_sha256
         self.calls.append(context.upstream_url)
@@ -37,7 +37,7 @@ class FakeDownloader:
         return DownloadedAsset(io.BytesIO(payload), len(payload), None, content_type)
 
     @asynccontextmanager
-    async def stream(self, context: AssetFetchContext):
+    async def stream(self, context: AssetFetchContext, *, max_bytes: int = 0):
         yield None
 
 
@@ -47,7 +47,7 @@ class StreamingDownloader(FakeDownloader):
         self.stream_calls: list[str] = []
 
     @asynccontextmanager
-    async def stream(self, context: AssetFetchContext):
+    async def stream(self, context: AssetFetchContext, *, max_bytes: int = 0):
         self.stream_calls.append(context.upstream_url)
         payload, content_type = self.payloads[context.upstream_url]
 
@@ -154,6 +154,80 @@ class FakeTikTok:
 
     async def extract_music(self, video_id: int, *, refresh: bool = False):
         raise AssertionError("cached music should be reused")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prepared", [True, False])
+async def test_failed_video_cancels_slow_optional_thumbnail(settings, prepared) -> None:
+    cache = CacheStore(60, 100)
+    video = await descriptor(cache, "video", "video")
+    cover = await descriptor(cache, "cover", "cover")
+    cover_started = asyncio.Event()
+    cover_cancelled = asyncio.Event()
+
+    class Downloader(FakeDownloader):
+        async def download(self, context, **kwargs):
+            if context.kind == "cover":
+                cover_started.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    cover_cancelled.set()
+            await cover_started.wait()
+            raise NetworkError("video rejected")
+
+    delivery = service(settings, cache, None, Downloader({}), FakeTelegramClient())
+    operation = (
+        delivery._download_with_prepared_thumbnail(video, cover, "thumb.jpg")
+        if prepared
+        else delivery._download_with_cover(video, cover)
+    )
+    with pytest.raises(NetworkError, match="video rejected"):
+        await asyncio.wait_for(operation, timeout=0.2)
+    assert cover_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_relay_prepares_cover_while_waiting_for_video_headers(settings) -> None:
+    cache = CacheStore(60, 100)
+    video = await descriptor(cache, "video", "video")
+    cover = await descriptor(cache, "cover", "cover")
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/video/123",
+        resolved_url="https://www.tiktok.com/@a/video/123",
+        content_type="video",
+        media=[video],
+        cover=cover,
+        expires_at=video.expires_at,
+    )
+    cover_ready = asyncio.Event()
+
+    class Images(FakeImages):
+        async def prepare_thumbnail(self, data, filename):
+            result = await super().prepare_thumbnail(data, filename)
+            cover_ready.set()
+            return result
+
+    class Downloader(StreamingDownloader):
+        @asynccontextmanager
+        async def stream(self, context, **kwargs):
+            await cover_ready.wait()
+            async with super().stream(context, **kwargs) as streamed:
+                yield streamed
+
+    client = FakeTelegramClient()
+    delivery = service(
+        settings,
+        cache,
+        extraction,
+        Downloader({"video": (b"video", "video/mp4"), "cover": (b"cover", "image/jpeg")}),
+        client,
+        Images(),
+    )
+    await asyncio.wait_for(delivery.deliver(request()), timeout=0.2)
+    assert client.calls[0][2]["thumbnail_file"] == b"\xff\xd8\xffthumbnail"
 
 
 async def descriptor(cache: CacheStore, name: str, kind: str, position: int = 0) -> AssetDescriptor:
@@ -288,7 +362,7 @@ async def test_relay_prepares_cover_before_consuming_video_stream(settings) -> N
         cover_ready = False
         stream_opened = False
 
-        async def download(self, context, *, compute_sha256=True):
+        async def download(self, context, *, compute_sha256=True, max_bytes=0):
             assert self.stream_opened
             result = await super().download(context, compute_sha256=compute_sha256)
             if context.upstream_url == "cover":
@@ -296,7 +370,7 @@ async def test_relay_prepares_cover_before_consuming_video_stream(settings) -> N
             return result
 
         @asynccontextmanager
-        async def stream(self, context):
+        async def stream(self, context, *, max_bytes=0):
             self.stream_opened = True
 
             async def chunks():
@@ -331,7 +405,7 @@ async def test_interrupted_relay_retries_with_verified_download(settings) -> Non
 
     class InterruptedRelayDownloader(FakeDownloader):
         @asynccontextmanager
-        async def stream(self, context):
+        async def stream(self, context, *, max_bytes=0):
             streamed: StreamedAsset
 
             async def chunks():
@@ -369,7 +443,7 @@ async def test_video_relay_does_not_wait_for_a_slow_source_cover(settings) -> No
     )
 
     class SlowCoverDownloader(StreamingDownloader):
-        async def download(self, context, *, compute_sha256=True):
+        async def download(self, context, *, compute_sha256=True, max_bytes=0):
             if context.upstream_url == "cover":
                 await asyncio.sleep(1)
             return await super().download(context, compute_sha256=compute_sha256)
@@ -405,7 +479,7 @@ async def test_downloads_continue_while_telegram_upload_slot_is_busy(settings) -
     both_downloaded = asyncio.Event()
 
     class SignalingDownloader(FakeDownloader):
-        async def download(self, context, *, compute_sha256=True):
+        async def download(self, context, *, compute_sha256=True, max_bytes=0):
             result = await super().download(context, compute_sha256=compute_sha256)
             if len(self.calls) == 2:
                 both_downloaded.set()
@@ -468,12 +542,12 @@ async def test_relay_setup_does_not_reserve_a_telegram_upload_slot(settings) -> 
             self.cover_ready = asyncio.Event()
 
         @asynccontextmanager
-        async def stream(self, context):
+        async def stream(self, context, *, max_bytes=0):
             self.stream_opened.set()
             async with super().stream(context) as streamed:
                 yield streamed
 
-        async def download(self, context, *, compute_sha256=True):
+        async def download(self, context, *, compute_sha256=True, max_bytes=0):
             result = await super().download(context, compute_sha256=compute_sha256)
             if context.upstream_url == "cover":
                 self.cover_ready.set()
@@ -714,7 +788,7 @@ async def test_thumbnail_preparation_overlaps_video_download(settings) -> None:
     thumbnail_ready = asyncio.Event()
 
     class GatedDownloader(FakeDownloader):
-        async def download(self, context, *, compute_sha256=True):
+        async def download(self, context, *, compute_sha256=True, max_bytes=0):
             if context.upstream_url == "video":
                 await asyncio.wait_for(thumbnail_ready.wait(), timeout=1)
             return await super().download(context, compute_sha256=compute_sha256)

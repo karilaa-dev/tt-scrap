@@ -7,6 +7,7 @@ import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from importlib.metadata import version
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -21,12 +22,16 @@ from ...errors import (
     ContentPrivateError,
     ExtractionError,
     InvalidLinkError,
+    NetworkError,
     RateLimitError,
     RegionBlockedError,
     ScraperError,
+    ServiceBusyError,
+    UpstreamTimeoutError,
 )
 from ...logging import elapsed_ms, log_event
 from ...proxy import ProxyManager, ProxySession
+from .http import ResolverClients
 
 logger = logging.getLogger(__name__)
 
@@ -111,19 +116,17 @@ class TikTokAdapter:
         )
         self._semaphore = asyncio.Semaphore(settings.extraction_concurrency)
         self._url_resolution_semaphore = asyncio.Semaphore(settings.http_max_connections)
-        self._http = httpx.AsyncClient(
-            follow_redirects=False,
-            timeout=httpx.Timeout(15, connect=5, read=10),
-            limits=httpx.Limits(
-                max_connections=settings.http_max_connections,
-                max_keepalive_connections=settings.http_max_connections,
-            ),
-            headers={"User-Agent": TIKTOK_USER_AGENT},
+        self._clients = ResolverClients(lambda proxy: self._new_http_client(proxy))
+        log_event(
+            logger,
+            "tiktok.resolver.configured",
+            httpx_version=httpx.__version__,
+            httpcore_version=version("httpcore"),
+            http_max_connections=settings.http_max_connections,
+            url_resolve_timeout_seconds=settings.url_resolve_timeout_seconds,
+            url_resolve_pool_timeout_seconds=settings.url_resolve_pool_timeout_seconds,
+            success=True,
         )
-        # Short-link resolution used to create and tear down a client (and its
-        # proxy/TLS connection) for every request. Keep one pool per configured
-        # proxy instead; AsyncClient is designed to be shared by concurrent tasks.
-        self._proxy_http: dict[str, httpx.AsyncClient] = {}
         self.cookies_path: str | None = None
         if settings.ytdlp_cookies:
             path = Path(settings.ytdlp_cookies).expanduser().resolve()
@@ -132,10 +135,35 @@ class TikTokAdapter:
             else:
                 logger.warning("Configured yt-dlp cookie file does not exist")
 
+    def _new_http_client(self, proxy: str | None) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            proxy=proxy,
+            follow_redirects=False,
+            timeout=httpx.Timeout(
+                5,
+                pool=self.settings.url_resolve_pool_timeout_seconds,
+            ),
+            limits=httpx.Limits(
+                max_connections=self.settings.http_max_connections,
+                max_keepalive_connections=self.settings.http_max_connections,
+            ),
+            headers={"User-Agent": TIKTOK_USER_AGENT},
+        )
+
     async def resolve_url(self, url: str, proxy_session: ProxySession) -> str:
+        try:
+            async with asyncio.timeout(self.settings.url_resolve_timeout_seconds):
+                return await self._resolve_url(url, proxy_session)
+        except TimeoutError as exc:
+            raise UpstreamTimeoutError("TikTok URL resolution deadline exceeded") from exc
+
+    async def _resolve_url(self, url: str, proxy_session: ProxySession) -> str:
         started_at = perf_counter()
         validate_tiktok_url(url)
-        short = any(part in url for part in ("vm.tiktok.com", "vt.tiktok.com", "/t/"))
+        parsed = urlparse(url)
+        short = parsed.hostname in {"vm.tiktok.com", "vt.tiktok.com"} or parsed.path.startswith(
+            "/t/"
+        )
         if not short:
             log_event(
                 logger,
@@ -156,23 +184,8 @@ class TikTokAdapter:
                 queue_started_at = perf_counter()
                 async with self._url_resolution_semaphore:
                     queue_wait = elapsed_ms(queue_started_at)
-                    if choice.url:
-                        client = self._proxy_http.get(choice.url)
-                        if client is None:
-                            client = httpx.AsyncClient(
-                                proxy=choice.url,
-                                follow_redirects=False,
-                                timeout=httpx.Timeout(15, connect=5, read=10),
-                                limits=httpx.Limits(
-                                    max_connections=self.settings.http_max_connections,
-                                    max_keepalive_connections=self.settings.http_max_connections,
-                                ),
-                                headers={"User-Agent": TIKTOK_USER_AGENT},
-                            )
-                            self._proxy_http[choice.url] = client
+                    async with self._clients.acquire(choice.url) as client:
                         resolved = await self._follow_tiktok_redirects(client, url)
-                    else:
-                        resolved = await self._follow_tiktok_redirects(self._http, url)
                 log_event(
                     logger,
                     "tiktok.url_resolution.completed",
@@ -181,6 +194,7 @@ class TikTokAdapter:
                     fast_path=False,
                     attempt=attempt,
                     proxy_used=choice.url is not None,
+                    proxy_slot=choice.slot,
                     queue_wait_ms=queue_wait,
                     elapsed_ms=elapsed_ms(started_at),
                     success=True,
@@ -188,7 +202,11 @@ class TikTokAdapter:
                 return resolved
             except (httpx.HTTPError, InvalidLinkError) as exc:
                 last_error = exc
-                retrying = attempt < self.settings.url_resolve_max_retries
+                permanent = isinstance(exc, InvalidLinkError) or (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and exc.response.status_code in {400, 404, 410}
+                )
+                retrying = not permanent and attempt < self.settings.url_resolve_max_retries
                 log_event(
                     logger,
                     "tiktok.url_resolution.failed",
@@ -197,6 +215,7 @@ class TikTokAdapter:
                     platform="tiktok",
                     attempt=attempt,
                     proxy_used=choice.url is not None,
+                    proxy_slot=choice.slot,
                     queue_wait_ms=queue_wait,
                     elapsed_ms=elapsed_ms(attempt_started_at),
                     error_type=type(exc).__name__,
@@ -205,7 +224,21 @@ class TikTokAdapter:
                 )
                 if retrying:
                     proxy_session.rotate()
-        raise InvalidLinkError("Invalid or expired TikTok link") from last_error
+                else:
+                    break
+        if isinstance(last_error, InvalidLinkError):
+            raise last_error
+        if isinstance(last_error, httpx.PoolTimeout):
+            raise ServiceBusyError("TikTok URL resolver is busy") from last_error
+        if isinstance(last_error, httpx.TimeoutException):
+            raise UpstreamTimeoutError("TikTok URL resolution timed out") from last_error
+        if isinstance(last_error, httpx.HTTPStatusError):
+            status = last_error.response.status_code
+            if status in {400, 404, 410}:
+                raise InvalidLinkError("Invalid or expired TikTok link") from last_error
+            if status == 429:
+                raise RateLimitError("TikTok URL resolution rate limit exceeded") from last_error
+        raise NetworkError("TikTok URL resolution failed") from last_error
 
     @staticmethod
     async def _follow_tiktok_redirects(client: httpx.AsyncClient, url: str) -> str:
@@ -378,9 +411,5 @@ class TikTokAdapter:
             raise ExtractionError("TikTok metadata extraction failed") from last_error
 
     async def close(self) -> None:
-        await asyncio.gather(
-            self._http.aclose(),
-            *(client.aclose() for client in self._proxy_http.values()),
-        )
-        self._proxy_http.clear()
+        await self._clients.close()
         self._executor.shutdown(wait=False, cancel_futures=True)

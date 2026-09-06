@@ -87,6 +87,32 @@ async def test_resolution_returns_post_id_without_extraction_and_is_cached(setti
 
 
 @pytest.mark.asyncio
+async def test_resolution_mapping_outlives_metadata_without_extending_metadata(settings):
+    service, cache = make_service(settings, {})
+    short_url = "https://vt.tiktok.com/CACHED/"
+    await service.resolve_url(short_url)
+    key = cache.metadata_key("tiktok-resolution", short_url)
+    _value, ttl = await cache._get_with_ttl(key)
+    assert ttl > settings.tiktok_info_cache_ttl_seconds
+    assert ttl <= settings.tiktok_resolution_cache_ttl_seconds
+
+
+@pytest.mark.asyncio
+async def test_resolution_deadline_includes_duplicate_request_lock(settings):
+    from tt_scrap.errors import UpstreamTimeoutError
+
+    settings.url_resolve_timeout_seconds = 0.02
+    service, cache = make_service(settings, {})
+    short_url = "https://vt.tiktok.com/WAIT/"
+    key = cache.metadata_key("tiktok-resolution", short_url)
+    async with service._key_lock(key):
+        with pytest.raises(UpstreamTimeoutError):
+            await asyncio.wait_for(service.resolve_url(short_url), timeout=0.2)
+    assert service.adapter.resolve_calls == 0
+    assert not service._key_locks
+
+
+@pytest.mark.asyncio
 async def test_extraction_reuses_cached_resolution(settings) -> None:
     service, _cache = make_service(
         settings,
@@ -588,6 +614,36 @@ async def test_concurrent_refreshes_share_one_fresh_extraction(settings) -> None
     assert len({result.extraction_id for result in results}) == 1
     assert service.adapter.calls == 1
     assert service.adapter.resolve_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_failed_extractions_share_failure_but_later_request_can_retry(settings):
+    from tt_scrap.errors import ExtractionError
+
+    service, _cache = make_service(settings, {})
+    started = asyncio.Event()
+    release = asyncio.Event()
+    original = service.adapter.extract
+
+    async def extract(*args):
+        started.set()
+        await release.wait()
+        return await original(*args)
+
+    service.adapter.extract = extract
+    tasks = [
+        asyncio.create_task(service.extract_url("https://www.tiktok.com/@a/video/123"))
+        for _ in range(8)
+    ]
+    await started.wait()
+    release.set()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    assert all(isinstance(result, ExtractionError) for result in results)
+    assert service.adapter.calls == 1
+    with pytest.raises(ExtractionError):
+        await service.extract_url("https://www.tiktok.com/@a/video/123")
+    assert service.adapter.calls == 2
+    assert not service._key_locks
 
 
 @pytest.mark.asyncio

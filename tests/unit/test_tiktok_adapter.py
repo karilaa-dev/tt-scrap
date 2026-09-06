@@ -5,11 +5,19 @@ from typing import Any, cast
 import pytest
 import respx
 import yt_dlp
-from httpx import Response
+from httpx import ConnectTimeout, PoolTimeout, Response
 from yt_dlp.utils import ExtractorError as YtdlpExtractorError
 from yt_dlp.version import __version__ as ytdlp_version
 
-from tt_scrap.errors import ContentDeletedError, ContentPrivateError, InvalidLinkError
+from tt_scrap.errors import (
+    ContentDeletedError,
+    ContentPrivateError,
+    InvalidLinkError,
+    NetworkError,
+    RateLimitError,
+    ServiceBusyError,
+    UpstreamTimeoutError,
+)
 from tt_scrap.platforms.tiktok.adapter import (
     TikTokAdapter,
     YtdlpContext,
@@ -26,6 +34,69 @@ class FakeContext:
 class FakeCookie:
     def __init__(self, value: str) -> None:
         self.value = value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error,expected", [(PoolTimeout, ServiceBusyError), (ConnectTimeout, UpstreamTimeoutError)]
+)
+async def test_resolution_preserves_transient_failure_type(settings, monkeypatch, error, expected):
+    adapter = TikTokAdapter(settings, ProxyManager())
+    attempts = 0
+
+    async def fail(*args):
+        nonlocal attempts
+        attempts += 1
+        raise error("upstream unavailable")
+
+    monkeypatch.setattr(adapter, "_follow_tiktok_redirects", fail)
+    try:
+        with pytest.raises(expected):
+            await adapter.resolve_url("https://vt.tiktok.com/FAIL/", ProxySession(ProxyManager()))
+        assert attempts == settings.url_resolve_max_retries
+    finally:
+        await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_resolution_deadline_includes_wait_for_capacity(settings):
+    import asyncio
+
+    settings.url_resolve_timeout_seconds = 0.02
+    settings.http_max_connections = 1
+    adapter = TikTokAdapter(settings, ProxyManager())
+    try:
+        async with adapter._url_resolution_semaphore:
+            with pytest.raises(UpstreamTimeoutError, match="deadline"):
+                await asyncio.wait_for(
+                    adapter.resolve_url(
+                        "https://vt.tiktok.com/WAIT/", ProxySession(ProxyManager())
+                    ),
+                    timeout=0.2,
+                )
+    finally:
+        await adapter.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(
+    "status,error,attempts",
+    [
+        (404, InvalidLinkError, 1),
+        (429, RateLimitError, 3),
+        (503, NetworkError, 3),
+    ],
+)
+async def test_resolution_status_retry_policy(settings, status, error, attempts):
+    route = respx.get("https://vt.tiktok.com/STATUS/").respond(status)
+    adapter = TikTokAdapter(settings, ProxyManager())
+    try:
+        with pytest.raises(error):
+            await adapter.resolve_url("https://vt.tiktok.com/STATUS/", ProxySession(ProxyManager()))
+        assert route.call_count == attempts
+    finally:
+        await adapter.close()
 
 
 class FakeExtractor:

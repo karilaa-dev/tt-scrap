@@ -48,6 +48,11 @@ class NetworkError(ScraperError):
     status_code = 502
 
 
+class ServiceBusyError(ScraperError):
+    code = "service_busy"
+    status_code = 503
+
+
 class ExtractionError(ScraperError):
     code = "upstream_extraction_error"
     status_code = 502

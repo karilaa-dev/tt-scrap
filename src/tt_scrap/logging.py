@@ -34,6 +34,10 @@ _STRUCTURED_FIELDS = {
     "failure_reason",
     "height",
     "http_method",
+    "http_max_connections",
+    "httpx_version",
+    "httpcore_version",
+    "inflight_requests",
     "item_count",
     "media_count",
     "media_type",
@@ -42,6 +46,7 @@ _STRUCTURED_FIELDS = {
     "path",
     "platform",
     "proxy_used",
+    "proxy_slot",
     "queue_wait_ms",
     "request_bytes",
     "response_bytes",
@@ -58,8 +63,11 @@ _STRUCTURED_FIELDS = {
     "upload_bytes",
     "upload_count",
     "uses_separate_audio",
+    "url_resolve_timeout_seconds",
+    "url_resolve_pool_timeout_seconds",
     "width",
     "worker_count",
+    "wait_seconds",
 }
 
 

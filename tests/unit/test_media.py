@@ -458,7 +458,7 @@ async def test_adaptive_video_and_audio_download_concurrently_then_remux(
     both_started = asyncio.Event()
 
     async def fake_download_single(
-        context: AssetFetchContext, *, compute_sha256: bool = True
+        context: AssetFetchContext, *, compute_sha256: bool = True, budget=None
     ) -> DownloadedAsset:
         assert not compute_sha256
         calls.append(context)
@@ -512,6 +512,7 @@ async def test_adaptive_tracks_share_the_global_transfer_limit(settings, monkeyp
         upstream_url,
         *,
         compute_sha256,
+        budget=None,
     ):
         nonlocal active, peak
         active += 1
@@ -547,5 +548,69 @@ async def test_adaptive_tracks_share_the_global_transfer_limit(settings, monkeyp
         assert peak == 2
         for result in results:
             result.file.close()
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_group_waiter_does_not_retain_group_capacity(settings):
+    settings.slideshow_concurrency = 1
+    downloader = AssetDownloader(settings, ProxyManager())
+    waiting = asyncio.Event()
+
+    async def waiter():
+        waiting.set()
+        async with downloader._group_limit("group"):
+            raise AssertionError("waiter must remain queued")
+
+    try:
+        async with downloader._group_limit("group"):
+            task = asyncio.create_task(waiter())
+            await waiting.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert not downloader._group_limits
+    finally:
+        await downloader.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_remux_kills_and_reaps_ffmpeg(settings, monkeypatch):
+    import tempfile
+
+    started = asyncio.Event()
+    killed = False
+    reaped = False
+
+    class Process:
+        returncode = None
+
+        async def communicate(self):
+            nonlocal reaped
+            started.set()
+            if not killed:
+                await asyncio.Future()
+            reaped = True
+            self.returncode = -9
+            return b"", b""
+
+        def kill(self):
+            nonlocal killed
+            killed = True
+
+    async def create_process(*args, **kwargs):
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    downloader = AssetDownloader(settings, ProxyManager())
+    try:
+        with tempfile.TemporaryFile() as video, tempfile.TemporaryFile() as audio:
+            task = asyncio.create_task(downloader._remux_copy(video, audio))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert killed and reaped
     finally:
         await downloader.close()
