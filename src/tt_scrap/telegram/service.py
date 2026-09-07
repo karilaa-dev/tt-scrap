@@ -149,7 +149,7 @@ class TelegramDeliveryService:
         self._pipeline_limit = asyncio.Semaphore(settings.telegram_pipeline_concurrency)
         self._upload_limit = asyncio.Semaphore(settings.telegram_upload_concurrency)
         self._thumbnail_wait_seconds = settings.telegram_thumbnail_wait_seconds
-        self._upload_max_bytes = settings.telegram_upload_max_bytes
+        self._upload_max_bytes = settings.telegram_upload_max_mb * 1024 * 1024
 
     @asynccontextmanager
     async def _upload_slot(self) -> AsyncIterator[None]:
