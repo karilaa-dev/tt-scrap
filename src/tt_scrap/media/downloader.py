@@ -22,7 +22,7 @@ from curl_cffi.requests.models import Response as CurlResponse
 
 from ..config import Settings
 from ..errors import AssetTooLargeError, NetworkError, UpstreamTimeoutError
-from ..logging import elapsed_ms, log_event
+from ..logging import bind_request_context, elapsed_ms, log_event, record_recovery
 from ..models import AssetFetchContext
 from ..proxy import ProxyChoice, ProxyManager
 
@@ -281,6 +281,7 @@ class AssetDownloader:
         Separate audio/video tracks still require a complete download and remux. Assets
         without a reliable Content-Length use the verified spool path as well.
         """
+        bind_request_context(platform=context.platform)
         if context.audio is not None:
             yield None
             return
@@ -302,6 +303,8 @@ class AssetDownloader:
             attempt_started_at = started_at
 
             for attempt in range(1, self.settings.download_max_retries + 1):
+                if attempt > 1:
+                    record_recovery("retry_count")
                 attempt_started_at = perf_counter()
                 try:
                     opened = await self._open_stream(
@@ -356,6 +359,20 @@ class AssetDownloader:
                         opened = None
                     last_error = exc
 
+                log_event(
+                    logger,
+                    "media.upstream_relay.failed",
+                    level=logging.DEBUG,
+                    message="Upstream media relay could not be opened",
+                    platform=context.platform,
+                    media_type=context.kind,
+                    attempt=attempt,
+                    proxy_used=proxy.url is not None,
+                    elapsed_ms=elapsed_ms(attempt_started_at),
+                    error_type=type(last_error).__name__,
+                    retrying=attempt < self.settings.download_max_retries,
+                    success=False,
+                )
                 if attempt < self.settings.download_max_retries:
                     if context.platform == "tiktok" and not self.settings.proxy_data_only:
                         proxy = self.proxy_manager.rotate(proxy)
@@ -426,6 +443,7 @@ class AssetDownloader:
                     log_event(
                         logger,
                         "media.upstream_relay.completed",
+                        level=logging.DEBUG,
                         message="Upstream media relayed to the delivery client",
                         platform=context.platform,
                         media_type=context.kind,
@@ -445,7 +463,7 @@ class AssetDownloader:
                     log_event(
                         logger,
                         "media.upstream_relay.failed",
-                        level=logging.WARNING,
+                        level=logging.DEBUG,
                         message="Upstream media relay failed during transfer",
                         platform=context.platform,
                         media_type=context.kind,
@@ -463,6 +481,7 @@ class AssetDownloader:
                     log_event(
                         logger,
                         "media.asset.completed",
+                        level=logging.DEBUG,
                         message="Media asset relayed without intermediate spooling",
                         platform=context.platform,
                         media_type=context.kind,
@@ -485,6 +504,7 @@ class AssetDownloader:
     async def download(
         self, context: AssetFetchContext, *, compute_sha256: bool = True, max_bytes: int = 0
     ) -> DownloadedAsset:
+        bind_request_context(platform=context.platform)
         started_at = perf_counter()
         budget = _DownloadBudget(self._size_limit(max_bytes))
         try:
@@ -505,7 +525,7 @@ class AssetDownloader:
             log_event(
                 logger,
                 "media.asset.failed",
-                level=logging.WARNING,
+                level=logging.DEBUG,
                 message="Media asset preparation failed",
                 platform=context.platform,
                 media_type=context.kind,
@@ -519,6 +539,7 @@ class AssetDownloader:
         log_event(
             logger,
             "media.asset.completed",
+            level=logging.DEBUG,
             message="Media asset prepared",
             platform=context.platform,
             media_type=context.kind,
@@ -545,6 +566,8 @@ class AssetDownloader:
         last_error: Exception | None = None
         upstream_urls = [context.upstream_url, *context.alternate_upstream_urls]
         for attempt in range(1, self.settings.download_max_retries + 1):
+            if attempt > 1:
+                record_recovery("retry_count")
             attempt_started_at = perf_counter()
             transfer_budget = _TransferBudget(budget)
             spool = tempfile.SpooledTemporaryFile(
@@ -580,6 +603,7 @@ class AssetDownloader:
                 log_event(
                     logger,
                     "media.upstream_download.completed",
+                    level=logging.DEBUG,
                     message="Upstream media download completed",
                     platform=context.platform,
                     media_type=context.kind,
@@ -601,7 +625,7 @@ class AssetDownloader:
                     log_event(
                         logger,
                         "media.upstream_download.failed",
-                        level=logging.WARNING,
+                        level=logging.DEBUG,
                         message="Upstream rejected the media download",
                         platform=context.platform,
                         media_type=context.kind,
@@ -629,7 +653,7 @@ class AssetDownloader:
                 log_event(
                     logger,
                     "media.upstream_download.failed",
-                    level=logging.WARNING,
+                    level=logging.DEBUG,
                     message="Upstream media download failed; retrying",
                     platform=context.platform,
                     media_type=context.kind,
@@ -644,7 +668,7 @@ class AssetDownloader:
         log_event(
             logger,
             "media.upstream_download.failed",
-            level=logging.WARNING,
+            level=logging.DEBUG,
             message="Upstream media download exhausted its attempts",
             platform=context.platform,
             media_type=context.kind,
@@ -710,7 +734,7 @@ class AssetDownloader:
                 log_event(
                     logger,
                     "media.separate_tracks.failed",
-                    level=logging.WARNING,
+                    level=logging.DEBUG,
                     message="Separate video and audio track downloads failed",
                     platform=context.platform,
                     elapsed_ms=elapsed_ms(download_started_at),
@@ -721,6 +745,7 @@ class AssetDownloader:
         log_event(
             logger,
             "media.separate_tracks.completed",
+            level=logging.DEBUG,
             message="Separate video and audio tracks downloaded",
             platform=context.platform,
             output_bytes=video_asset.size + audio_asset.size,
@@ -739,7 +764,7 @@ class AssetDownloader:
                 log_event(
                     logger,
                     "media.remux.failed",
-                    level=logging.WARNING,
+                    level=logging.DEBUG,
                     message="FFmpeg stream-copy remux failed",
                     platform=context.platform,
                     elapsed_ms=elapsed_ms(remux_started_at),
@@ -750,6 +775,7 @@ class AssetDownloader:
             log_event(
                 logger,
                 "media.remux.completed",
+                level=logging.DEBUG,
                 message="FFmpeg stream-copy remux completed",
                 platform=context.platform,
                 output_bytes=result.size,
@@ -769,6 +795,7 @@ class AssetDownloader:
             log_event(
                 logger,
                 "media.remux.queue_acquired",
+                level=logging.DEBUG,
                 message="FFmpeg remux worker acquired",
                 queue_wait_ms=elapsed_ms(queue_started_at),
                 success=True,

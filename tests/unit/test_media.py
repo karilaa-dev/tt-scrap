@@ -103,7 +103,9 @@ async def test_tiktok_relay_normalizes_curl_response_headers(settings, monkeypat
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_instagram_asset_retries_and_verifies(settings) -> None:
+async def test_instagram_asset_retries_and_verifies(
+    settings, log_records, request_log_context
+) -> None:
     route = respx.get("https://cdn.test/image").mock(
         side_effect=[
             Response(503),
@@ -132,19 +134,29 @@ async def test_instagram_asset_retries_and_verifies(settings) -> None:
     finally:
         await downloader.close()
 
+    assert request_log_context.retry_count == 1
+    assert all(record.levelno < 30 for record in log_records)
+
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_length_delimited_asset_can_be_relayed_without_spooling(settings) -> None:
+@pytest.mark.parametrize("retry", [False, True])
+async def test_length_delimited_asset_can_be_relayed_without_spooling(
+    settings, retry, request_log_context, log_records
+) -> None:
     payload = b"\x00\x00\x00\x18ftypisomstreamed-video"
     route = respx.get("https://cdn.test/video").mock(
-        return_value=Response(
-            200,
-            content=payload,
-            headers={"Content-Type": "video/mp4", "Content-Length": str(len(payload))},
-        )
+        side_effect=([Response(503)] if retry else [])
+        + [
+            Response(
+                200,
+                content=payload,
+                headers={"Content-Type": "video/mp4", "Content-Length": str(len(payload))},
+            )
+        ]
     )
     downloader = AssetDownloader(settings, ProxyManager())
+    log_records.clear()
     try:
         async with downloader.stream(
             AssetFetchContext(
@@ -157,10 +169,12 @@ async def test_length_delimited_asset_can_be_relayed_without_spooling(settings) 
             assert streamed is not None
             received = b"".join([chunk async for chunk in streamed.chunks])
 
-        assert route.call_count == 1
+        assert route.call_count == (2 if retry else 1)
         assert streamed.size == len(payload)
         assert streamed.content_type == "video/mp4"
         assert received == payload
+        assert request_log_context.retry_count == int(retry)
+        assert not log_records
     finally:
         await downloader.close()
 

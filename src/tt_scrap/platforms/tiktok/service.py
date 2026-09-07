@@ -24,7 +24,7 @@ from ...errors import (
     ScraperError,
     UpstreamTimeoutError,
 )
-from ...logging import elapsed_ms, log_event
+from ...logging import bind_request_context, elapsed_ms, log_event
 from ...models import (
     AssetDescriptor,
     AssetFetchContext,
@@ -370,6 +370,14 @@ class TikTokService:
         cache_hit: bool,
         cache_scope: str | None = None,
     ) -> None:
+        bind_request_context(
+            platform="tiktok",
+            source_id=response.source_id,
+            cache_hit=cache_hit,
+            cache_scope=cache_scope,
+            media_count=len(response.media),
+            media_type=response.content_type,
+        )
         log_event(
             logger,
             "tiktok.extraction.completed",
@@ -396,6 +404,12 @@ class TikTokService:
         cache_hit: bool,
         cache_scope: str | None = None,
     ) -> None:
+        bind_request_context(
+            platform="tiktok",
+            source_id=response.source_id,
+            cache_hit=cache_hit,
+            cache_scope=cache_scope,
+        )
         log_event(
             logger,
             "tiktok.resolution.completed",
@@ -630,10 +644,15 @@ class TikTokService:
             TikTokExtractionResponse,
         )
         if cached is None:
+            bind_request_context(
+                platform="tiktok",
+                cache_hit=False,
+                cache_scope="extraction_id",
+            )
             log_event(
                 logger,
                 "tiktok.extraction_cache.lookup",
-                level=logging.WARNING,
+                level=logging.DEBUG,
                 message="TikTok extraction cache lookup missed",
                 platform="tiktok",
                 cache_hit=False,
@@ -642,9 +661,17 @@ class TikTokService:
                 success=False,
             )
             raise ExtractionExpiredError("TikTok extraction was not found or has expired")
+        bind_request_context(
+            platform="tiktok",
+            source_id=cached.source_id,
+            cache_hit=True,
+            cache_scope="extraction_id",
+            media_count=len(cached.media),
+        )
         log_event(
             logger,
             "tiktok.extraction_cache.lookup",
+            level=logging.DEBUG,
             message="TikTok extraction cache lookup completed",
             platform="tiktok",
             source_id=cached.source_id,
@@ -661,9 +688,16 @@ class TikTokService:
         cached = await self.cache.get_model(
             self.cache.metadata_key("tiktok", str(video_id)), TikTokExtractionResponse
         )
+        bind_request_context(
+            platform="tiktok",
+            source_id=str(video_id),
+            cache_hit=cached is not None,
+            cache_scope="video_id",
+        )
         log_event(
             logger,
             "tiktok.video_cache.lookup",
+            level=logging.DEBUG,
             message="TikTok video cache lookup completed",
             platform="tiktok",
             source_id=str(video_id),
@@ -719,7 +753,7 @@ class TikTokService:
                 log_event(
                     logger,
                     "tiktok.normalization.failed",
-                    level=logging.WARNING,
+                    level=logging.DEBUG,
                     platform="tiktok",
                     source_id=video_id,
                     failure_reason="empty_slideshow",
@@ -735,7 +769,7 @@ class TikTokService:
                 log_event(
                     logger,
                     "tiktok.normalization.failed",
-                    level=logging.WARNING,
+                    level=logging.DEBUG,
                     platform="tiktok",
                     source_id=video_id,
                     failure_reason="missing_video_asset",
@@ -751,9 +785,14 @@ class TikTokService:
                 raise ContentTooLongError("TikTok video exceeds MAX_VIDEO_DURATION")
             width = video_source.width
             height = video_source.height
+            bind_request_context(
+                platform="tiktok",
+                source_id=video_id,
+            )
             log_event(
                 logger,
                 "tiktok.video_selection.completed",
+                level=logging.DEBUG,
                 message="TikTok video quality selection completed",
                 platform="tiktok",
                 source_id=video_id,
@@ -861,6 +900,12 @@ class TikTokService:
         if not refresh:
             cached = await self.cache.get_model(cache_key, TikTokMusicResponse)
             if cached:
+                bind_request_context(
+                    platform="tiktok",
+                    source_id=identity,
+                    cache_hit=True,
+                    cache_scope="video_id",
+                )
                 log_event(
                     logger,
                     "tiktok.music_extraction.completed",
@@ -877,6 +922,12 @@ class TikTokService:
             if not refresh:
                 cached = await self.cache.get_model(cache_key, TikTokMusicResponse)
                 if cached:
+                    bind_request_context(
+                        platform="tiktok",
+                        source_id=identity,
+                        cache_hit=True,
+                        cache_scope="video_id_coalesced",
+                    )
                     log_event(
                         logger,
                         "tiktok.music_extraction.completed",
@@ -938,6 +989,12 @@ class TikTokService:
                 cache_key,
                 response,
                 ttl_seconds=self.settings.tiktok_info_cache_ttl_seconds,
+            )
+            bind_request_context(
+                platform="tiktok",
+                source_id=identity,
+                cache_hit=False,
+                cache_scope=None,
             )
             log_event(
                 logger,

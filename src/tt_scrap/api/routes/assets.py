@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
+from ...logging import bind_request_context
 from ...media.downloader import filename_for_type
 from ..dependencies import require_api_key
 from ..responses import AUTHENTICATED_RESPONSES
@@ -83,6 +84,7 @@ async def get_asset(token: str, request: Request) -> StreamingResponse:
     before responding, so the downloaded video is playable and contains audio.
     """
     context = await request.app.state.cache.get_asset(token)
+    bind_request_context(platform=context.platform, media_type=context.kind)
     downloaded = await request.app.state.asset_downloader.download(context)
     filename = filename_for_type(context.filename, downloaded.content_type)
     if downloaded.sha256 is None:

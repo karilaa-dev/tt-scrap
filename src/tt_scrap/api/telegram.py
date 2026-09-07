@@ -5,12 +5,14 @@ from __future__ import annotations
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
 
+from ..logging import bind_request_context
 from ..models import TelegramDeliveryRecord, TelegramMultiDeliveryResponse
 from ..telegram import TelegramDeliveryOutcome
 
 
 def telegram_delivery_response(outcome: TelegramDeliveryOutcome) -> Response:
     """Preserve one Telegram call verbatim or wrap ordered multi-batch results."""
+    bind_request_context(**outcome.log_fields())
     if len(outcome.calls) == 1:
         call = outcome.calls[0]
         return Response(

@@ -71,8 +71,11 @@ def test_video_url_fallback() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolution_returns_post_id_without_extraction_and_is_cached(settings) -> None:
+async def test_resolution_returns_post_id_without_extraction_and_is_cached(
+    settings, log_records, request_log_context
+) -> None:
     service, _cache = make_service(settings, {})
+    log_records.clear()
     short_url = "https://www.tiktok.com/t/EXAMPLE/"
 
     first = await service.resolve_url(short_url)
@@ -84,6 +87,9 @@ async def test_resolution_returns_post_id_without_extraction_and_is_cached(setti
     assert first.resolved_url == "https://www.tiktok.com/@creator/video/123"
     assert service.adapter.resolve_calls == 1
     assert service.adapter.calls == 0
+
+    assert [record.event for record in log_records] == ["tiktok.resolution.completed"] * 2
+    assert all(record.levelno < 30 for record in log_records)
 
 
 @pytest.mark.asyncio

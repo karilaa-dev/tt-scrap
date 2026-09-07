@@ -18,7 +18,14 @@ from .api.routes import assets, health, instagram, tiktok
 from .cache import CacheStore
 from .config import Settings, get_settings
 from .errors import ScraperError
-from .logging import configure_logging, elapsed_ms, log_event, request_id_var
+from .logging import (
+    RequestLogContext,
+    configure_logging,
+    elapsed_ms,
+    log_event,
+    request_id_var,
+    request_log_var,
+)
 from .media import AssetDownloader
 from .media.images import ImagePreparationService
 from .models import ErrorDetail, ErrorResponse
@@ -201,11 +208,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request_id = supplied_request_id[:128] if supplied_request_id else str(uuid4())
         request.state.request_id = request_id
         token = request_id_var.set(request_id)
+        context = RequestLogContext()
+        request.state.log_context = context
+        context_token = request_log_var.set(context)
         started_at = perf_counter()
         status_code = 500
         response_bytes: int | None = None
+        unexpected: Exception | None = None
         try:
-            response = await call_next(request)
+            try:
+                response = await call_next(request)
+            except Exception as exc:
+                unexpected = exc
+                context.update(error_code="internal_error", error_type=type(exc).__name__)
+                response = _error_response(
+                    500, "internal_error", "Internal server error", request_id
+                )
             status_code = response.status_code
             elapsed = elapsed_ms(started_at)
             response.headers["X-Request-ID"] = request_id
@@ -223,30 +241,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if route_path.startswith("/v1/assets/"):
                     route_path = "/v1/assets/{token}"
                 route_path = route_path[:256]
-            log_event(
-                logger,
-                "http.request.completed",
-                http_method=request.method,
-                path=route_path,
-                operation=operation if isinstance(operation, str) else None,
-                status_code=status_code,
-                response_bytes=response_bytes,
-                elapsed_ms=elapsed_ms(started_at),
-                success=status_code < 400,
-            )
-            request_id_var.reset(token)
+            fields = context.summary()
+            for platform in ("tiktok", "instagram"):
+                if route_path.startswith(f"/v1/{platform}/"):
+                    fields.setdefault("platform", platform)
+            outcome_success = fields.pop("success", True)
+            success = status_code < 400 and outcome_success
+            if status_code >= 500:
+                level = logging.ERROR
+            elif not success:
+                level = logging.WARNING
+            elif route_path in {"/health/live", "/health/ready"}:
+                level = logging.DEBUG
+            else:
+                level = logging.INFO
+            try:
+                log_event(
+                    logger,
+                    "http.request.completed",
+                    level=level,
+                    message="Request completed" if success else "Request failed",
+                    http_method=request.method,
+                    path=route_path,
+                    operation=operation if isinstance(operation, str) else None,
+                    status_code=status_code,
+                    response_bytes=response_bytes,
+                    elapsed_ms=elapsed_ms(started_at),
+                    success=success,
+                    exc_info=unexpected,
+                    **fields,
+                )
+            finally:
+                request_log_var.reset(context_token)
+                request_id_var.reset(token)
 
     @app.exception_handler(ScraperError)
     async def scraper_error_handler(request: Request, exc: ScraperError) -> JSONResponse:
         request_id = getattr(request.state, "request_id", "-")
-        log_event(
-            logger,
-            "http.request.error",
-            level=logging.WARNING,
-            message="Request failed with a known application error",
+        request.state.log_context.update(
             error_code=exc.code,
             error_type=type(exc).__name__,
-            status_code=exc.status_code,
         )
         return _error_response(exc.status_code, exc.code, str(exc), request_id)
 
@@ -255,28 +289,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
         request_id = getattr(request.state, "request_id", "-")
-        log_event(
-            logger,
-            "http.request.validation_error",
-            level=logging.WARNING,
-            message="Request validation failed",
+        request.state.log_context.update(
             error_code="validation_error",
             error_type=type(exc).__name__,
-            status_code=422,
         )
         return _error_response(422, "validation_error", "Request validation failed", request_id)
 
     @app.exception_handler(Exception)
     async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
         request_id = getattr(request.state, "request_id", "-")
-        logger.exception(
-            "Unhandled request error",
-            extra={
-                "event": "http.request.unhandled_error",
-                "error_code": "internal_error",
-                "error_type": type(exc).__name__,
-                "status_code": 500,
-            },
+        # Pre-response exceptions are handled by request_context. This fallback
+        # covers streaming failures, after that middleware has reset its context.
+        log_event(
+            logger,
+            "http.request.unhandled_error",
+            level=logging.ERROR,
+            message="Unhandled error after response preparation",
+            request_id=request_id,
+            exc_info=exc,
+            error_code="internal_error",
+            error_type=type(exc).__name__,
+            status_code=500,
         )
         return _error_response(500, "internal_error", "Internal server error", request_id)
 
