@@ -647,6 +647,63 @@ async def test_concurrent_failed_extractions_share_failure_but_later_request_can
 
 
 @pytest.mark.asyncio
+async def test_new_resolution_retries_while_failed_waiters_are_draining(settings):
+    from tt_scrap.errors import ExtractionError
+
+    service, _cache = make_service(settings, {})
+    short_url = "https://vt.tiktok.com/RETRY/"
+    started = asyncio.Event()
+    release_failure = asyncio.Event()
+    retry_started = asyncio.Event()
+    release_retry = asyncio.Event()
+    calls = 0
+
+    async def resolve(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await release_failure.wait()
+            raise ExtractionError("transient failure")
+        retry_started.set()
+        await release_retry.wait()
+        return "https://www.tiktok.com/@creator/video/123"
+
+    service.adapter.resolve_url = resolve
+    leader = asyncio.create_task(service.resolve_url(short_url))
+    tasks = [leader]
+    try:
+        await started.wait()
+        waiters = [asyncio.create_task(service.resolve_url(short_url)) for _ in range(20)]
+        tasks.extend(waiters)
+        await asyncio.sleep(0)
+        release_failure.set()
+        with pytest.raises(ExtractionError):
+            await leader
+        assert any(not waiter.done() for waiter in waiters)
+
+        retry = asyncio.create_task(service.resolve_url(short_url))
+        tasks.append(retry)
+        results = await asyncio.gather(*waiters, return_exceptions=True)
+        assert all(isinstance(result, ExtractionError) for result in results)
+        await asyncio.wait_for(retry_started.wait(), timeout=1)
+
+        # Draining the old group must not remove the active retry's state.
+        joined_retry = asyncio.create_task(service.resolve_url(short_url))
+        tasks.append(joined_retry)
+        await asyncio.sleep(0)
+        assert calls == 2
+        release_retry.set()
+        assert await retry == await joined_retry
+        assert not service._key_locks
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_refresh_does_not_reuse_stale_cache_rewritten_by_joined_request(settings) -> None:
     payload = {
         "video": {
@@ -666,9 +723,9 @@ async def test_refresh_does_not_reuse_stale_cache_rewritten_by_joined_request(se
         refresh_task = asyncio.create_task(service.extract_url(joined_url, refresh=True))
         for _ in range(10):
             await asyncio.sleep(0)
-            if service._key_locks[joined_key][1] == 2:
+            if service._key_locks[joined_key].users == 2:
                 break
-        assert service._key_locks[joined_key][1] == 2
+        assert service._key_locks[joined_key].users == 2
         await cache.set_model(
             joined_key,
             stale.model_copy(update={"source_url": joined_url}),
