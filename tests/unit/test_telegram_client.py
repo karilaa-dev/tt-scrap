@@ -100,16 +100,20 @@ async def test_client_rejects_oversized_upload_before_calling_telegram(settings)
             update={
                 "telegram_bot_token": SecretStr("runtime-secret"),
                 "telegram_api_base_url": f"http://127.0.0.1:{port}",
-                "telegram_upload_max_bytes": 4,
+                "telegram_upload_max_mb": 1,
             }
         )
     )
     try:
-        with pytest.raises(AssetTooLargeError):
+        with pytest.raises(AssetTooLargeError, match="TELEGRAM_UPLOAD_MAX_MB"):
             await client.call(
                 "sendVideo",
                 {"chat_id": 123, "video": "attach://video_file"},
-                [TelegramUpload("video_file", io.BytesIO(b"video"), "video.mp4", "video/mp4")],
+                [
+                    TelegramUpload(
+                        "video_file", io.BytesIO(b"v" * (1024 * 1024 + 1)), "video.mp4", "video/mp4"
+                    )
+                ],
             )
     finally:
         await client.close()

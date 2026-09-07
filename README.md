@@ -66,10 +66,15 @@ are:
 | `TELEGRAM_PIPELINE_CONCURRENCY` | Maximum concurrent extraction/preparation pipelines; default 32 |
 | `TELEGRAM_UPLOAD_CONCURRENCY` | Maximum concurrent Telegram API uploads; default 20 |
 | `TELEGRAM_UPLOAD_TIMEOUT_SECONDS` | Per Telegram upload timeout; default 600 seconds |
-| `TELEGRAM_UPLOAD_MAX_BYTES` | Per-file Telegram upload limit; default 50 MiB, zero disables it for a local Bot API server |
+| `TELEGRAM_UPLOAD_MAX_MB` | Per-file Telegram upload limit in MiB; default 50, zero disables it for a local Bot API server |
 | `TELEGRAM_THUMBNAIL_WAIT_SECONDS` | Optional cover budget, overlapping media preparation; default 1.5 seconds, zero skips covers |
 | `MAX_VIDEO_DURATION` | Maximum duration in seconds; zero disables it |
 | `MAX_ASSET_BYTES` | Maximum downloaded size; zero disables it |
+
+Set `TELEGRAM_UPLOAD_MAX_MB=100` to allow files up to 100 MiB when your custom
+`TELEGRAM_API_BASE_URL` supports that size. Each MB here is 1,048,576 bytes,
+preserving the existing default of 52,428,800 bytes. Restart the service after
+changing it.
 
 `IMAGE_CONVERSION_WORKERS=0` is automatic: the service uses the logical CPUs
 available to its process minus one, with a minimum of one worker. A positive value

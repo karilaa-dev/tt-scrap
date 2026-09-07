@@ -107,7 +107,7 @@ class TelegramClient:
     def __init__(self, settings: Settings) -> None:
         self._token = settings.telegram_bot_token.get_secret_value()
         self._base_url = settings.telegram_api_base_url
-        self._upload_max_bytes = settings.telegram_upload_max_bytes
+        self._upload_max_bytes = settings.telegram_upload_max_mb * 1024 * 1024
         timeout = aiohttp.ClientTimeout(
             total=settings.telegram_upload_timeout_seconds,
             connect=min(30.0, settings.telegram_upload_timeout_seconds),
@@ -158,7 +158,7 @@ class TelegramClient:
                 error_type="AssetTooLargeError",
                 elapsed_ms=elapsed_ms(started_at),
             )
-            raise AssetTooLargeError("Telegram upload exceeds TELEGRAM_UPLOAD_MAX_BYTES")
+            raise AssetTooLargeError("Telegram upload exceeds TELEGRAM_UPLOAD_MAX_MB")
         form = aiohttp.FormData(quote_fields=False)
         for name, value in fields.items():
             if value is not None:
