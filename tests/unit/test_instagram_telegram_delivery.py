@@ -25,7 +25,7 @@ class FakeDownloader:
         self.calls: list[str] = []
 
     async def download(
-        self, context: AssetFetchContext, *, compute_sha256: bool = True
+        self, context: AssetFetchContext, *, compute_sha256: bool = True, max_bytes: int = 0
     ) -> DownloadedAsset:
         assert not compute_sha256
         self.calls.append(context.upstream_url)

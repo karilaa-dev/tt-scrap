@@ -8,7 +8,7 @@ import logging
 import math
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
 from typing import Any, Literal
@@ -17,7 +17,13 @@ from uuid import uuid4
 from ...assets import AssetFactory
 from ...cache import CacheStore
 from ...config import Settings
-from ...errors import ContentTooLongError, ExtractionError, ExtractionExpiredError
+from ...errors import (
+    ContentTooLongError,
+    ExtractionError,
+    ExtractionExpiredError,
+    ScraperError,
+    UpstreamTimeoutError,
+)
 from ...logging import elapsed_ms, log_event
 from ...models import (
     AssetDescriptor,
@@ -278,6 +284,14 @@ def extract_video_url(video: dict[str, Any]) -> str | None:
     return source.url if source else None
 
 
+@dataclass
+class _KeyRequestGroup:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+    fresh_generation: int | None = None
+    failure: ScraperError | None = None
+
+
 class TikTokService:
     def __init__(
         self,
@@ -291,7 +305,7 @@ class TikTokService:
         self.adapter = TikTokAdapter(settings, proxy_manager)
         self.proxy_manager = proxy_manager
         self._key_lock_guard = asyncio.Lock()
-        self._key_locks: dict[str, tuple[asyncio.Lock, int, int | None]] = {}
+        self._key_locks: dict[str, _KeyRequestGroup] = {}
 
     def _ensure_key_locks(self) -> None:
         # A few unit tests construct the service without __init__ to inject a
@@ -305,39 +319,45 @@ class TikTokService:
         self._ensure_key_locks()
         async with self._key_lock_guard:
             state = self._key_locks.get(key)
-            return state[2] if state is not None else None
+            return state.fresh_generation if state is not None else None
 
     async def _mark_key_fresh(self, key: str) -> None:
         """Record that the current lock holder completed real provider work."""
         async with self._key_lock_guard:
-            lock, users, generation = self._key_locks[key]
-            self._key_locks[key] = (
-                lock,
-                users,
-                0 if generation is None else generation + 1,
+            group = self._key_locks[key]
+            group.fresh_generation = (
+                0 if group.fresh_generation is None else group.fresh_generation + 1
             )
 
     @asynccontextmanager
     async def _key_lock(self, key: str) -> AsyncIterator[bool]:
         self._ensure_key_locks()
         async with self._key_lock_guard:
-            lock, users, fresh_generation = self._key_locks.get(key, (asyncio.Lock(), 0, None))
-            joined = users > 0
-            self._key_locks[key] = (lock, users + 1, fresh_generation)
+            group = self._key_locks.get(key)
+            if group is None or group.failure is not None:
+                # Failed groups keep only their existing callers. Later arrivals
+                # can retry immediately, even while those callers are draining.
+                group = _KeyRequestGroup()
+                self._key_locks[key] = group
+            joined = group.users > 0
+            group.users += 1
         acquired = False
         try:
-            await lock.acquire()
+            await group.lock.acquire()
             acquired = True
+            if group.failure is not None:
+                raise group.failure
             yield joined
+        except ScraperError as exc:
+            group.failure = exc
+            raise
         finally:
             if acquired:
-                lock.release()
+                group.lock.release()
             async with self._key_lock_guard:
-                current, users, fresh_generation = self._key_locks[key]
-                if users == 1:
+                group.users -= 1
+                if group.users == 0 and self._key_locks.get(key) is group:
                     del self._key_locks[key]
-                else:
-                    self._key_locks[key] = (current, users - 1, fresh_generation)
 
     def _expires_at(self) -> datetime:
         return datetime.now(UTC) + timedelta(seconds=self.settings.cache_ttl_seconds)
@@ -395,6 +415,16 @@ class TikTokService:
     async def resolve_url(
         self, source_url: str, *, refresh: bool = False
     ) -> TikTokResolutionResponse:
+        # Include duplicate-request lock waits in the caller's resolution budget.
+        try:
+            async with asyncio.timeout(self.settings.url_resolve_timeout_seconds):
+                return await self._resolve_url(source_url, refresh=refresh)
+        except TimeoutError as exc:
+            raise UpstreamTimeoutError("TikTok URL resolution deadline exceeded") from exc
+
+    async def _resolve_url(
+        self, source_url: str, *, refresh: bool = False
+    ) -> TikTokResolutionResponse:
         """Resolve a share URL and return its post ID without extracting metadata."""
         started_at = perf_counter()
         source_url = source_url.strip()
@@ -434,7 +464,7 @@ class TikTokService:
             await self.cache.set_model(
                 cache_key,
                 response,
-                ttl_seconds=self.settings.tiktok_info_cache_ttl_seconds,
+                ttl_seconds=self.settings.tiktok_resolution_cache_ttl_seconds,
             )
             await self._mark_key_fresh(cache_key)
             self._log_resolution(response, started_at, cache_hit=False)
@@ -686,6 +716,15 @@ class TikTokService:
                         )
                     )
             if not media:
+                log_event(
+                    logger,
+                    "tiktok.normalization.failed",
+                    level=logging.WARNING,
+                    platform="tiktok",
+                    source_id=video_id,
+                    failure_reason="empty_slideshow",
+                    success=False,
+                )
                 raise ExtractionError("TikTok slideshow has no image assets")
             content_type: Literal["video", "slideshow"] = "slideshow"
         else:
@@ -693,6 +732,15 @@ class TikTokService:
             selection_started_at = perf_counter()
             video_source = select_video_source(video)
             if not video_source:
+                log_event(
+                    logger,
+                    "tiktok.normalization.failed",
+                    level=logging.WARNING,
+                    platform="tiktok",
+                    source_id=video_id,
+                    failure_reason="missing_video_asset",
+                    success=False,
+                )
                 raise ExtractionError("TikTok response has no video asset")
             duration = int(video["duration"]) if video.get("duration") else None
             if (

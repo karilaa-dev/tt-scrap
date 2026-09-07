@@ -9,7 +9,7 @@ import random
 import tempfile
 import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass
 from functools import partial
 from time import perf_counter
@@ -119,6 +119,31 @@ class _RetryableDownload(Exception):
     pass
 
 
+@dataclass(slots=True)
+class _DownloadBudget:
+    limit: int
+    reserved: int = 0
+
+
+@dataclass(slots=True)
+class _TransferBudget:
+    """Reserve declared or received bytes across concurrent tracks of one asset."""
+
+    parent: _DownloadBudget
+    reserved: int = 0
+
+    def reserve(self, size: int) -> None:
+        increase = max(0, size - self.reserved)
+        if self.parent.limit and self.parent.reserved + increase > self.parent.limit:
+            raise AssetTooLargeError("Asset exceeds the download size limit")
+        self.parent.reserved += increase
+        self.reserved += increase
+
+    def release(self) -> None:
+        self.parent.reserved -= self.reserved
+        self.reserved = 0
+
+
 async def _close_curl_response(response: CurlResponse) -> None:
     """Stop an unfinished stream and let its task release the curl handle once."""
     if response.quit_now is not None:
@@ -147,6 +172,12 @@ class AssetDownloader:
         self._group_lock = asyncio.Lock()
         self._group_limits: dict[str, tuple[asyncio.Semaphore, int]] = {}
 
+    def _size_limit(self, max_bytes: int) -> int:
+        return min(
+            (limit for limit in (max_bytes, self.settings.max_asset_bytes) if limit > 0),
+            default=0,
+        )
+
     @asynccontextmanager
     async def _group_limit(self, extraction_id: str | None) -> AsyncIterator[None]:
         if extraction_id is None:
@@ -158,11 +189,14 @@ class AssetDownloader:
                 (asyncio.Semaphore(self.settings.slideshow_concurrency), 0),
             )
             self._group_limits[extraction_id] = (semaphore, active + 1)
-        await semaphore.acquire()
+        acquired = False
         try:
+            await semaphore.acquire()
+            acquired = True
             yield
         finally:
-            semaphore.release()
+            if acquired:
+                semaphore.release()
             async with self._group_lock:
                 current, active = self._group_limits[extraction_id]
                 if active == 1:
@@ -239,7 +273,9 @@ class AssetDownloader:
         )
 
     @asynccontextmanager
-    async def stream(self, context: AssetFetchContext) -> AsyncIterator[StreamedAsset | None]:
+    async def stream(
+        self, context: AssetFetchContext, *, max_bytes: int = 0
+    ) -> AsyncIterator[StreamedAsset | None]:
         """Relay an unmodified, length-delimited asset without first spooling it.
 
         Separate audio/video tracks still require a complete download and remux. Assets
@@ -249,6 +285,7 @@ class AssetDownloader:
             yield None
             return
 
+        size_limit = self._size_limit(max_bytes)
         started_at = perf_counter()
         async with AsyncExitStack() as opening_limits:
             await opening_limits.enter_async_context(self._semaphore)
@@ -286,11 +323,8 @@ class AssetDownloader:
                     expected_length = int(length)
                     if expected_length <= 0:
                         raise _RetryableDownload("Upstream returned an empty asset")
-                    if (
-                        self.settings.max_asset_bytes
-                        and expected_length > self.settings.max_asset_bytes
-                    ):
-                        raise AssetTooLargeError("Asset exceeds MAX_ASSET_BYTES")
+                    if size_limit and expected_length > size_limit:
+                        raise AssetTooLargeError("Asset exceeds the download size limit")
                     async for candidate in opened.chunks:
                         if candidate:
                             first_chunk = candidate
@@ -449,16 +483,24 @@ class AssetDownloader:
                 await opened.close()
 
     async def download(
-        self, context: AssetFetchContext, *, compute_sha256: bool = True
+        self, context: AssetFetchContext, *, compute_sha256: bool = True, max_bytes: int = 0
     ) -> DownloadedAsset:
         started_at = perf_counter()
+        budget = _DownloadBudget(self._size_limit(max_bytes))
         try:
             async with self._semaphore, self._group_limit(context.extraction_id):
                 queue_wait = elapsed_ms(started_at)
                 if context.audio:
-                    result = await self._download_and_remux(context, compute_sha256=compute_sha256)
+                    result = await self._download_and_remux(
+                        context, compute_sha256=compute_sha256, budget=budget
+                    )
                 else:
-                    result = await self._download_single(context, compute_sha256=compute_sha256)
+                    result = await self._download_single(
+                        context, compute_sha256=compute_sha256, budget=budget
+                    )
+                if budget.limit and result.size > budget.limit:
+                    result.file.close()
+                    raise AssetTooLargeError("Prepared asset exceeds the download size limit")
         except Exception as exc:
             log_event(
                 logger,
@@ -491,13 +533,20 @@ class AssetDownloader:
         return result
 
     async def _download_single(
-        self, context: AssetFetchContext, *, compute_sha256: bool = True
+        self,
+        context: AssetFetchContext,
+        *,
+        compute_sha256: bool = True,
+        budget: _DownloadBudget | None = None,
     ) -> DownloadedAsset:
+        if budget is None:
+            budget = _DownloadBudget(self._size_limit(0))
         proxy = self._initial_proxy(context)
         last_error: Exception | None = None
         upstream_urls = [context.upstream_url, *context.alternate_upstream_urls]
         for attempt in range(1, self.settings.download_max_retries + 1):
             attempt_started_at = perf_counter()
+            transfer_budget = _TransferBudget(budget)
             spool = tempfile.SpooledTemporaryFile(
                 max_size=self.settings.spool_threshold_bytes, mode="w+b"
             )
@@ -511,6 +560,7 @@ class AssetDownloader:
                         binary_spool,
                         upstream_urls[(attempt - 1) % len(upstream_urls)],
                         compute_sha256=compute_sha256,
+                        budget=transfer_budget,
                     )
                 if size == 0:
                     raise _RetryableDownload("Upstream returned an empty asset")
@@ -569,6 +619,7 @@ class AssetDownloader:
                 last_error = exc
             finally:
                 if not retain_spool:
+                    transfer_budget.release()
                     spool.close()
             if attempt < self.settings.download_max_retries:
                 if context.platform == "tiktok" and not self.settings.proxy_data_only:
@@ -611,11 +662,19 @@ class AssetDownloader:
         ) from last_error
 
     async def _download_and_remux(
-        self, context: AssetFetchContext, *, compute_sha256: bool
+        self,
+        context: AssetFetchContext,
+        *,
+        compute_sha256: bool,
+        budget: _DownloadBudget | None = None,
     ) -> DownloadedAsset:
+        if budget is None:
+            budget = _DownloadBudget(self._size_limit(0))
         audio = context.audio
         if audio is None:
-            return await self._download_single(context, compute_sha256=compute_sha256)
+            return await self._download_single(
+                context, compute_sha256=compute_sha256, budget=budget
+            )
         video_context = context.model_copy(update={"audio": None})
         audio_context = AssetFetchContext(
             platform=context.platform,
@@ -630,8 +689,12 @@ class AssetDownloader:
             extraction_id=context.extraction_id,
         )
         tasks = [
-            asyncio.create_task(self._download_single(video_context, compute_sha256=False)),
-            asyncio.create_task(self._download_single(audio_context, compute_sha256=False)),
+            asyncio.create_task(
+                self._download_single(video_context, compute_sha256=False, budget=budget)
+            ),
+            asyncio.create_task(
+                self._download_single(audio_context, compute_sha256=False, budget=budget)
+            ),
         ]
         download_started_at = perf_counter()
         try:
@@ -665,11 +728,8 @@ class AssetDownloader:
             success=True,
         )
         try:
-            if (
-                self.settings.max_asset_bytes
-                and video_asset.size + audio_asset.size > self.settings.max_asset_bytes
-            ):
-                raise AssetTooLargeError("Remuxed asset exceeds MAX_ASSET_BYTES")
+            if budget.limit and video_asset.size + audio_asset.size > budget.limit:
+                raise AssetTooLargeError("Combined tracks exceed the download size limit")
             remux_started_at = perf_counter()
             try:
                 result = await self._remux_copy(
@@ -758,11 +818,17 @@ class AssetDownloader:
                     process.communicate(),
                     timeout=self.settings.upstream_download_timeout_seconds,
                 )
-            except TimeoutError as exc:
-                process.kill()
-                await process.communicate()
-                output.close()
-                raise UpstreamTimeoutError("Media remux timed out") from exc
+            except BaseException as exc:
+                try:
+                    if process.returncode is None:
+                        with suppress(ProcessLookupError):
+                            process.kill()
+                    await process.communicate()
+                finally:
+                    output.close()
+                if isinstance(exc, TimeoutError):
+                    raise UpstreamTimeoutError("Media remux timed out") from exc
+                raise
             if process.returncode != 0:
                 output.close()
                 detail = stderr.decode("utf-8", "replace").strip().splitlines()
@@ -807,12 +873,20 @@ class AssetDownloader:
         upstream_url: str,
         *,
         compute_sha256: bool,
+        budget: _TransferBudget | None = None,
     ) -> tuple[str | None, int | None, str | None, int, bytes]:
         headers = self._request_headers(context)
         digest = hashlib.sha256() if compute_sha256 else None
         prefix = bytearray()
         size = 0
         disk_backed = False
+        if budget is None:
+            budget = _TransferBudget(_DownloadBudget(self._size_limit(0)))
+
+        def reserve_length(length: str | None) -> str | None:
+            if length and length.isdigit():
+                budget.reserve(int(length))
+            return length
 
         async def consume(chunks: object) -> None:
             nonlocal disk_backed, size
@@ -820,8 +894,7 @@ class AssetDownloader:
                 if not chunk:
                     continue
                 size += len(chunk)
-                if self.settings.max_asset_bytes and size > self.settings.max_asset_bytes:
-                    raise AssetTooLargeError("Asset exceeds MAX_ASSET_BYTES")
+                budget.reserve(size)
                 if len(prefix) < 32:
                     prefix.extend(chunk[: 32 - len(prefix)])
                 if digest is not None:
@@ -847,11 +920,11 @@ class AssetDownloader:
                     if curl_response.status_code in _RETRYABLE_STATUSES:
                         raise _RetryableDownload(f"Retryable HTTP {curl_response.status_code}")
                     raise NetworkError(f"Upstream asset returned HTTP {curl_response.status_code}")
+                length = reserve_length(curl_response.headers.get("content-length"))
                 await consume(curl_response.aiter_content(self.settings.download_chunk_bytes))
                 declared = (
                     curl_response.headers.get("content-type") or context.declared_content_type
                 )
-                length = curl_response.headers.get("content-length")
             finally:
                 if curl_response is not None:
                     await _close_curl_response(curl_response)
@@ -861,11 +934,11 @@ class AssetDownloader:
                     if http_response.status_code in _RETRYABLE_STATUSES:
                         raise _RetryableDownload(f"Retryable HTTP {http_response.status_code}")
                     raise NetworkError(f"Upstream asset returned HTTP {http_response.status_code}")
+                length = reserve_length(http_response.headers.get("content-length"))
                 await consume(http_response.aiter_bytes(self.settings.download_chunk_bytes))
                 declared = (
                     http_response.headers.get("content-type") or context.declared_content_type
                 )
-                length = http_response.headers.get("content-length")
         expected = int(length) if length and length.isdigit() else None
         return (
             declared,
