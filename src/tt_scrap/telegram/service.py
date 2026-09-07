@@ -19,7 +19,7 @@ from ..errors import (
     ImageConversionError,
     TelegramParameterError,
 )
-from ..logging import elapsed_ms, log_event
+from ..logging import bind_request_context, elapsed_ms, log_event, record_recovery
 from ..media import AssetDownloader, DownloadedAsset, ImagePreparationService, StreamedAsset
 from ..media.downloader import filename_for_type
 from ..media.images import detect_image_format, is_native_telegram_photo
@@ -36,7 +36,7 @@ from ..models import (
 )
 from ..platforms.instagram import InstagramService
 from ..platforms.tiktok import TikTokService
-from .client import TelegramCallResponse, TelegramClient, TelegramUpload
+from .client import TelegramCallResponse, TelegramClient, TelegramUpload, _telegram_error_details
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,31 @@ _KNOWN_TELEGRAM_FIELDS = set(TelegramParameters.model_fields)
 @dataclass(frozen=True, slots=True)
 class TelegramDeliveryOutcome:
     calls: list[TelegramCallResponse]
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.calls) and all(call.ok for call in self.calls)
+
+    @property
+    def partial(self) -> bool:
+        return not self.ok and any(call.ok for call in self.calls)
+
+    def log_fields(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {
+            "success": self.ok,
+            "partial": self.partial,
+            "call_count": len(self.calls),
+        }
+        for index, call in enumerate(self.calls, start=1):
+            if not call.ok:
+                fields.update(
+                    telegram_method=call.method,
+                    **_telegram_error_details(call.body),
+                )
+                if call.method == "sendMediaGroup":
+                    fields["batch_index"] = index
+                break
+        return fields
 
 
 @dataclass(slots=True)
@@ -162,18 +187,21 @@ class TelegramDeliveryService:
         fields: dict[str, Any],
         uploads: list[TelegramUpload],
     ) -> TelegramCallResponse:
+        bind_request_context(telegram_method=method)
         async with self._upload_slot():
             return await self._client.call(method, fields, uploads)
 
     async def deliver(self, request: TikTokTelegramDeliveryRequest) -> TelegramDeliveryOutcome:
-        if not self._client.configured:
-            raise ConfigurationError("Telegram delivery is not configured")
+        bind_request_context(platform="tiktok", delivery=request.delivery)
         started_at = perf_counter()
         source_kind = next(
             name
             for name in ("extraction_id", "url", "video_id")
             if getattr(request.source, name) is not None
         )
+        bind_request_context(source_kind=source_kind)
+        if not self._client.configured:
+            raise ConfigurationError("Telegram delivery is not configured")
         try:
             async with self._pipeline_limit:
                 queue_wait = elapsed_ms(started_at)
@@ -189,7 +217,7 @@ class TelegramDeliveryService:
             log_event(
                 logger,
                 "telegram.delivery.failed",
-                level=logging.WARNING,
+                level=logging.DEBUG,
                 message="TikTok Telegram delivery failed",
                 platform="tiktok",
                 delivery=request.delivery,
@@ -199,31 +227,38 @@ class TelegramDeliveryService:
                 success=False,
             )
             raise
+        bind_request_context(
+            platform="tiktok",
+            delivery=request.delivery,
+            source_kind=source_kind,
+        )
         log_event(
             logger,
             "telegram.delivery.completed",
+            level=logging.INFO if outcome.ok else logging.DEBUG,
             message="TikTok Telegram delivery completed",
             platform="tiktok",
             delivery=request.delivery,
             source_kind=source_kind,
             queue_wait_ms=queue_wait,
-            call_count=len(outcome.calls),
             status_code=outcome.calls[-1].status_code if outcome.calls else None,
             elapsed_ms=elapsed_ms(started_at),
-            success=bool(outcome.calls)
-            and all(200 <= call.status_code < 300 for call in outcome.calls),
+            **outcome.log_fields(),
         )
+        bind_request_context(**outcome.log_fields())
         return outcome
 
     async def deliver_instagram(
         self, request: InstagramTelegramDeliveryRequest
     ) -> TelegramDeliveryOutcome:
+        bind_request_context(platform="instagram", delivery=request.delivery)
+        source_kind = "extraction_id" if request.source.extraction_id is not None else "url"
+        bind_request_context(source_kind=source_kind)
         if not self._client.configured:
             raise ConfigurationError("Telegram delivery is not configured")
         if self._instagram is None:
             raise ConfigurationError("Instagram delivery is not configured")
         started_at = perf_counter()
-        source_kind = "extraction_id" if request.source.extraction_id is not None else "url"
         try:
             async with self._pipeline_limit:
                 queue_wait = elapsed_ms(started_at)
@@ -236,7 +271,7 @@ class TelegramDeliveryService:
             log_event(
                 logger,
                 "telegram.delivery.failed",
-                level=logging.WARNING,
+                level=logging.DEBUG,
                 message="Instagram Telegram delivery failed",
                 platform="instagram",
                 delivery=request.delivery,
@@ -246,20 +281,25 @@ class TelegramDeliveryService:
                 success=False,
             )
             raise
+        bind_request_context(
+            platform="instagram",
+            delivery=request.delivery,
+            source_kind=source_kind,
+        )
         log_event(
             logger,
             "telegram.delivery.completed",
+            level=logging.INFO if outcome.ok else logging.DEBUG,
             message="Instagram Telegram delivery completed",
             platform="instagram",
             delivery=request.delivery,
             source_kind=source_kind,
             queue_wait_ms=queue_wait,
-            call_count=len(outcome.calls),
             status_code=outcome.calls[-1].status_code if outcome.calls else None,
             elapsed_ms=elapsed_ms(started_at),
-            success=bool(outcome.calls)
-            and all(200 <= call.status_code < 300 for call in outcome.calls),
+            **outcome.log_fields(),
         )
+        bind_request_context(**outcome.log_fields())
         return outcome
 
     async def _resolve_extraction(
@@ -311,10 +351,11 @@ class TelegramDeliveryService:
                 async with asyncio.timeout(self._thumbnail_wait_seconds):
                     return await self._download(cover)
             except Exception as exc:
+                record_recovery("thumbnail_skipped_count")
                 log_event(
                     logger,
                     "telegram.thumbnail_download.failed",
-                    level=logging.WARNING,
+                    level=logging.DEBUG,
                     message="Media cover skipped; Telegram will generate a preview",
                     error_type=type(exc).__name__,
                     success=False,
@@ -345,10 +386,11 @@ class TelegramDeliveryService:
         try:
             downloaded_cover = await self._download(cover)
         except Exception as exc:
+            record_recovery("thumbnail_skipped_count")
             log_event(
                 logger,
                 "telegram.thumbnail_download.failed",
-                level=logging.WARNING,
+                level=logging.DEBUG,
                 message="Media cover download failed; Telegram will generate a preview",
                 error_type=type(exc).__name__,
                 success=False,
@@ -375,9 +417,11 @@ class TelegramDeliveryService:
             async with asyncio.timeout(self._thumbnail_wait_seconds):
                 return await self._download_prepared_thumbnail(cover, filename)
         except TimeoutError:
+            record_recovery("thumbnail_skipped_count")
             log_event(
                 logger,
                 "telegram.relay_thumbnail.skipped",
+                level=logging.DEBUG,
                 message="Slow source cover skipped; Telegram will generate a preview",
                 wait_seconds=self._thumbnail_wait_seconds,
                 success=True,
@@ -442,10 +486,11 @@ class TelegramDeliveryService:
             data = await self._images.read_file(cover.file)
             converted = await self._images.prepare_thumbnail(data, filename)
         except Exception as exc:
+            record_recovery("thumbnail_skipped_count")
             log_event(
                 logger,
                 "telegram.thumbnail_preparation.failed",
-                level=logging.WARNING,
+                level=logging.DEBUG,
                 message="Media cover conversion failed; Telegram will generate a preview",
                 error_type=type(exc).__name__,
                 success=False,
@@ -511,10 +556,11 @@ class TelegramDeliveryService:
             except Exception:
                 if streamed.failure is None:
                     raise
+                record_recovery("fallback_count")
                 log_event(
                     logger,
                     "telegram.relay.fallback",
-                    level=logging.WARNING,
+                    level=logging.DEBUG,
                     message="Interrupted media relay is retrying through verified spool",
                     delivery="media",
                     error_type=type(streamed.failure).__name__,
@@ -558,10 +604,11 @@ class TelegramDeliveryService:
                     except Exception:
                         if streamed.failure is None:
                             raise
+                        record_recovery("fallback_count")
                         log_event(
                             logger,
                             "telegram.relay.fallback",
-                            level=logging.WARNING,
+                            level=logging.DEBUG,
                             message="Interrupted media relay is retrying through verified spool",
                             delivery="document",
                             error_type=type(streamed.failure).__name__,
@@ -921,7 +968,7 @@ class TelegramDeliveryService:
             log_event(
                 logger,
                 "telegram.album_downloads.failed",
-                level=logging.WARNING,
+                level=logging.DEBUG,
                 message="Instagram carousel downloads failed",
                 platform="instagram",
                 delivery=request.delivery,
@@ -934,6 +981,7 @@ class TelegramDeliveryService:
         log_event(
             logger,
             "telegram.album_downloads.completed",
+            level=logging.DEBUG,
             message="Instagram carousel downloads completed",
             platform="instagram",
             delivery=request.delivery,
@@ -979,7 +1027,7 @@ class TelegramDeliveryService:
                 log_event(
                     logger,
                     "telegram.album_preparation.failed",
-                    level=logging.WARNING,
+                    level=logging.DEBUG,
                     message="Instagram carousel preparation failed",
                     platform="instagram",
                     delivery=request.delivery,
@@ -992,6 +1040,7 @@ class TelegramDeliveryService:
             log_event(
                 logger,
                 "telegram.album_preparation.completed",
+                level=logging.DEBUG,
                 message="Instagram carousel preparation completed",
                 platform="instagram",
                 delivery=request.delivery,
@@ -1003,7 +1052,9 @@ class TelegramDeliveryService:
 
             calls: list[TelegramCallResponse] = []
             batches = _album_batches(prepared)
+            bind_request_context(batch_count=len(batches))
             for batch_index, batch in enumerate(batches):
+                bind_request_context(batch_index=batch_index + 1)
                 batch_fields = dict(fields)
                 if batch_index > 0:
                     batch_fields.pop("reply_parameters", None)
@@ -1058,10 +1109,13 @@ class TelegramDeliveryService:
                 batch_started_at = perf_counter()
                 response = await self._call("sendMediaGroup", batch_fields, uploads)
                 calls.append(response)
+                # Preserve confirmed progress if a later batch raises before
+                # returning an outcome. Successful completion clears partial.
+                bind_request_context(call_count=len(calls), partial=any(call.ok for call in calls))
                 log_event(
                     logger,
                     "telegram.album_batch.completed",
-                    level=logging.INFO if response.ok else logging.WARNING,
+                    level=logging.DEBUG,
                     message="Instagram Telegram album batch completed",
                     platform="instagram",
                     delivery=request.delivery,
@@ -1148,7 +1202,7 @@ class TelegramDeliveryService:
             log_event(
                 logger,
                 "telegram.album_downloads.failed",
-                level=logging.WARNING,
+                level=logging.DEBUG,
                 message="TikTok slideshow downloads failed",
                 platform="tiktok",
                 delivery=request.delivery,
@@ -1161,6 +1215,7 @@ class TelegramDeliveryService:
         log_event(
             logger,
             "telegram.album_downloads.completed",
+            level=logging.DEBUG,
             message="TikTok slideshow downloads completed",
             platform="tiktok",
             delivery=request.delivery,
@@ -1196,7 +1251,7 @@ class TelegramDeliveryService:
                 log_event(
                     logger,
                     "telegram.album_preparation.failed",
-                    level=logging.WARNING,
+                    level=logging.DEBUG,
                     message="TikTok slideshow preparation failed",
                     platform="tiktok",
                     delivery=request.delivery,
@@ -1210,6 +1265,7 @@ class TelegramDeliveryService:
             log_event(
                 logger,
                 "telegram.album_preparation.completed",
+                level=logging.DEBUG,
                 message="TikTok slideshow preparation completed",
                 platform="tiktok",
                 delivery=request.delivery,
@@ -1241,7 +1297,9 @@ class TelegramDeliveryService:
 
             calls: list[TelegramCallResponse] = []
             batches = _album_batches(prepared)
+            bind_request_context(batch_count=len(batches))
             for batch_index, batch in enumerate(batches):
+                bind_request_context(batch_index=batch_index + 1)
                 batch_fields = dict(fields)
                 if batch_index > 0:
                     batch_fields.pop("reply_parameters", None)
@@ -1263,10 +1321,11 @@ class TelegramDeliveryService:
                 batch_started_at = perf_counter()
                 response = await self._call("sendMediaGroup", batch_fields, uploads)
                 calls.append(response)
+                bind_request_context(call_count=len(calls), partial=any(call.ok for call in calls))
                 log_event(
                     logger,
                     "telegram.album_batch.completed",
-                    level=logging.INFO if response.ok else logging.WARNING,
+                    level=logging.DEBUG,
                     message="TikTok Telegram album batch completed",
                     platform="tiktok",
                     delivery=request.delivery,

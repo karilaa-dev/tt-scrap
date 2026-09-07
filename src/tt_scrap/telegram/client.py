@@ -149,7 +149,7 @@ class TelegramClient:
             log_event(
                 logger,
                 "telegram.api_call.rejected",
-                level=logging.WARNING,
+                level=logging.DEBUG,
                 message="Telegram upload exceeds the configured size limit",
                 telegram_method=method,
                 success=False,
@@ -196,7 +196,7 @@ class TelegramClient:
                 log_event(
                     logger,
                     "telegram.api_call.completed",
-                    level=logging.INFO if result.ok else logging.WARNING,
+                    level=logging.DEBUG,
                     message="Telegram API upload completed",
                     telegram_method=method,
                     status_code=response.status,
@@ -212,7 +212,7 @@ class TelegramClient:
             log_event(
                 logger,
                 "telegram.api_call.failed",
-                level=logging.WARNING,
+                level=logging.DEBUG,
                 message="Telegram API upload timed out",
                 telegram_method=method,
                 success=False,
@@ -226,7 +226,7 @@ class TelegramClient:
             log_event(
                 logger,
                 "telegram.api_call.failed",
-                level=logging.WARNING,
+                level=logging.DEBUG,
                 message="Telegram API upload failed before a response",
                 telegram_method=method,
                 success=False,

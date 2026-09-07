@@ -18,6 +18,7 @@ from tt_scrap.errors import (
     ServiceBusyError,
     UpstreamTimeoutError,
 )
+from tt_scrap.logging import request_id_var
 from tt_scrap.platforms.tiktok.adapter import (
     TikTokAdapter,
     YtdlpContext,
@@ -88,7 +89,9 @@ async def test_resolution_deadline_includes_wait_for_capacity(settings):
         (503, NetworkError, 3),
     ],
 )
-async def test_resolution_status_retry_policy(settings, status, error, attempts):
+async def test_resolution_status_retry_policy(
+    settings, status, error, attempts, log_records, request_log_context
+):
     route = respx.get("https://vt.tiktok.com/STATUS/").respond(status)
     adapter = TikTokAdapter(settings, ProxyManager())
     try:
@@ -97,6 +100,9 @@ async def test_resolution_status_retry_policy(settings, status, error, attempts)
         assert route.call_count == attempts
     finally:
         await adapter.close()
+
+    assert request_log_context.retry_count == attempts - 1
+    assert all(record.levelno < 30 for record in log_records)
 
 
 class FakeExtractor:
@@ -218,12 +224,15 @@ async def test_short_url_rejects_removed_canonical_post(settings) -> None:
 
 
 @pytest.mark.asyncio
-async def test_transient_metadata_failure_is_retried(settings, monkeypatch) -> None:
+async def test_transient_metadata_failure_is_retried(
+    settings, monkeypatch, log_records, request_log_context
+) -> None:
     adapter = TikTokAdapter(settings, ProxyManager())
     calls = 0
 
     def fake_extract(*args: Any):
         nonlocal calls
+        assert request_id_var.get() == "unit-request"
         calls += 1
         if calls == 1:
             return None, "extraction", None
@@ -240,6 +249,9 @@ async def test_transient_metadata_failure_is_retried(settings, monkeypatch) -> N
         assert calls == 2
     finally:
         await adapter.close()
+
+    assert request_log_context.retry_count == 1
+    assert all(record.levelno < 30 for record in log_records)
 
 
 @pytest.mark.asyncio

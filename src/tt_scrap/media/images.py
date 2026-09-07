@@ -307,6 +307,7 @@ class ImagePreparationService:
             log_event(
                 logger,
                 "image.worker_pool.warmed",
+                level=logging.DEBUG,
                 message="Image conversion worker warmed",
                 warmed_workers=1,
                 pool_capacity=self._workers,
@@ -320,6 +321,7 @@ class ImagePreparationService:
         log_event(
             logger,
             "image.file_read.completed",
+            level=logging.DEBUG,
             message="Image bytes read for preparation",
             output_bytes=len(data),
             elapsed_ms=elapsed_ms(started_at),
@@ -345,6 +347,7 @@ class ImagePreparationService:
         log_event(
             logger,
             "image.native_validation.completed",
+            level=logging.DEBUG,
             message="Native Telegram photo validation completed",
             content_type=detected_content_type,
             request_bytes=size,
@@ -370,7 +373,7 @@ class ImagePreparationService:
                 log_event(
                     logger,
                     "image.photo_conversion.failed",
-                    level=logging.WARNING,
+                    level=logging.DEBUG,
                     message="Telegram photo conversion failed",
                     request_bytes=len(data),
                     queue_wait_ms=queue_wait,
@@ -382,6 +385,7 @@ class ImagePreparationService:
         log_event(
             logger,
             "image.photo_conversion.completed",
+            level=logging.DEBUG,
             message="Telegram photo conversion completed",
             request_bytes=len(data),
             output_bytes=len(result.data),
@@ -412,7 +416,7 @@ class ImagePreparationService:
                 log_event(
                     logger,
                     "image.photo_normalization.failed",
-                    level=logging.WARNING,
+                    level=logging.DEBUG,
                     message="Telegram photo normalization failed",
                     request_bytes=len(data),
                     queue_wait_ms=queue_wait,
@@ -424,6 +428,7 @@ class ImagePreparationService:
         log_event(
             logger,
             "image.photo_normalization.completed",
+            level=logging.DEBUG,
             message="Telegram photo normalization completed",
             request_bytes=len(data),
             output_bytes=len(result.data),
@@ -447,6 +452,7 @@ class ImagePreparationService:
             log_event(
                 logger,
                 "image.thumbnail_preparation.completed",
+                level=logging.DEBUG,
                 message="Telegram thumbnail already compliant",
                 request_bytes=len(data),
                 output_bytes=len(verified.data),
@@ -475,7 +481,7 @@ class ImagePreparationService:
                 log_event(
                     logger,
                     "image.thumbnail_preparation.failed",
-                    level=logging.WARNING,
+                    level=logging.DEBUG,
                     message="Telegram thumbnail conversion failed",
                     request_bytes=len(data),
                     queue_wait_ms=queue_wait,
@@ -487,6 +493,7 @@ class ImagePreparationService:
         log_event(
             logger,
             "image.thumbnail_preparation.completed",
+            level=logging.DEBUG,
             message="Telegram thumbnail conversion completed",
             request_bytes=len(data),
             output_bytes=len(result.data),

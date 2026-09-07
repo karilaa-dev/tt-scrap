@@ -20,7 +20,9 @@ def make_service(settings) -> InstagramService:
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_mixed_carousel_is_normalized_and_cached(settings) -> None:
+async def test_mixed_carousel_is_normalized_and_cached(
+    settings, log_records, request_log_context
+) -> None:
     route = respx.get(API_URL).mock(
         return_value=Response(
             200,
@@ -66,6 +68,9 @@ async def test_mixed_carousel_is_normalized_and_cached(settings) -> None:
         assert route.call_count == 1
     finally:
         await service.close()
+
+    assert [record.event for record in log_records] == ["instagram.extraction.completed"] * 3
+    assert all(record.levelno < 30 for record in log_records)
 
 
 @pytest.mark.asyncio
@@ -125,7 +130,7 @@ async def test_instagram_404_is_not_retried(settings) -> None:
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_instagram_5xx_is_retried(settings) -> None:
+async def test_instagram_5xx_is_retried(settings, log_records, request_log_context) -> None:
     route = respx.get(API_URL).mock(
         side_effect=[
             Response(503),
@@ -139,6 +144,9 @@ async def test_instagram_5xx_is_retried(settings) -> None:
         assert route.call_count == 2
     finally:
         await service.close()
+
+    assert request_log_context.retry_count == 1
+    assert all(record.levelno < 30 for record in log_records)
 
 
 @pytest.mark.asyncio
@@ -229,7 +237,7 @@ async def test_rate_limit_backoff_releases_provider_slot(settings, monkeypatch) 
 
 @pytest.mark.asyncio
 async def test_provider_retry_after_is_bounded_by_total_backoff_budget(
-    settings, monkeypatch
+    settings, monkeypatch, log_records, request_log_context
 ) -> None:
     settings.instagram_max_attempts = 3
     settings.instagram_retry_delay_seconds = 0
@@ -252,3 +260,6 @@ async def test_provider_retry_after_is_bounded_by_total_backoff_budget(
 
     assert asyncio.get_running_loop().time() - started < 0.1
     assert calls == 2
+
+    assert request_log_context.retry_count == 1
+    assert all(record.levelno < 30 for record in log_records)

@@ -158,7 +158,9 @@ class FakeTikTok:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("prepared", [True, False])
-async def test_failed_video_cancels_slow_optional_thumbnail(settings, prepared) -> None:
+async def test_failed_video_cancels_slow_optional_thumbnail(
+    settings, prepared, log_records, request_log_context
+) -> None:
     cache = CacheStore(60, 100)
     video = await descriptor(cache, "video", "video")
     cover = await descriptor(cache, "cover", "cover")
@@ -185,6 +187,9 @@ async def test_failed_video_cancels_slow_optional_thumbnail(settings, prepared) 
     with pytest.raises(NetworkError, match="video rejected"):
         await asyncio.wait_for(operation, timeout=0.2)
     assert cover_cancelled.is_set()
+
+    assert request_log_context.thumbnail_skipped_count == 0
+    assert all(record.levelno < 30 for record in log_records)
 
 
 @pytest.mark.asyncio
@@ -273,7 +278,9 @@ def service(
 
 
 @pytest.mark.asyncio
-async def test_video_upload_infers_metadata_and_attaches_thumbnail(settings) -> None:
+async def test_video_upload_infers_metadata_and_attaches_thumbnail(
+    settings, log_records, request_log_context
+) -> None:
     cache = CacheStore(600, 100)
     video = await descriptor(cache, "video", "video")
     cover = await descriptor(cache, "cover", "cover")
@@ -313,6 +320,11 @@ async def test_video_upload_infers_metadata_and_attaches_thumbnail(settings) -> 
         "video_file": b"video-data",
         "thumbnail_file": b"\xff\xd8\xffthumbnail",
     }
+
+    assert [record.event for record in log_records] == ["telegram.delivery.completed"]
+    assert request_log_context.summary()["success"] is True
+    assert "thumbnail_skipped_count" not in request_log_context.summary()
+    assert all(record.levelno < 30 for record in log_records)
 
 
 @pytest.mark.asyncio
@@ -390,7 +402,9 @@ async def test_relay_prepares_cover_before_consuming_video_stream(settings) -> N
 
 
 @pytest.mark.asyncio
-async def test_interrupted_relay_retries_with_verified_download(settings) -> None:
+async def test_interrupted_relay_retries_with_verified_download(
+    settings, log_records, request_log_context
+) -> None:
     cache = CacheStore(600, 100)
     video = await descriptor(cache, "video", "video")
     extraction = TikTokExtractionResponse(
@@ -425,9 +439,15 @@ async def test_interrupted_relay_retries_with_verified_download(settings) -> Non
     assert downloader.calls == ["video"]
     assert client.calls[0][2]["video_file"] == b"verified-video"
 
+    assert request_log_context.fallback_count == 1
+    assert request_log_context.retry_count == 0
+    assert all(record.levelno < 30 for record in log_records)
+
 
 @pytest.mark.asyncio
-async def test_video_relay_does_not_wait_for_a_slow_source_cover(settings) -> None:
+async def test_video_relay_does_not_wait_for_a_slow_source_cover(
+    settings, log_records, request_log_context
+) -> None:
     cache = CacheStore(600, 100)
     video = await descriptor(cache, "video", "video")
     cover = await descriptor(cache, "cover", "cover")
@@ -461,6 +481,9 @@ async def test_video_relay_does_not_wait_for_a_slow_source_cover(settings) -> No
 
     assert client.calls[0][2] == {"video_file": b"streamed-video"}
     assert "thumbnail" not in client.calls[0][1]
+
+    assert request_log_context.thumbnail_skipped_count == 1
+    assert all(record.levelno < 30 for record in log_records)
 
 
 @pytest.mark.asyncio
@@ -645,9 +668,14 @@ async def test_video_document_mode_skips_cover_and_metadata(settings) -> None:
 
 
 @pytest.mark.asyncio
-async def test_slideshow_is_partitioned_without_single_item_tail(settings) -> None:
+@pytest.mark.parametrize("item_count,expected_batches", [(11, [9, 2]), (21, [10, 9, 2])])
+async def test_slideshow_is_partitioned_without_single_item_tail(
+    settings, item_count, expected_batches, log_records
+) -> None:
     cache = CacheStore(600, 100)
-    media = [await descriptor(cache, f"image-{index}", "image", index) for index in range(11)]
+    media = [
+        await descriptor(cache, f"image-{index}", "image", index) for index in range(item_count)
+    ]
     extraction = TikTokExtractionResponse(
         extraction_id="extraction-1",
         source_id="123",
@@ -658,15 +686,17 @@ async def test_slideshow_is_partitioned_without_single_item_tail(settings) -> No
         expires_at=datetime.now(UTC) + timedelta(minutes=10),
     )
     downloader = FakeDownloader(
-        {f"image-{index}": (b"\xff\xd8\xffimage", "image/jpeg") for index in range(11)}
+        {f"image-{index}": (b"\xff\xd8\xffimage", "image/jpeg") for index in range(item_count)}
     )
     client = FakeTelegramClient()
 
     outcome = await service(settings, cache, extraction, downloader, client).deliver(request())
 
-    assert len(outcome.calls) == 2
-    assert [len(call[1]["media"]) for call in client.calls] == [9, 2]
+    assert len(outcome.calls) == len(expected_batches)
+    assert [len(call[1]["media"]) for call in client.calls] == expected_batches
     assert all(item["type"] == "photo" for call in client.calls for item in call[1]["media"])
+
+    assert [record.event for record in log_records] == ["telegram.delivery.completed"]
 
 
 @pytest.mark.asyncio
@@ -881,7 +911,9 @@ async def test_cached_audio_uses_send_audio_metadata(settings) -> None:
 
 
 @pytest.mark.asyncio
-async def test_thumbnail_failure_does_not_fail_video_delivery(settings) -> None:
+async def test_thumbnail_failure_does_not_fail_video_delivery(
+    settings, log_records, request_log_context
+) -> None:
     cache = CacheStore(600, 100)
     video = await descriptor(cache, "video", "video")
     cover = await descriptor(cache, "cover", "cover")
@@ -913,6 +945,9 @@ async def test_thumbnail_failure_does_not_fail_video_delivery(settings) -> None:
     assert method == "sendVideo"
     assert "thumbnail" not in fields
     assert set(uploads) == {"video_file"}
+
+    assert request_log_context.thumbnail_skipped_count == 1
+    assert all(record.levelno < 30 for record in log_records)
 
 
 @pytest.mark.asyncio

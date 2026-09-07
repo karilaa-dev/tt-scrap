@@ -73,7 +73,7 @@ class ResolverClients:
                 log_event(
                     logger,
                     "tiktok.resolver_client.retired",
-                    level=logging.WARNING,
+                    level=logging.DEBUG,
                     message="Failed resolver pool retired; active requests will drain",
                     error_type=type(exc).__name__,
                     proxy_used=proxy is not None,

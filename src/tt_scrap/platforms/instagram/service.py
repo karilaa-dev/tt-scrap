@@ -27,7 +27,7 @@ from ...errors import (
     NetworkError,
     RateLimitError,
 )
-from ...logging import elapsed_ms, log_event
+from ...logging import bind_request_context, elapsed_ms, log_event, record_recovery
 from ...models import (
     AssetFetchContext,
     InstagramExtractionResponse,
@@ -136,6 +136,8 @@ class InstagramService:
             retry_budget = min(5.0, self.settings.instagram_request_timeout_seconds)
             backoff_spent = 0.0
             for attempt in range(1, self.settings.instagram_max_attempts + 1):
+                if attempt > 1:
+                    record_recovery("retry_count")
                 attempt_started_at = perf_counter()
                 attempt_status: int | None = None
                 attempt_retry_after: float | None = None
@@ -171,6 +173,7 @@ class InstagramService:
                     log_event(
                         logger,
                         "instagram.upstream.completed",
+                        level=logging.DEBUG,
                         message="Instagram metadata request completed",
                         attempt=attempt,
                         status_code=response.status_code,
@@ -182,7 +185,7 @@ class InstagramService:
                     log_event(
                         logger,
                         "instagram.upstream.failed",
-                        level=logging.WARNING,
+                        level=logging.DEBUG,
                         message="Instagram content was not available",
                         attempt=attempt,
                         status_code=attempt_status,
@@ -196,7 +199,7 @@ class InstagramService:
                     log_event(
                         logger,
                         "instagram.upstream.failed",
-                        level=logging.WARNING,
+                        level=logging.DEBUG,
                         message="Instagram API returned an invalid payload",
                         attempt=attempt,
                         status_code=attempt_status,
@@ -211,7 +214,7 @@ class InstagramService:
                     log_event(
                         logger,
                         "instagram.upstream.failed",
-                        level=logging.WARNING,
+                        level=logging.DEBUG,
                         message="Instagram metadata request failed",
                         attempt=attempt,
                         status_code=attempt_status,
@@ -246,6 +249,7 @@ class InstagramService:
         started_at = perf_counter()
         normalized_url = normalize_instagram_url(source_url)
         media_id = extract_instagram_media_id(normalized_url)
+        bind_request_context(platform="instagram", source_id=media_id)
         cache_key = self.cache.metadata_key("instagram", normalized_url)
         baseline_generation = await self.cache.get_generation(cache_key) if refresh else None
         if not refresh:
@@ -297,6 +301,13 @@ class InstagramService:
         cache_scope: str,
     ) -> InstagramExtractionResponse:
         response = cached.model_copy(update={"source_url": source_url})
+        bind_request_context(
+            platform="instagram",
+            source_id=media_id,
+            cache_hit=True,
+            cache_scope=cache_scope,
+            media_count=len(response.media),
+        )
         log_event(
             logger,
             "instagram.extraction.completed",
@@ -394,6 +405,13 @@ class InstagramService:
             self.cache.metadata_key("instagram-extraction", extraction_id),
             response,
         )
+        bind_request_context(
+            platform="instagram",
+            source_id=media_id,
+            cache_hit=False,
+            cache_scope=None,
+            media_count=len(response.media),
+        )
         log_event(
             logger,
             "instagram.extraction.completed",
@@ -414,10 +432,15 @@ class InstagramService:
             InstagramExtractionResponse,
         )
         if cached is None:
+            bind_request_context(
+                platform="instagram",
+                cache_hit=False,
+                cache_scope="extraction_id",
+            )
             log_event(
                 logger,
                 "instagram.extraction_cache.lookup",
-                level=logging.WARNING,
+                level=logging.DEBUG,
                 message="Instagram extraction cache lookup missed",
                 platform="instagram",
                 cache_hit=False,
@@ -426,9 +449,17 @@ class InstagramService:
                 success=False,
             )
             raise ExtractionExpiredError("Instagram extraction was not found or has expired")
+        bind_request_context(
+            platform="instagram",
+            source_id=cached.source_id,
+            cache_hit=True,
+            cache_scope="extraction_id",
+            media_count=len(cached.media),
+        )
         log_event(
             logger,
             "instagram.extraction_cache.lookup",
+            level=logging.DEBUG,
             message="Instagram extraction cache lookup completed",
             platform="instagram",
             cache_hit=True,

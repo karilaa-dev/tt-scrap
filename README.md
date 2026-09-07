@@ -48,7 +48,8 @@ are:
 | Variable | Purpose |
 | --- | --- |
 | `TT_SCRAP_API_KEY` | Bearer token required by every `/v1/` endpoint |
-| `LOG_LEVEL` | JSON log verbosity; timing events are emitted at `INFO` |
+| `LOG_LEVEL` | Log verbosity; `INFO` keeps request summaries and major milestones, `DEBUG` includes individual stages |
+| `LOG_FORMAT` | `console` by default; use `json` for structured log collectors |
 | `RAPIDAPI_KEY` | Instagram RapidAPI credential |
 | `INSTAGRAM_CONCURRENCY` | Maximum concurrent Instagram provider calls; default 4 |
 | `YTDLP_COOKIES` | Optional Netscape cookie file for restricted TikToks |
@@ -295,19 +296,32 @@ for example `Server-Timing: app;dur=1842.317`. The duration measures server work
 to response streaming; it does not measure how long the caller takes to receive a
 streamed asset.
 
-At `LOG_LEVEL=INFO`, the service writes one `http.request.completed` event for
-every request and correlated stage events for cache lookups, URL resolution,
-metadata APIs, upstream media downloads, image validation/conversion, separate-track
-downloads, FFmpeg stream-copy remuxing, album preparation, each Telegram API upload,
-and total Telegram delivery. Durations use `elapsed_ms`; bounded pools also report
-`queue_wait_ms`. Transfer events report byte counts without logging media URLs,
-credentials, cookies, captions, chat IDs, or request bodies.
+At `LOG_LEVEL=INFO`, the service writes extraction, standalone URL resolution,
+music extraction, and overall Telegram delivery milestones, followed by one
+`http.request.completed` summary. Successful health checks appear only at `DEBUG`.
+The summary includes the route, status, duration, request ID, and available platform,
+source ID, delivery mode, and error details. Client errors and partial or rejected
+Telegram deliveries use `WARNING`; server errors use `ERROR`. Telegram success is
+checked against both its HTTP status and JSON `ok` value.
+
+Recovery is summarized with `retry_count`, `fallback_count`, and
+`thumbnail_skipped_count`; zero counts are omitted. Retries count extra attempts
+that actually start. Fallbacks count interrupted relays retried through a verified
+spool. Thumbnail skips count failures or timeouts, not absent or disabled covers.
+Successful requests do not emit warnings for this recovery work.
+
+Set `LOG_LEVEL=DEBUG` to inspect cache lookups, individual downloads, image
+validation/conversion, remuxing, album preparation, Telegram uploads, and failed
+attempts. Durations use `elapsed_ms`; bounded pools also report `queue_wait_ms`.
+Transfer events report byte counts without logging media URLs, credentials,
+cookies, captions, chat IDs, or request bodies.
 
 `LOG_FORMAT=console` is the default and produces compact human-readable output for
 terminal and Dokploy logs. Set `LOG_FORMAT=json` when logs are consumed by `jq` or a
 structured log collector. Uvicorn startup/shutdown records use the same formatter.
 
-With `LOG_FORMAT=json`, use the response's request ID to inspect one complete operation:
+With `LOG_FORMAT=json` and `LOG_LEVEL=DEBUG`, use the response's request ID to
+inspect one complete operation:
 
 ```bash
 docker compose logs --no-log-prefix tt-scrap \

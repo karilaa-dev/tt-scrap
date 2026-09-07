@@ -14,7 +14,7 @@ from tt_scrap.telegram import TelegramClient, TelegramUpload
 @pytest.mark.parametrize("relay", [False, True])
 @pytest.mark.asyncio
 async def test_client_streams_multipart_and_serializes_telegram_fields(
-    settings, relay: bool
+    settings, relay: bool, log_records
 ) -> None:
     received: dict[str, bytes] = {}
 
@@ -76,6 +76,7 @@ async def test_client_streams_multipart_and_serializes_telegram_fields(
     assert json.loads(received["reply_markup"]) == {"inline_keyboard": []}
     assert received["video"] == b"attach://video_file"
     assert received["video_file"] == b"video"
+    assert not log_records
 
 
 @pytest.mark.asyncio

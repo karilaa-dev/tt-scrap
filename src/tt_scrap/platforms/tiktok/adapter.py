@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
@@ -29,7 +30,7 @@ from ...errors import (
     ServiceBusyError,
     UpstreamTimeoutError,
 )
-from ...logging import elapsed_ms, log_event
+from ...logging import bind_request_context, elapsed_ms, log_event, record_recovery
 from ...proxy import ProxyManager, ProxySession
 from .http import ResolverClients
 
@@ -151,6 +152,7 @@ class TikTokAdapter:
         )
 
     async def resolve_url(self, url: str, proxy_session: ProxySession) -> str:
+        bind_request_context(platform="tiktok")
         try:
             async with asyncio.timeout(self.settings.url_resolve_timeout_seconds):
                 return await self._resolve_url(url, proxy_session)
@@ -168,6 +170,7 @@ class TikTokAdapter:
             log_event(
                 logger,
                 "tiktok.url_resolution.completed",
+                level=logging.DEBUG,
                 message="TikTok URL did not require redirect resolution",
                 platform="tiktok",
                 fast_path=True,
@@ -177,6 +180,8 @@ class TikTokAdapter:
             return url
         last_error: Exception | None = None
         for attempt in range(1, self.settings.url_resolve_max_retries + 1):
+            if attempt > 1:
+                record_recovery("retry_count")
             attempt_started_at = perf_counter()
             choice = proxy_session.get()
             queue_wait = 0.0
@@ -189,6 +194,7 @@ class TikTokAdapter:
                 log_event(
                     logger,
                     "tiktok.url_resolution.completed",
+                    level=logging.DEBUG,
                     message="TikTok short URL resolution completed",
                     platform="tiktok",
                     fast_path=False,
@@ -210,7 +216,7 @@ class TikTokAdapter:
                 log_event(
                     logger,
                     "tiktok.url_resolution.failed",
-                    level=logging.WARNING,
+                    level=logging.DEBUG,
                     message="TikTok short URL resolution failed",
                     platform="tiktok",
                     attempt=attempt,
@@ -315,12 +321,15 @@ class TikTokAdapter:
     async def extract(
         self, url: str, video_id: str, proxy_session: ProxySession
     ) -> tuple[dict[str, Any], YtdlpContext]:
+        bind_request_context(platform="tiktok", source_id=video_id)
         started_at = perf_counter()
         async with self._semaphore:
             queue_wait = elapsed_ms(started_at)
             last_status: str | None = None
             last_error: Exception | None = None
             for attempt in range(1, self.settings.video_info_max_retries + 1):
+                if attempt > 1:
+                    record_recovery("retry_count")
                 attempt_started_at = perf_counter()
                 choice = proxy_session.get()
                 context: YtdlpContext | None = None
@@ -328,6 +337,7 @@ class TikTokAdapter:
                     loop = asyncio.get_running_loop()
                     data, status, context = await loop.run_in_executor(
                         self._executor,
+                        copy_context().run,
                         self._extract_sync,
                         url,
                         video_id,
@@ -345,6 +355,7 @@ class TikTokAdapter:
                         log_event(
                             logger,
                             "tiktok.metadata.completed",
+                            level=logging.DEBUG,
                             message="TikTok metadata extraction completed",
                             platform="tiktok",
                             source_id=video_id,
@@ -368,7 +379,7 @@ class TikTokAdapter:
                     log_event(
                         logger,
                         "tiktok.metadata.failed",
-                        level=logging.WARNING,
+                        level=logging.DEBUG,
                         message="TikTok metadata extraction returned a permanent content error",
                         platform="tiktok",
                         source_id=video_id,
@@ -390,7 +401,7 @@ class TikTokAdapter:
                 log_event(
                     logger,
                     "tiktok.metadata.failed",
-                    level=logging.WARNING,
+                    level=logging.DEBUG,
                     message="TikTok metadata extraction attempt failed",
                     platform="tiktok",
                     source_id=video_id,
