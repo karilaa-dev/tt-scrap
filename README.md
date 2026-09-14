@@ -310,14 +310,19 @@ failures retain FastAPI's existing response and identify `http.body_parsing`.
 Queue timings use `resolver_queue_wait_ms`, `extraction_queue_wait_ms`,
 `download_queue_wait_ms`, `pipeline_queue_wait_ms`, `upload_queue_wait_ms`, and
 `image_queue_wait_ms`. Each is the longest observed wait for that stage, so parallel
-album waits are not added together. Recovered failures are omitted from successful
+album waits are not added together. Download waits include relay setup and the
+capacity reacquisition when upload consumption starts. Telegram rejections record
+their failure stage and upstream HTTP status even when the HTTP status is 200 and
+the Bot API body contains `ok: false`. Recovered failures are omitted from successful
 request summaries; recovery counters remain.
 
 Log output runs in a background thread with a 10,000-record queue. Records capture
 their request ID before enqueueing. During overflow, warnings and errors displace
 lower-priority records; once output resumes, `logging.records_dropped` reports
 dropped counts by level. A queue containing only warnings/errors drops incoming
-records when full. Shutdown flushes queued output for up to five seconds.
+records when full. Malformed messages or exception formatting failures are also
+dropped and counted; they cannot fail the request. Shutdown flushes queued output
+for up to five seconds.
 `runtime.event_loop.stalled` warns when loop lag exceeds one second, at most once
 per minute. Correlate these warnings with host CPU, memory, and storage pressure
 before raising concurrency limits.

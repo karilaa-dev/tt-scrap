@@ -242,3 +242,44 @@ def test_sibling_success_does_not_erase_upstream_failure(request_log_context):
     log_event(logger, "media.upstream_download.completed", level=logging.DEBUG, success=True)
     assert request_log_context.summary()["upstream_status_code"] == 404
     assert request_log_context.summary()["failure_stage"] == "media.upstream_download"
+
+
+@pytest.mark.parametrize("malformed", ["arguments", "string_conversion", "exception_formatting"])
+def test_background_logging_contains_formatting_failure_and_reports_drop(malformed, monkeypatch):
+    from tt_scrap.logging import BackgroundLogHandler
+
+    records = []
+
+    class Sink(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    class BadString:
+        def __str__(self):
+            raise ValueError("secret diagnostic must not escape")
+
+    def broken_exception_formatter(self, exc_info):
+        raise ValueError("secret traceback must not escape")
+
+    handler = BackgroundLogHandler(Sink())
+    logger = logging.Logger("review-formatting-test", logging.INFO)
+    logger.addHandler(handler)
+    try:
+        if malformed == "arguments":
+            logger.error("secret invalid message %s %s", "one argument")
+        elif malformed == "string_conversion":
+            logger.error("secret invalid argument %s", BadString())
+        else:
+            monkeypatch.setattr(logging.Formatter, "formatException", broken_exception_formatter)
+            error = ValueError("secret error")
+            logger.error("secret exception", exc_info=(type(error), error, None))
+        logger.info("request completed")
+        handler.flush()
+        assert [record.getMessage() for record in records] == [
+            "request completed",
+            "Log records dropped",
+        ]
+        assert records[-1].event == "logging.records_dropped"
+        assert records[-1].dropped_records == {"ERROR": 1}
+    finally:
+        handler.close()

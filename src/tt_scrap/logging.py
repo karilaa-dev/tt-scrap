@@ -204,12 +204,15 @@ def log_event(
     """Emit a safe structured event correlated with the active request."""
     stage, _, outcome = event.rpartition(".")
     if stage in _FAILURE_STAGES and (context := request_log_var.get()):
-        if outcome == "failed":
+        if outcome == "failed" or (outcome == "completed" and fields.get("success") is False):
             reason = fields.get("failure_reason")
             if reason is None:
-                reason = (
-                    "http_status" if fields.get("status_code") is not None else "upstream_error"
-                )
+                if outcome == "completed":
+                    reason = "upstream_rejected"
+                else:
+                    reason = (
+                        "http_status" if fields.get("status_code") is not None else "upstream_error"
+                    )
             context.update(
                 failure_stage=stage,
                 failure_reason=reason,
@@ -304,14 +307,22 @@ class BackgroundLogHandler(logging.Handler):
         self._thread.start()
 
     def emit(self, record: logging.LogRecord) -> None:
-        snapshot = copy.copy(record)
-        snapshot.request_id = getattr(record, "request_id", request_id_var.get())
-        snapshot.msg = record.getMessage()
-        snapshot.args = None
-        # Do not retain traceback frames and their request-local resources in the queue.
-        if record.exc_info:
-            snapshot.exc_text = logging.Formatter().formatException(record.exc_info)
-            snapshot.exc_info = None
+        try:
+            snapshot = copy.copy(record)
+            snapshot.request_id = getattr(record, "request_id", request_id_var.get())
+            snapshot.msg = record.getMessage()
+            snapshot.args = None
+            # Do not retain traceback frames and their request-local resources in the queue.
+            if record.exc_info:
+                snapshot.exc_text = logging.Formatter().formatException(record.exc_info)
+                snapshot.exc_info = None
+        except Exception:
+            # Malformed diagnostics must not fail the caller. Count the drop
+            # without recursively logging or exposing the original message.
+            with self._condition:
+                if not self._stopping:
+                    self._dropped[record.levelname] += 1
+            return
         with self._condition:
             if self._stopping:
                 return
@@ -354,7 +365,7 @@ class BackgroundLogHandler(logging.Handler):
                         logging.WARNING,
                         "",
                         0,
-                        "Log records dropped during output pressure",
+                        "Log records dropped",
                         (),
                         None,
                     )

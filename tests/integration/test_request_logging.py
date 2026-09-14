@@ -418,3 +418,70 @@ async def test_invalid_json_keeps_validation_response_and_records_stage(
     assert len(log_records) == 1
     assert log_records[0].failure_stage == "http.body_parsing"
     assert log_records[0].failure_reason == "invalid_json"
+
+
+@respx.mock
+@pytest.mark.parametrize("status,ok", [(400, False), (200, False), (200, True)])
+async def test_real_telegram_response_records_failure_context_without_changing_response(
+    logging_app, logging_client, log_records, monkeypatch, status, ok
+):
+    from aiohttp import web
+
+    respx.get(API_URL).respond(
+        200, json={"media": [{"type": "image", "url": "https://cdn.test/photo"}]}
+    )
+    photo = io.BytesIO()
+    Image.new("RGB", (16, 16)).save(photo, format="JPEG")
+    respx.get("https://cdn.test/photo").respond(
+        200, content=photo.getvalue(), headers={"Content-Type": "image/jpeg"}
+    )
+    body = (
+        b'{"ok":true,"result":[]}'
+        if ok
+        else b'{"ok":false,"error_code":400,"description":"rejected"}'
+    )
+    calls = 0
+
+    async def upload(request):
+        nonlocal calls
+        calls += 1
+        reader = await request.multipart()
+        while part := await reader.next():
+            await part.read()
+        return web.Response(status=status, body=body, content_type="application/json")
+
+    application = web.Application()
+    application.router.add_post("/botreview-test/sendPhoto", upload)
+    runner = web.AppRunner(application, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    monkeypatch.setattr(logging_app.state.telegram_client, "_base_url", f"http://127.0.0.1:{port}")
+    monkeypatch.setattr(logging_app.state.telegram_client, "_token", "review-test")
+    try:
+        response = await logging_client.post(
+            "/v1/instagram/telegram-deliveries",
+            json={
+                "source": {"url": "https://www.instagram.com/p/ABC123/"},
+                "telegram": {"chat_id": 123},
+                "delivery": "media",
+            },
+        )
+        assert response.status_code == status
+        assert response.content == body
+        assert calls == 1
+        assert len(log_records) == 1
+        summary = log_records[0]
+        assert summary.event == "http.request.completed"
+        assert summary.success is ok
+        if ok:
+            assert not hasattr(summary, "failure_stage")
+        else:
+            assert summary.levelno == logging.WARNING
+            assert summary.failure_stage == "telegram.api_call"
+            assert summary.upstream_status_code == status
+            assert summary.failure_reason == "upstream_rejected"
+            assert summary.telegram_error_code == 400
+    finally:
+        await runner.cleanup()

@@ -432,11 +432,13 @@ class AssetDownloader:
 
             async def chunks() -> AsyncGenerator[bytes]:
                 nonlocal consumer_completed, producer
+                consumption_queue_started = perf_counter()
                 async with (
                     self._group_limit(context.extraction_id),
                     self._semaphore,
                     self._transfer_semaphore,
                 ):
+                    record_queue_wait("download", elapsed_ms(consumption_queue_started))
                     producer = asyncio.create_task(produce())
                     while True:
                         item = await queue.get()

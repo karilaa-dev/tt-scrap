@@ -678,3 +678,41 @@ async def test_cancelled_remux_launch_drains_before_closing_output(settings, mon
     finally:
         release.set()
         await downloader.close()
+
+
+@pytest.mark.parametrize("permit", ["_semaphore", "_transfer_semaphore"])
+@respx.mock
+async def test_relay_records_capacity_wait_when_consumption_starts(
+    settings, monkeypatch, request_log_context, permit
+):
+    now = 100.0
+    monkeypatch.setattr("tt_scrap.media.downloader.perf_counter", lambda: now)
+    monkeypatch.setattr("tt_scrap.logging.perf_counter", lambda: now)
+    payload = b"video-data"
+    respx.get("https://cdn.test/video").respond(
+        200, content=payload, headers={"Content-Type": "video/mp4"}
+    )
+    downloader = AssetDownloader(settings, ProxyManager())
+    setattr(downloader, permit, asyncio.Semaphore(1))
+    context = AssetFetchContext(
+        platform="instagram",
+        upstream_url="https://cdn.test/video",
+        filename="video.mp4",
+        kind="video",
+    )
+    try:
+        async with downloader.stream(context) as streamed:
+            assert request_log_context.summary()["download_queue_wait_ms"] == 0
+
+            async def consume():
+                return b"".join([chunk async for chunk in streamed.chunks])
+
+            async with getattr(downloader, permit):
+                task = asyncio.create_task(consume())
+                await asyncio.sleep(0)
+                assert not task.done()
+                now += 0.025
+            assert await task == payload
+            assert request_log_context.summary()["download_queue_wait_ms"] == 25
+    finally:
+        await downloader.close()
