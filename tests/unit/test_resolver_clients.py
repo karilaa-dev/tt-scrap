@@ -29,6 +29,7 @@ async def test_failed_client_drains_active_user_while_new_requests_use_fresh_poo
                 assert fresh is not active
                 assert (await fresh.get("https://test/")).status_code == 200
             assert (await active.get("https://test/")).status_code == 200
+        await asyncio.gather(*clients._closing)
         assert active.is_closed
         async with clients.acquire("proxy-a") as reused:
             assert reused is fresh
@@ -82,3 +83,43 @@ async def test_old_failure_does_not_retire_new_generation() -> None:
             assert current is fresh
     finally:
         await clients.close()
+
+
+async def test_simultaneous_cancellations_close_once_and_shutdown_drains():
+    started, release = asyncio.Event(), asyncio.Event()
+    close_calls = 0
+
+    class SlowClient:
+        async def aclose(self):
+            nonlocal close_calls
+            close_calls += 1
+            started.set()
+            await release.wait()
+
+    clients = ResolverClients(lambda proxy: SlowClient())
+    entered = 0
+    all_entered = asyncio.Event()
+
+    async def request():
+        nonlocal entered
+        async with clients.acquire(None):
+            entered += 1
+            if entered == 4:
+                all_entered.set()
+            await asyncio.Future()
+
+    tasks = [asyncio.create_task(request()) for _ in range(4)]
+    await all_entered.wait()
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await started.wait()
+    shutdown = asyncio.create_task(clients.close())
+    try:
+        await asyncio.sleep(0)
+        assert not shutdown.done()
+        assert close_calls == 1
+    finally:
+        release.set()
+        await shutdown
+    assert not clients._closing

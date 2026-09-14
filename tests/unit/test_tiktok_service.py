@@ -88,7 +88,7 @@ async def test_resolution_returns_post_id_without_extraction_and_is_cached(
     assert service.adapter.resolve_calls == 1
     assert service.adapter.calls == 0
 
-    assert [record.event for record in log_records] == ["tiktok.resolution.completed"] * 2
+    assert not log_records
     assert all(record.levelno < 30 for record in log_records)
 
 

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
+import copy
 import json
 import logging
+import threading
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from time import perf_counter
@@ -76,6 +80,17 @@ _STRUCTURED_FIELDS = {
     "worker_count",
     "wait_seconds",
     "warmed_workers",
+    "failure_stage",
+    "upstream_status_code",
+    "upstream_error_type",
+    "resolver_queue_wait_ms",
+    "extraction_queue_wait_ms",
+    "download_queue_wait_ms",
+    "pipeline_queue_wait_ms",
+    "upload_queue_wait_ms",
+    "image_queue_wait_ms",
+    "event_loop_lag_ms",
+    "dropped_records",
 }
 
 
@@ -99,6 +114,16 @@ _SUMMARY_FIELDS = {
     "telegram_retry_after",
     "batch_index",
     "batch_count",
+    "failure_stage",
+    "failure_reason",
+    "upstream_status_code",
+    "upstream_error_type",
+    "resolver_queue_wait_ms",
+    "extraction_queue_wait_ms",
+    "download_queue_wait_ms",
+    "pipeline_queue_wait_ms",
+    "upload_queue_wait_ms",
+    "image_queue_wait_ms",
 }
 RecoveryCounter = Literal["retry_count", "fallback_count", "thumbnail_skipped_count"]
 
@@ -139,9 +164,31 @@ def record_recovery(counter: RecoveryCounter) -> None:
         setattr(context, counter, getattr(context, counter) + 1)
 
 
+def record_queue_wait(stage: str, milliseconds: float) -> None:
+    """Retain the longest wait per stage; concurrent waits must not be summed."""
+    key = f"{stage}_queue_wait_ms"
+    if key in _SUMMARY_FIELDS and (context := request_log_var.get()):
+        context.fields[key] = max(context.fields.get(key, 0.0), milliseconds)
+
+
 def elapsed_ms(started_at: float) -> float:
     """Return stable monotonic elapsed time rounded for compact JSON logs."""
     return round((perf_counter() - started_at) * 1_000, 3)
+
+
+_FAILURE_STAGES = {
+    "tiktok.metadata",
+    "tiktok.url_resolution",
+    "tiktok.normalization",
+    "instagram.upstream",
+    "media.upstream_download",
+    "media.upstream_relay",
+    "telegram.api_call",
+    "media.remux",
+    "image.photo_conversion",
+    "image.photo_normalization",
+    "telegram.album_preparation",
+}
 
 
 def log_event(
@@ -155,6 +202,24 @@ def log_event(
     **fields: Any,
 ) -> None:
     """Emit a safe structured event correlated with the active request."""
+    stage, _, outcome = event.rpartition(".")
+    if stage in _FAILURE_STAGES and (context := request_log_var.get()):
+        if outcome == "failed":
+            reason = fields.get("failure_reason")
+            if reason is None:
+                reason = (
+                    "http_status" if fields.get("status_code") is not None else "upstream_error"
+                )
+            context.update(
+                failure_stage=stage,
+                failure_reason=reason,
+                upstream_status_code=fields.get("status_code"),
+                upstream_error_type=fields.get("error_type"),
+            )
+        # A sibling album item completing must not erase another item's failure.
+        # The request middleware clears these fields when the whole request succeeds.
+    if not logger.isEnabledFor(level):
+        return
     extra = {"event": event, "request_id": request_id or request_id_var.get()}
     extra.update({name: value for name, value in fields.items() if name in _STRUCTURED_FIELDS})
     logger.log(level, message or event, extra=extra, exc_info=exc_info)
@@ -173,7 +238,9 @@ class JsonFormatter(logging.Formatter):
             value = getattr(record, name, None)
             if value is not None:
                 payload[name] = value
-        if record.exc_info:
+        if record.exc_text:
+            payload["exception"] = record.exc_text
+        elif record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False, default=str)
 
@@ -203,7 +270,9 @@ class ConsoleFormatter(logging.Formatter):
         ]
         if fields:
             line = f"{line} {' '.join(fields)}"
-        if record.exc_info:
+        if record.exc_text:
+            line = f"{line}\n{record.exc_text}"
+        elif record.exc_info:
             line = f"{line}\n{self.formatException(record.exc_info)}"
         return line
 
@@ -215,13 +284,146 @@ class RequestIdFilter(logging.Filter):
         return True
 
 
+class BackgroundLogHandler(logging.Handler):
+    """Bounded, ordered output; disk/stdout backpressure never blocks request tasks."""
+
+    def __init__(self, sink: logging.Handler, capacity: int = 10_000) -> None:
+        super().__init__()
+        if capacity < 1:
+            raise ValueError("Logging capacity must be positive")
+        self.sink = sink
+        self.capacity = capacity
+        self._condition = threading.Condition()
+        self._normal: deque[tuple[int, logging.LogRecord]] = deque()
+        self._important: deque[tuple[int, logging.LogRecord]] = deque()
+        self._sequence = 0
+        self._active = False
+        self._stopping = False
+        self._dropped: Counter[str] = Counter()
+        self._thread = threading.Thread(target=self._write, name="tt-scrap-logs", daemon=True)
+        self._thread.start()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        snapshot = copy.copy(record)
+        snapshot.request_id = getattr(record, "request_id", request_id_var.get())
+        snapshot.msg = record.getMessage()
+        snapshot.args = None
+        # Do not retain traceback frames and their request-local resources in the queue.
+        if record.exc_info:
+            snapshot.exc_text = logging.Formatter().formatException(record.exc_info)
+            snapshot.exc_info = None
+        with self._condition:
+            if self._stopping:
+                return
+            if len(self._normal) + len(self._important) >= self.capacity:
+                if snapshot.levelno >= logging.WARNING and self._normal:
+                    _, evicted = self._normal.popleft()
+                    self._dropped[evicted.levelname] += 1
+                else:
+                    self._dropped[snapshot.levelname] += 1
+                    return
+            queue = self._important if snapshot.levelno >= logging.WARNING else self._normal
+            queue.append((self._sequence, snapshot))
+            self._sequence += 1
+            self._condition.notify()
+
+    def _write(self) -> None:
+        while True:
+            with self._condition:
+                self._condition.wait_for(lambda: self._normal or self._important or self._stopping)
+                if not self._normal and not self._important:
+                    return
+                queue = self._normal
+                if self._important and (not queue or self._important[0][0] < queue[0][0]):
+                    queue = self._important
+                _, record = queue.popleft()
+                self._active = True
+            try:
+                self.sink.handle(record)
+            except Exception:
+                # A broken log sink must not crash the writer or recursively log to itself.
+                with self._condition:
+                    self._dropped[record.levelname] += 1
+            else:
+                with self._condition:
+                    dropped = dict(self._dropped)
+                    self._dropped.clear()
+                if dropped:
+                    summary = logging.LogRecord(
+                        "tt_scrap.logging",
+                        logging.WARNING,
+                        "",
+                        0,
+                        "Log records dropped during output pressure",
+                        (),
+                        None,
+                    )
+                    summary.event = "logging.records_dropped"
+                    summary.request_id = "-"
+                    summary.dropped_records = dropped
+                    try:
+                        self.sink.handle(summary)
+                    except Exception:
+                        with self._condition:
+                            self._dropped.update(dropped)
+            finally:
+                with self._condition:
+                    self._active = False
+                    self._condition.notify_all()
+
+    def flush(self) -> None:
+        if threading.current_thread() is not self._thread:
+            with self._condition:
+                self._condition.wait_for(
+                    lambda: not self._normal and not self._important and not self._active, timeout=5
+                )
+
+    def close(self) -> None:
+        with self._condition:
+            self._stopping = True
+            self._condition.notify_all()
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=5)
+        super().close()
+
+
+def flush_logging() -> None:
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, BackgroundLogHandler):
+            handler.flush()
+
+
+async def monitor_event_loop(
+    *, interval: float = 1.0, threshold: float = 1.0, cooldown: float = 60.0
+) -> None:
+    last_warning = float("-inf")
+    while True:
+        started = perf_counter()
+        await asyncio.sleep(interval)
+        now = perf_counter()
+        lag = max(0.0, now - started - interval)
+        if lag > threshold and now - last_warning >= cooldown:
+            last_warning = now
+            log_event(
+                logging.getLogger(__name__),
+                "runtime.event_loop.stalled",
+                level=logging.WARNING,
+                event_loop_lag_ms=round(lag * 1000, 3),
+                success=False,
+            )
+
+
 def configure_logging(level: str, log_format: str = "console") -> None:
-    handler = logging.StreamHandler()
+    sink = logging.StreamHandler()
+    sink.setFormatter(JsonFormatter() if log_format == "json" else ConsoleFormatter())
+    root = logging.getLogger()
+    for previous in root.handlers:
+        if isinstance(previous, BackgroundLogHandler):
+            previous.close()
+    root.handlers.clear()
+    handler = BackgroundLogHandler(sink)
     handler.setLevel(level)
     handler.addFilter(RequestIdFilter())
-    handler.setFormatter(JsonFormatter() if log_format == "json" else ConsoleFormatter())
-    root = logging.getLogger()
-    root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(level)
 

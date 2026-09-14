@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import httpx
 
 from ...logging import log_event
+from ...resources import await_completion
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ class ResolverClients:
         self._closing: set[asyncio.Task[None]] = set()
         self._closed = False
 
-    async def _close(self, lease: _ClientLease) -> None:
+    def _close(self, lease: _ClientLease) -> None:
         if lease not in self._leases:
             return
         self._leases.discard(lease)
@@ -50,8 +51,7 @@ class ResolverClients:
         task = asyncio.create_task(close_client())
         self._closing.add(task)
         task.add_done_callback(self._closing.discard)
-        # A second caller cancellation must not interrupt socket cleanup.
-        await asyncio.shield(task)
+        # Cleanup belongs to the pool, not the request whose deadline just expired.
 
     @asynccontextmanager
     async def acquire(self, proxy: str | None) -> AsyncIterator[httpx.AsyncClient]:
@@ -87,11 +87,12 @@ class ResolverClients:
         finally:
             lease.users -= 1
             if lease.retired and lease.users == 0 and lease in self._leases:
-                await self._close(lease)
+                self._close(lease)
 
     async def close(self) -> None:
         self._closed = True
         self._current.clear()
-        await asyncio.gather(*(self._close(lease) for lease in list(self._leases)))
+        for lease in list(self._leases):
+            self._close(lease)
         if self._closing:
-            await asyncio.gather(*self._closing)
+            await await_completion(asyncio.gather(*self._closing))

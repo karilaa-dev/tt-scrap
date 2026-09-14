@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 import random
+import re
 import tempfile
 import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
@@ -13,7 +14,7 @@ from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass
 from functools import partial
 from time import perf_counter
-from typing import BinaryIO, cast
+from typing import BinaryIO, NotRequired, TypedDict, cast
 
 import httpx
 from curl_cffi import CurlError
@@ -22,9 +23,16 @@ from curl_cffi.requests.models import Response as CurlResponse
 
 from ..config import Settings
 from ..errors import AssetTooLargeError, NetworkError, UpstreamTimeoutError
-from ..logging import bind_request_context, elapsed_ms, log_event, record_recovery
+from ..logging import (
+    bind_request_context,
+    elapsed_ms,
+    log_event,
+    record_queue_wait,
+    record_recovery,
+)
 from ..models import AssetFetchContext
 from ..proxy import ProxyChoice, ProxyManager
+from ..resources import await_completion, cancel_and_dispose, close_files, memory_file, run_io
 
 logger = logging.getLogger(__name__)
 # A CDN 404 can mean a stale signed variant or a region-specific edge miss even
@@ -117,6 +125,31 @@ def filename_for_type(filename: str, content_type: str) -> str:
 
 class _RetryableDownload(Exception):
     pass
+
+
+class _FailureDetails(TypedDict):
+    failure_reason: str
+    status_code: NotRequired[int]
+
+
+def _failure_details(error: Exception | None) -> _FailureDetails:
+    status: int | None = None
+    reason = "transport"
+    if isinstance(error, (NetworkError, _RetryableDownload)):
+        match = re.fullmatch(r"(?:Upstream asset returned|Retryable) HTTP (\d{3})", str(error))
+        if match:
+            status = int(match[1])
+            reason = "http_status"
+        elif str(error).startswith("Truncated asset:"):
+            reason = "truncated_asset"
+        elif str(error) == "Upstream returned an empty asset":
+            reason = "empty_asset"
+    if isinstance(error, (TimeoutError, httpx.TimeoutException)):
+        reason = "timeout"
+    details: _FailureDetails = {"failure_reason": reason}
+    if status is not None:
+        details["status_code"] = status
+    return details
 
 
 @dataclass(slots=True)
@@ -289,10 +322,11 @@ class AssetDownloader:
         size_limit = self._size_limit(max_bytes)
         started_at = perf_counter()
         async with AsyncExitStack() as opening_limits:
-            await opening_limits.enter_async_context(self._semaphore)
             await opening_limits.enter_async_context(self._group_limit(context.extraction_id))
+            await opening_limits.enter_async_context(self._semaphore)
             await opening_limits.enter_async_context(self._transfer_semaphore)
             queue_wait = elapsed_ms(started_at)
+            record_queue_wait("download", queue_wait)
             proxy = self._initial_proxy(context)
             upstream_urls = [context.upstream_url, *context.alternate_upstream_urls]
             opened: _OpenStream | None = None
@@ -370,6 +404,7 @@ class AssetDownloader:
                     proxy_used=proxy.url is not None,
                     elapsed_ms=elapsed_ms(attempt_started_at),
                     error_type=type(last_error).__name__,
+                    **_failure_details(last_error),
                     retrying=attempt < self.settings.download_max_retries,
                     success=False,
                 )
@@ -398,8 +433,8 @@ class AssetDownloader:
             async def chunks() -> AsyncGenerator[bytes]:
                 nonlocal consumer_completed, producer
                 async with (
-                    self._semaphore,
                     self._group_limit(context.extraction_id),
+                    self._semaphore,
                     self._transfer_semaphore,
                 ):
                     producer = asyncio.create_task(produce())
@@ -471,6 +506,7 @@ class AssetDownloader:
                         proxy_used=proxy.url is not None,
                         elapsed_ms=elapsed_ms(attempt_started_at),
                         error_type=type(exc).__name__,
+                        **_failure_details(exc if isinstance(exc, Exception) else None),
                         success=False,
                     )
                     await queue.put(exc)
@@ -508,8 +544,9 @@ class AssetDownloader:
         started_at = perf_counter()
         budget = _DownloadBudget(self._size_limit(max_bytes))
         try:
-            async with self._semaphore, self._group_limit(context.extraction_id):
+            async with self._group_limit(context.extraction_id), self._semaphore:
                 queue_wait = elapsed_ms(started_at)
+                record_queue_wait("download", queue_wait)
                 if context.audio:
                     result = await self._download_and_remux(
                         context, compute_sha256=compute_sha256, budget=budget
@@ -519,7 +556,7 @@ class AssetDownloader:
                         context, compute_sha256=compute_sha256, budget=budget
                     )
                 if budget.limit and result.size > budget.limit:
-                    result.file.close()
+                    await close_files([result.file])
                     raise AssetTooLargeError("Prepared asset exceeds the download size limit")
         except Exception as exc:
             log_event(
@@ -591,7 +628,10 @@ class AssetDownloader:
                     raise _RetryableDownload(
                         f"Truncated asset: expected {expected_length} bytes, got {size}"
                     )
-                spool.seek(0)
+                if memory_file(binary_spool):
+                    spool.seek(0)
+                else:
+                    await run_io(spool.seek, 0)
                 content_type = detect_content_type(prefix, declared)
                 result = DownloadedAsset(
                     file=binary_spool,
@@ -633,6 +673,7 @@ class AssetDownloader:
                         proxy_used=proxy.url is not None,
                         elapsed_ms=elapsed_ms(attempt_started_at),
                         error_type=type(exc).__name__,
+                        **_failure_details(exc),
                         retrying=False,
                         success=False,
                     )
@@ -644,7 +685,7 @@ class AssetDownloader:
             finally:
                 if not retain_spool:
                     transfer_budget.release()
-                    spool.close()
+                    await close_files([binary_spool])
             if attempt < self.settings.download_max_retries:
                 if context.platform == "tiktok" and not self.settings.proxy_data_only:
                     proxy = self.proxy_manager.rotate(proxy)
@@ -661,6 +702,7 @@ class AssetDownloader:
                     proxy_used=proxy.url is not None,
                     elapsed_ms=elapsed_ms(attempt_started_at),
                     error_type=type(last_error).__name__,
+                    **_failure_details(last_error),
                     retrying=True,
                     success=False,
                 )
@@ -676,6 +718,7 @@ class AssetDownloader:
             proxy_used=proxy.url is not None,
             elapsed_ms=elapsed_ms(attempt_started_at),
             error_type=type(last_error).__name__,
+            **_failure_details(last_error),
             retrying=False,
             success=False,
         )
@@ -724,12 +767,11 @@ class AssetDownloader:
         try:
             video_asset, audio_asset = await asyncio.gather(*tasks)
         except BaseException as exc:
-            for task in tasks:
-                task.cancel()
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for result in results:
-                if isinstance(result, DownloadedAsset):
-                    result.file.close()
+
+            async def dispose_tracks(results: list[DownloadedAsset]) -> None:
+                await close_files(result.file for result in results)
+
+            await cancel_and_dispose(tasks, dispose=dispose_tracks)
             if isinstance(exc, Exception):
                 log_event(
                     logger,
@@ -784,8 +826,7 @@ class AssetDownloader:
             )
             return result
         finally:
-            video_asset.file.close()
-            audio_asset.file.close()
+            await close_files([video_asset.file, audio_asset.file])
 
     async def _remux_copy(
         self, video: BinaryIO, audio: BinaryIO, *, compute_sha256: bool = True
@@ -804,13 +845,19 @@ class AssetDownloader:
                 max_size=self.settings.spool_threshold_bytes, mode="w+b"
             )
             binary_output = cast(BinaryIO, output)
-            video.seek(0)
-            audio.seek(0)
-            video_fd = video.fileno()
-            audio_fd = audio.fileno()
-            output_fd = output.fileno()
+
+            def prepare_fds() -> tuple[int, int, int]:
+                video.seek(0)
+                audio.seek(0)
+                return video.fileno(), audio.fileno(), output.fileno()
+
             try:
-                process = await asyncio.create_subprocess_exec(
+                video_fd, audio_fd, output_fd = await run_io(prepare_fds)
+            except BaseException:
+                await close_files([binary_output])
+                raise
+            launch = asyncio.create_task(
+                asyncio.create_subprocess_exec(
                     "ffmpeg",
                     "-nostdin",
                     "-hide_banner",
@@ -837,9 +884,22 @@ class AssetDownloader:
                     stderr=asyncio.subprocess.PIPE,
                     pass_fds=(video_fd, audio_fd, output_fd),
                 )
-            except FileNotFoundError as exc:
-                output.close()
-                raise NetworkError("Media remuxer is unavailable") from exc
+            )
+            try:
+                process = await await_completion(launch)
+            except BaseException as exc:
+                try:
+                    if not launch.cancelled() and launch.exception() is None:
+                        abandoned = launch.result()
+                        if abandoned.returncode is None:
+                            with suppress(ProcessLookupError):
+                                abandoned.kill()
+                        await await_completion(asyncio.create_task(abandoned.communicate()))
+                finally:
+                    await close_files([binary_output])
+                if isinstance(exc, FileNotFoundError):
+                    raise NetworkError("Media remuxer is unavailable") from exc
+                raise
             try:
                 _, stderr = await asyncio.wait_for(
                     process.communicate(),
@@ -850,47 +910,51 @@ class AssetDownloader:
                     if process.returncode is None:
                         with suppress(ProcessLookupError):
                             process.kill()
-                    await process.communicate()
+                    await await_completion(asyncio.create_task(process.communicate()))
                 finally:
-                    output.close()
+                    await close_files([binary_output])
                 if isinstance(exc, TimeoutError):
                     raise UpstreamTimeoutError("Media remux timed out") from exc
                 raise
             if process.returncode != 0:
-                output.close()
+                await close_files([binary_output])
                 detail = stderr.decode("utf-8", "replace").strip().splitlines()
                 message = detail[-1][:300] if detail else "unknown ffmpeg error"
                 raise NetworkError(f"Media remux failed: {message}")
 
-            output.seek(0, 2)
-            size = output.tell()
-            if self.settings.max_asset_bytes and size > self.settings.max_asset_bytes:
-                output.close()
-                raise AssetTooLargeError("Remuxed asset exceeds MAX_ASSET_BYTES")
-            digest_value: str | None = None
-            prefix = bytearray()
-            if compute_sha256:
-                digest = hashlib.sha256()
+            def inspect_output() -> DownloadedAsset:
+                output.seek(0, 2)
+                size = output.tell()
+                if self.settings.max_asset_bytes and size > self.settings.max_asset_bytes:
+                    raise AssetTooLargeError("Remuxed asset exceeds MAX_ASSET_BYTES")
+                digest_value: str | None = None
+                prefix = bytearray()
                 output.seek(0)
-                while chunk := output.read(self.settings.download_chunk_bytes):
-                    if len(prefix) < 32:
-                        prefix.extend(chunk[: 32 - len(prefix)])
-                    digest.update(chunk)
-                digest_value = digest.hexdigest()
-            else:
+                if compute_sha256:
+                    digest = hashlib.sha256()
+                    while chunk := output.read(self.settings.download_chunk_bytes):
+                        if len(prefix) < 32:
+                            prefix.extend(chunk[: 32 - len(prefix)])
+                        digest.update(chunk)
+                    digest_value = digest.hexdigest()
+                else:
+                    prefix.extend(output.read(32))
+                if size == 0:
+                    raise NetworkError("Media remux produced an empty asset")
                 output.seek(0)
-                prefix.extend(output.read(32))
-            if size == 0:
-                output.close()
-                raise NetworkError("Media remux produced an empty asset")
-            output.seek(0)
-            return DownloadedAsset(
-                file=binary_output,
-                size=size,
-                sha256=digest_value,
-                content_type=detect_content_type(bytes(prefix), "video/mp4"),
-                declared_content_type="video/mp4",
-            )
+                return DownloadedAsset(
+                    file=binary_output,
+                    size=size,
+                    sha256=digest_value,
+                    content_type=detect_content_type(bytes(prefix), "video/mp4"),
+                    declared_content_type="video/mp4",
+                )
+
+            try:
+                return await run_io(inspect_output)
+            except BaseException:
+                await close_files([binary_output])
+                raise
 
     async def _download_once(
         self,
@@ -928,7 +992,7 @@ class AssetDownloader:
                     digest.update(chunk)
                 if disk_backed or size > self.settings.spool_threshold_bytes:
                     disk_backed = True
-                    await asyncio.to_thread(spool.write, chunk)
+                    await run_io(spool.write, chunk)
                 else:
                     spool.write(chunk)
 

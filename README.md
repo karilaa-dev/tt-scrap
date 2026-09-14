@@ -48,7 +48,7 @@ are:
 | Variable | Purpose |
 | --- | --- |
 | `TT_SCRAP_API_KEY` | Bearer token required by every `/v1/` endpoint |
-| `LOG_LEVEL` | Log verbosity; `INFO` keeps request summaries and major milestones, `DEBUG` includes individual stages |
+| `LOG_LEVEL` | Log verbosity; `INFO` keeps request summaries and lifecycle events, `DEBUG` includes internal stages |
 | `LOG_FORMAT` | `console` by default; use `json` for structured log collectors |
 | `RAPIDAPI_KEY` | Instagram RapidAPI credential |
 | `INSTAGRAM_CONCURRENCY` | Maximum concurrent Instagram provider calls; default 4 |
@@ -85,7 +85,7 @@ The cache is bounded and exists only in the API process. It stores normalized
 metadata and upstream fetch context, never media bytes or request history. TikTok
 information entries use a non-sliding 60-second lifetime; resolved URL mappings use
 600 seconds and asset contexts retain the asset TTL. Concurrent requests for the
-same TikTok share successful or failed work. Failed results are discarded when the
+same TikTok or Instagram post share successful or failed work. Failed results are discarded when the
 waiting group drains, so later requests can retry. All entries
 and asset tokens disappear on restart. Run exactly one Uvicorn worker; multiple
 workers would not share tokens or extraction IDs.
@@ -296,13 +296,31 @@ for example `Server-Timing: app;dur=1842.317`. The duration measures server work
 to response streaming; it does not measure how long the caller takes to receive a
 streamed asset.
 
-At `LOG_LEVEL=INFO`, the service writes extraction, standalone URL resolution,
-music extraction, and overall Telegram delivery milestones, followed by one
-`http.request.completed` summary. Successful health checks appear only at `DEBUG`.
+At `LOG_LEVEL=INFO`, each request writes one `http.request.completed` summary.
+Internal extraction, resolution, and delivery milestones appear at `DEBUG`, as do
+successful health checks. Startup, shutdown, and operational warnings remain visible.
 The summary includes the route, status, duration, request ID, and available platform,
 source ID, delivery mode, and error details. Client errors and partial or rejected
 Telegram deliveries use `WARNING`; server errors use `ERROR`. Telegram success is
 checked against both its HTTP status and JSON `ok` value.
+
+Failed request summaries include sanitized `failure_stage`, `failure_reason`,
+`upstream_status_code`, and `upstream_error_type` when available. Body-reading
+failures retain FastAPI's existing response and identify `http.body_parsing`.
+Queue timings use `resolver_queue_wait_ms`, `extraction_queue_wait_ms`,
+`download_queue_wait_ms`, `pipeline_queue_wait_ms`, `upload_queue_wait_ms`, and
+`image_queue_wait_ms`. Each is the longest observed wait for that stage, so parallel
+album waits are not added together. Recovered failures are omitted from successful
+request summaries; recovery counters remain.
+
+Log output runs in a background thread with a 10,000-record queue. Records capture
+their request ID before enqueueing. During overflow, warnings and errors displace
+lower-priority records; once output resumes, `logging.records_dropped` reports
+dropped counts by level. A queue containing only warnings/errors drops incoming
+records when full. Shutdown flushes queued output for up to five seconds.
+`runtime.event_loop.stalled` warns when loop lag exceeds one second, at most once
+per minute. Correlate these warnings with host CPU, memory, and storage pressure
+before raising concurrency limits.
 
 Recovery is summarized with `retry_count`, `fallback_count`, and
 `thumbnail_skipped_count`; zero counts are omitted. Retries count extra attempts
@@ -348,7 +366,9 @@ results fail immediately.
 Resolution uses a 12-second total budget and a 1-second HTTP pool wait by default.
 Transport failures retire the affected client; existing users finish before it
 closes and new requests use a fresh pool. Healthy clients continue to reuse their
-connections. Pool exhaustion returns `service_busy` with HTTP 503, timeouts return
+connections. Retired-pool cleanup runs separately from requests and drains during
+shutdown, so socket cleanup cannot extend the resolution deadline.
+Pool exhaustion returns `service_busy` with HTTP 503, timeouts return
 `upstream_timeout` with HTTP 504, and other transport failures return
 `upstream_network_error` with HTTP 502. Invalid URLs/redirects and upstream 400/404/410
 responses fail without repeated resolution attempts. Read-only callers should bound
@@ -396,3 +416,6 @@ docker compose up --build -d
 ```
 
 Published images are available at `ghcr.io/karilaa-dev/tt-scrap`.
+
+For the local mixed-workload benchmark, measured results, and rollout notes, see
+[performance and resilience](docs/performance-and-resilience.md).

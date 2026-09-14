@@ -35,6 +35,7 @@ from ...models import (
     TikTokResolutionResponse,
 )
 from ...proxy import ProxyManager, ProxySession
+from ...resources import run_io
 from .adapter import TikTokAdapter, YtdlpContext, validate_tiktok_url
 
 logger = logging.getLogger(__name__)
@@ -381,6 +382,7 @@ class TikTokService:
         log_event(
             logger,
             "tiktok.extraction.completed",
+            level=logging.DEBUG,
             message=(
                 "TikTok extraction served from cache"
                 if cache_hit
@@ -413,6 +415,7 @@ class TikTokService:
         log_event(
             logger,
             "tiktok.resolution.completed",
+            level=logging.DEBUG,
             message=(
                 "TikTok URL resolution served from cache"
                 if cache_hit
@@ -434,6 +437,7 @@ class TikTokService:
             async with asyncio.timeout(self.settings.url_resolve_timeout_seconds):
                 return await self._resolve_url(source_url, refresh=refresh)
         except TimeoutError as exc:
+            bind_request_context(failure_stage="tiktok.url_resolution", failure_reason="deadline")
             raise UpstreamTimeoutError("TikTok URL resolution deadline exceeded") from exc
 
     async def _resolve_url(
@@ -617,13 +621,14 @@ class TikTokService:
 
                 extraction_url = f"https://www.tiktok.com/@_/video/{video_id}"
                 proxy_session = ProxySession(self.proxy_manager)
+                bind_request_context(cache_hit=False, cache_scope=None)
                 data, context = await self.adapter.extract(extraction_url, video_id, proxy_session)
                 try:
                     response = await self._build_video_response(
                         data, context, video_id, source_url, resolved_url
                     )
                 finally:
-                    context.close()
+                    await run_io(context.close)
                 ttl = self.settings.tiktok_info_cache_ttl_seconds
                 await self.cache.set_model(video_cache_key, response, ttl_seconds=ttl)
                 await self.cache.set_model(url_cache_key, response, ttl_seconds=ttl)
@@ -909,6 +914,7 @@ class TikTokService:
                 log_event(
                     logger,
                     "tiktok.music_extraction.completed",
+                    level=logging.DEBUG,
                     message="TikTok music extraction served from cache",
                     platform="tiktok",
                     source_id=identity,
@@ -931,6 +937,7 @@ class TikTokService:
                     log_event(
                         logger,
                         "tiktok.music_extraction.completed",
+                        level=logging.DEBUG,
                         message="TikTok music extraction served from coalesced cache",
                         platform="tiktok",
                         source_id=identity,
@@ -984,7 +991,7 @@ class TikTokService:
                     expires_at=expires_at,
                 )
             finally:
-                context.close()
+                await run_io(context.close)
             await self.cache.set_model(
                 cache_key,
                 response,
@@ -999,6 +1006,7 @@ class TikTokService:
             log_event(
                 logger,
                 "tiktok.music_extraction.completed",
+                level=logging.DEBUG,
                 message="TikTok music extraction completed",
                 platform="tiktok",
                 source_id=identity,

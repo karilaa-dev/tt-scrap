@@ -69,7 +69,7 @@ async def test_mixed_carousel_is_normalized_and_cached(
     finally:
         await service.close()
 
-    assert [record.event for record in log_records] == ["instagram.extraction.completed"] * 3
+    assert not log_records
     assert all(record.levelno < 30 for record in log_records)
 
 

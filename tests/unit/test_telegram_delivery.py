@@ -321,7 +321,7 @@ async def test_video_upload_infers_metadata_and_attaches_thumbnail(
         "thumbnail_file": b"\xff\xd8\xffthumbnail",
     }
 
-    assert [record.event for record in log_records] == ["telegram.delivery.completed"]
+    assert not log_records
     assert request_log_context.summary()["success"] is True
     assert "thumbnail_skipped_count" not in request_log_context.summary()
     assert all(record.levelno < 30 for record in log_records)
@@ -696,7 +696,7 @@ async def test_slideshow_is_partitioned_without_single_item_tail(
     assert [len(call[1]["media"]) for call in client.calls] == expected_batches
     assert all(item["type"] == "photo" for call in client.calls for item in call[1]["media"])
 
-    assert [record.event for record in log_records] == ["telegram.delivery.completed"]
+    assert not log_records
 
 
 @pytest.mark.asyncio
@@ -1011,3 +1011,75 @@ async def test_slideshow_documents_preserve_original_bytes_without_image_work(se
     assert list(uploads.values()) == [b"BMfirst", b"BMsecond"]
     assert images.photo_conversions == 0
     assert images.thumbnail_conversions == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_album_cancels_remaining_downloads(settings):
+    cache = CacheStore(600, 100)
+    media = [await descriptor(cache, f"image-{index}", "image", index) for index in range(3)]
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/photo/123",
+        resolved_url="https://www.tiktok.com/@a/photo/123",
+        content_type="slideshow",
+        media=media,
+        expires_at=media[0].expires_at,
+    )
+    started, cancelled = asyncio.Event(), asyncio.Event()
+    completed_file = io.BytesIO(b"image")
+
+    class Downloader(FakeDownloader):
+        async def download(self, context, **kwargs):
+            if context.upstream_url == "image-0":
+                await started.wait()
+                raise NetworkError("inaccessible first image")
+            if context.upstream_url == "image-1":
+                started.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    cancelled.set()
+            return DownloadedAsset(completed_file, 5, None, "image/jpeg")
+
+    client = FakeTelegramClient()
+    delivery = service(settings, cache, extraction, Downloader({}), client)
+    with pytest.raises(NetworkError, match="inaccessible first image"):
+        await asyncio.wait_for(delivery.deliver(request()), 0.2)
+    assert cancelled.is_set()
+    assert completed_file.closed
+    assert not client.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("statuses", [[200], [200, 429]])
+async def test_album_cleanup_preserves_accepted_or_partial_result(settings, statuses):
+    cache = CacheStore(600, 100)
+    count = 2 if len(statuses) == 1 else 11
+    media = [await descriptor(cache, f"image-{index}", "image", index) for index in range(count)]
+    extraction = TikTokExtractionResponse(
+        extraction_id="extraction-1",
+        source_id="123",
+        source_url="https://www.tiktok.com/@a/photo/123",
+        resolved_url="https://www.tiktok.com/@a/photo/123",
+        content_type="slideshow",
+        media=media,
+        expires_at=media[0].expires_at,
+    )
+
+    class File(io.BytesIO):
+        def close(self):
+            super().close()
+            raise ValueError("I/O operation on closed file")
+
+    class Downloader(FakeDownloader):
+        async def download(self, context, **kwargs):
+            return DownloadedAsset(File(b"original"), 8, None, "image/jpeg")
+
+    client = FakeTelegramClient(statuses)
+    outcome = await service(settings, cache, extraction, Downloader({}), client).deliver(
+        request("document")
+    )
+    assert len(outcome.calls) == len(statuses)
+    assert outcome.partial is (len(statuses) > 1)
+    assert [call.status_code for call in outcome.calls] == statuses

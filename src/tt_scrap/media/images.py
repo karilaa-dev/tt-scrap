@@ -20,7 +20,8 @@ from pillow_heif import register_heif_opener
 
 from ..config import Settings
 from ..errors import ImageConversionError
-from ..logging import elapsed_ms, log_event
+from ..logging import elapsed_ms, log_event, record_queue_wait
+from ..resources import run_io
 
 logger = logging.getLogger(__name__)
 
@@ -317,7 +318,7 @@ class ImagePreparationService:
 
     async def read_file(self, file: BinaryIO) -> bytes:
         started_at = perf_counter()
-        data = await asyncio.to_thread(_read_file_sync, file)
+        data = await run_io(_read_file_sync, file)
         log_event(
             logger,
             "image.file_read.completed",
@@ -337,7 +338,7 @@ class ImagePreparationService:
         declared_content_type: str | None,
     ) -> bool:
         started_at = perf_counter()
-        compliant = await asyncio.to_thread(
+        compliant = await run_io(
             _native_photo_is_compliant_sync,
             file,
             size,
@@ -364,6 +365,7 @@ class ImagePreparationService:
             raise ImageConversionError(f"Only HEIC/HEIF photos are converted; detected {detected}")
         async with self._semaphore:
             queue_wait = elapsed_ms(started_at)
+            record_queue_wait("image", queue_wait)
             loop = asyncio.get_running_loop()
             try:
                 result = await loop.run_in_executor(
@@ -407,6 +409,7 @@ class ImagePreparationService:
             raise ImageConversionError(f"Photo format cannot be normalized: {detected}")
         async with self._semaphore:
             queue_wait = elapsed_ms(started_at)
+            record_queue_wait("image", queue_wait)
             loop = asyncio.get_running_loop()
             try:
                 result = await loop.run_in_executor(
@@ -447,7 +450,7 @@ class ImagePreparationService:
         detected = detect_image_format(data[:32])
         if detected not in _THUMBNAIL_INPUT_FORMATS:
             raise ImageConversionError(f"Unsupported Telegram thumbnail format: {detected}")
-        verified = await asyncio.to_thread(_verified_jpeg_thumbnail, data, filename)
+        verified = await run_io(_verified_jpeg_thumbnail, data, filename)
         if verified is not None:
             log_event(
                 logger,
@@ -467,9 +470,10 @@ class ImagePreparationService:
         queue_started_at = perf_counter()
         async with self._semaphore:
             queue_wait = elapsed_ms(queue_started_at)
+            record_queue_wait("image", queue_wait)
             try:
                 if detected in _NATIVE_PHOTO_FORMATS:
-                    result = await asyncio.to_thread(_thumbnail_sync, data, filename)
+                    result = await run_io(_thumbnail_sync, data, filename)
                     execution = "thread"
                 else:
                     loop = asyncio.get_running_loop()
@@ -509,4 +513,4 @@ class ImagePreparationService:
         return result
 
     async def close(self) -> None:
-        await asyncio.to_thread(self._executor.shutdown, wait=True, cancel_futures=True)
+        await run_io(self._executor.shutdown, wait=True, cancel_futures=True)

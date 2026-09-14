@@ -10,8 +10,10 @@ from time import perf_counter
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
 from .api.routes import assets, health, instagram, tiktok
@@ -22,7 +24,9 @@ from .logging import (
     RequestLogContext,
     configure_logging,
     elapsed_ms,
+    flush_logging,
     log_event,
+    monitor_event_loop,
     request_id_var,
     request_log_var,
 )
@@ -177,10 +181,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             instagram=app.state.instagram,
         )
         image_warm_task = asyncio.create_task(app.state.image_preparation.warm())
+        lag_monitor = asyncio.create_task(monitor_event_loop())
         logger.info("tt-scrap started")
         try:
             yield
         finally:
+            lag_monitor.cancel()
+            await asyncio.gather(lag_monitor, return_exceptions=True)
             if not image_warm_task.done():
                 image_warm_task.cancel()
             await asyncio.gather(image_warm_task, return_exceptions=True)
@@ -191,6 +198,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await app.state.asset_downloader.close()
             await cache.close()
             logger.info("tt-scrap stopped")
+            await asyncio.to_thread(flush_logging)
 
     app = FastAPI(
         title="tt-scrap",
@@ -247,6 +255,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     fields.setdefault("platform", platform)
             outcome_success = fields.pop("success", True)
             success = status_code < 400 and outcome_success
+            if success:
+                for key in (
+                    "failure_stage",
+                    "failure_reason",
+                    "upstream_status_code",
+                    "upstream_error_type",
+                ):
+                    fields.pop(key, None)
             if status_code >= 500:
                 level = logging.ERROR
             elif not success:
@@ -275,6 +291,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 request_log_var.reset(context_token)
                 request_id_var.reset(token)
 
+    @app.exception_handler(StarletteHTTPException)
+    async def framework_error_handler(request: Request, exc: StarletteHTTPException) -> Response:
+        if exc.status_code == 400 and exc.detail == "There was an error parsing the body":
+            request.state.log_context.update(
+                failure_stage="http.body_parsing",
+                failure_reason="body_read_failed",
+                upstream_error_type=type(exc.__cause__).__name__ if exc.__cause__ else None,
+            )
+        return await http_exception_handler(request, exc)
+
     @app.exception_handler(ScraperError)
     async def scraper_error_handler(request: Request, exc: ScraperError) -> JSONResponse:
         request_id = getattr(request.state, "request_id", "-")
@@ -293,6 +319,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             error_code="validation_error",
             error_type=type(exc).__name__,
         )
+        if any(error["type"] == "json_invalid" for error in exc.errors()):
+            request.state.log_context.update(
+                failure_stage="http.body_parsing", failure_reason="invalid_json"
+            )
         return _error_response(422, "validation_error", "Request validation failed", request_id)
 
     @app.exception_handler(Exception)

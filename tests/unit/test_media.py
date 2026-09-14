@@ -628,3 +628,53 @@ async def test_cancelled_remux_kills_and_reaps_ffmpeg(settings, monkeypatch):
         assert killed and reaped
     finally:
         await downloader.close()
+
+
+async def test_cancelled_remux_launch_drains_before_closing_output(settings, monkeypatch):
+    import os
+    import tempfile
+
+    started, release = asyncio.Event(), asyncio.Event()
+    killed = reaped = False
+    output_fd = None
+
+    class Process:
+        returncode = None
+
+        def kill(self):
+            nonlocal killed
+            killed = True
+
+        async def communicate(self):
+            nonlocal reaped
+            assert killed
+            os.fstat(output_fd)  # Still owned until the subprocess has stopped.
+            reaped = True
+            self.returncode = -9
+            return b"", b""
+
+    async def create_process(*args, **kwargs):
+        nonlocal output_fd
+        output_fd = kwargs["pass_fds"][2]
+        started.set()
+        await release.wait()
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    downloader = AssetDownloader(settings, ProxyManager())
+    try:
+        with tempfile.TemporaryFile() as video, tempfile.TemporaryFile() as audio:
+            task = asyncio.create_task(downloader._remux_copy(video, audio))
+            await started.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert killed and reaped
+        with pytest.raises(OSError):
+            os.fstat(output_fd)
+    finally:
+        release.set()
+        await downloader.close()

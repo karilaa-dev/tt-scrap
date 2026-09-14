@@ -313,3 +313,46 @@ async def test_sensitive_content_extractor_error_is_not_retried(settings, monkey
         assert calls == 1
     finally:
         await adapter.close()
+
+
+async def test_cancelled_extraction_drains_worker_and_closes_abandoned_context(
+    settings, monkeypatch
+):
+    import asyncio
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+    worker_finished = threading.Event()
+    close_threads = []
+
+    class Context:
+        def close(self):
+            assert worker_finished.is_set()
+            close_threads.append(threading.get_ident())
+
+    def extract(*args):
+        started.set()
+        assert release.wait(2)
+        worker_finished.set()
+        return {"video": {}}, None, Context()
+
+    adapter = TikTokAdapter(settings, ProxyManager())
+    monkeypatch.setattr(adapter, "_extract_sync", extract)
+    task = asyncio.create_task(
+        adapter.extract("https://www.tiktok.com/@_/video/123", "123", ProxySession(ProxyManager()))
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(close_threads) == 1
+        assert close_threads[0] != threading.get_ident()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await adapter.close()
