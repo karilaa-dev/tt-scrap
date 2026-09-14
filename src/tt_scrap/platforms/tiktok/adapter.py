@@ -30,8 +30,15 @@ from ...errors import (
     ServiceBusyError,
     UpstreamTimeoutError,
 )
-from ...logging import bind_request_context, elapsed_ms, log_event, record_recovery
+from ...logging import (
+    bind_request_context,
+    elapsed_ms,
+    log_event,
+    record_queue_wait,
+    record_recovery,
+)
 from ...proxy import ProxyManager, ProxySession
+from ...resources import await_completion, run_io
 from .http import ResolverClients
 
 logger = logging.getLogger(__name__)
@@ -189,6 +196,7 @@ class TikTokAdapter:
                 queue_started_at = perf_counter()
                 async with self._url_resolution_semaphore:
                     queue_wait = elapsed_ms(queue_started_at)
+                    record_queue_wait("resolver", queue_wait)
                     async with self._clients.acquire(choice.url) as client:
                         resolved = await self._follow_tiktok_redirects(client, url)
                 log_event(
@@ -225,6 +233,9 @@ class TikTokAdapter:
                     queue_wait_ms=queue_wait,
                     elapsed_ms=elapsed_ms(attempt_started_at),
                     error_type=type(exc).__name__,
+                    status_code=(
+                        exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+                    ),
                     retrying=retrying,
                     success=False,
                 )
@@ -325,6 +336,7 @@ class TikTokAdapter:
         started_at = perf_counter()
         async with self._semaphore:
             queue_wait = elapsed_ms(started_at)
+            record_queue_wait("extraction", queue_wait)
             last_status: str | None = None
             last_error: Exception | None = None
             for attempt in range(1, self.settings.video_info_max_retries + 1):
@@ -335,7 +347,7 @@ class TikTokAdapter:
                 context: YtdlpContext | None = None
                 try:
                     loop = asyncio.get_running_loop()
-                    data, status, context = await loop.run_in_executor(
+                    extraction = loop.run_in_executor(
                         self._executor,
                         copy_context().run,
                         self._extract_sync,
@@ -344,6 +356,14 @@ class TikTokAdapter:
                         choice.url,
                         choice.slot,
                     )
+                    try:
+                        data, status, context = await await_completion(extraction)
+                    except asyncio.CancelledError:
+                        if not extraction.cancelled() and extraction.exception() is None:
+                            abandoned_context = extraction.result()[2]
+                            if abandoned_context is not None:
+                                await run_io(abandoned_context.close)
+                        raise
                     last_status = str(status) if status is not None else None
                     if status == "deleted":
                         raise ContentDeletedError("TikTok content was deleted")
@@ -367,7 +387,7 @@ class TikTokAdapter:
                         )
                         return data, context
                     if context:
-                        context.close()
+                        await run_io(context.close)
                     last_error = ExtractionError(f"TikTok extraction status: {status}")
                 except (
                     ContentDeletedError,
@@ -375,7 +395,7 @@ class TikTokAdapter:
                     RegionBlockedError,
                 ) as exc:
                     if context:
-                        context.close()
+                        await run_io(context.close)
                     log_event(
                         logger,
                         "tiktok.metadata.failed",
@@ -395,7 +415,7 @@ class TikTokAdapter:
                     raise
                 except Exception as exc:
                     if context:
-                        context.close()
+                        await run_io(context.close)
                     last_error = exc
                 retrying = attempt < self.settings.video_info_max_retries
                 log_event(

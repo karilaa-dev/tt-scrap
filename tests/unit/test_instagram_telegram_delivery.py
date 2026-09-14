@@ -365,3 +365,52 @@ async def test_instagram_carousel_batches_without_single_item_tail(settings) -> 
     assert [len(call[1]["media"]) for call in client.calls] == [9, 2]
     assert client.calls[0][1]["media"][0]["caption"] == "first batch"
     assert all("caption" not in item for item in client.calls[1][1]["media"])
+
+
+@pytest.mark.parametrize("failure_position", [0, 1, 3])
+async def test_carousel_failure_cancels_siblings_and_closes_completed_files(
+    settings, failure_position
+):
+    import asyncio
+
+    from tt_scrap.errors import NetworkError
+
+    cache = CacheStore(600, 100)
+    descriptors = [await descriptor(cache, f"image-{i}", "image", i) for i in range(5)]
+    extraction = InstagramExtractionResponse(
+        extraction_id="instagram-extraction",
+        source_id="ABC123",
+        source_url="https://www.instagram.com/p/ABC123/",
+        content_type="carousel",
+        media=[
+            InstagramMediaItem(position=i, media_type="image", asset=item)
+            for i, item in enumerate(descriptors)
+        ],
+        expires_at=descriptors[0].expires_at,
+    )
+    started, cancelled = asyncio.Event(), asyncio.Event()
+    files = []
+
+    class Downloader(FakeDownloader):
+        async def download(self, context, **kwargs):
+            index = int(context.upstream_url.split("-")[-1])
+            if index == failure_position:
+                await started.wait()
+                raise NetworkError("unavailable item")
+            if index == 4:
+                started.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    cancelled.set()
+            file = io.BytesIO(b"original")
+            files.append(file)
+            return DownloadedAsset(file, 8, None, "image/jpeg")
+
+    client = FakeTelegramClient()
+    delivery, _ = service(settings, cache, extraction, Downloader({}), client)
+    with pytest.raises(NetworkError, match="unavailable item"):
+        await asyncio.wait_for(delivery.deliver_instagram(request()), 0.2)
+    assert cancelled.is_set()
+    assert all(file.closed for file in files)
+    assert not client.calls

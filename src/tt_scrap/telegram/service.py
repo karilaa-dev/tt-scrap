@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any, BinaryIO, Literal
+from typing import Any, BinaryIO, Literal, cast
 
 from ..cache import CacheStore
 from ..config import Settings
@@ -19,7 +19,13 @@ from ..errors import (
     ImageConversionError,
     TelegramParameterError,
 )
-from ..logging import bind_request_context, elapsed_ms, log_event, record_recovery
+from ..logging import (
+    bind_request_context,
+    elapsed_ms,
+    log_event,
+    record_queue_wait,
+    record_recovery,
+)
 from ..media import AssetDownloader, DownloadedAsset, ImagePreparationService, StreamedAsset
 from ..media.downloader import filename_for_type
 from ..media.images import detect_image_format, is_native_telegram_photo
@@ -36,6 +42,8 @@ from ..models import (
 )
 from ..platforms.instagram import InstagramService
 from ..platforms.tiktok import TikTokService
+from ..resources import cancel_and_dispose, ordered_results, read_file
+from ..resources import close_files as _close_files
 from .client import TelegramCallResponse, TelegramClient, TelegramUpload, _telegram_error_details
 
 logger = logging.getLogger(__name__)
@@ -132,12 +140,21 @@ class _PreparedInstagramItem:
     thumbnail: _PreparedUpload | None = None
 
 
-def _close_files(files: list[BinaryIO]) -> None:
-    for file in files:
-        try:
-            file.close()
-        except OSError:
-            pass
+def _media_files(value: object) -> Iterator[BinaryIO]:
+    if isinstance(value, (DownloadedAsset, _PreparedUpload)):
+        yield value.file
+    elif isinstance(value, _PreparedInstagramItem):
+        yield from _media_files(value.media)
+        yield from _media_files(value.thumbnail)
+    elif isinstance(value, io.IOBase):
+        yield cast(BinaryIO, value)
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            yield from _media_files(item)
+
+
+async def _dispose_media(values: object) -> None:
+    await _close_files(_media_files(values))
 
 
 def _album_batches[AlbumItemT](items: list[AlbumItemT]) -> list[list[AlbumItemT]]:
@@ -178,7 +195,9 @@ class TelegramDeliveryService:
 
     @asynccontextmanager
     async def _upload_slot(self) -> AsyncIterator[None]:
+        started = perf_counter()
         async with self._upload_limit:
+            record_queue_wait("upload", elapsed_ms(started))
             yield
 
     async def _call(
@@ -205,6 +224,7 @@ class TelegramDeliveryService:
         try:
             async with self._pipeline_limit:
                 queue_wait = elapsed_ms(started_at)
+                record_queue_wait("pipeline", queue_wait)
                 if request.delivery == "audio":
                     outcome = await self._deliver_audio(request)
                 else:
@@ -235,7 +255,7 @@ class TelegramDeliveryService:
         log_event(
             logger,
             "telegram.delivery.completed",
-            level=logging.INFO if outcome.ok else logging.DEBUG,
+            level=logging.DEBUG,
             message="TikTok Telegram delivery completed",
             platform="tiktok",
             delivery=request.delivery,
@@ -262,6 +282,7 @@ class TelegramDeliveryService:
         try:
             async with self._pipeline_limit:
                 queue_wait = elapsed_ms(started_at)
+                record_queue_wait("pipeline", queue_wait)
                 extraction = await self._resolve_instagram_extraction(request)
                 if len(extraction.media) == 1:
                     outcome = await self._deliver_instagram_single(request, extraction.media[0])
@@ -289,7 +310,7 @@ class TelegramDeliveryService:
         log_event(
             logger,
             "telegram.delivery.completed",
-            level=logging.INFO if outcome.ok else logging.DEBUG,
+            level=logging.DEBUG,
             message="Instagram Telegram delivery completed",
             platform="instagram",
             delivery=request.delivery,
@@ -368,12 +389,7 @@ class TelegramDeliveryService:
             media_result = await media_task
             return media_result, await cover_task
         except BaseException:
-            media_task.cancel()
-            cover_task.cancel()
-            results = await asyncio.gather(media_task, cover_task, return_exceptions=True)
-            for result in results:
-                if isinstance(result, DownloadedAsset):
-                    result.file.close()
+            await cancel_and_dispose([media_task, cover_task], dispose=_dispose_media)
             raise
 
     async def _download_prepared_thumbnail(
@@ -402,7 +418,7 @@ class TelegramDeliveryService:
                 thumbnail_filename,
             )
         except BaseException:
-            downloaded_cover.file.close()
+            await _close_files([downloaded_cover.file])
             raise
         return downloaded_cover, thumbnail
 
@@ -428,16 +444,6 @@ class TelegramDeliveryService:
             )
             return None, None
 
-    @staticmethod
-    def _close_thumbnail(
-        result: tuple[DownloadedAsset | None, tuple[io.BytesIO, str] | None],
-    ) -> None:
-        cover, thumbnail = result
-        if cover is not None:
-            cover.file.close()
-        if thumbnail is not None:
-            thumbnail[0].close()
-
     @asynccontextmanager
     async def _background_thumbnail(
         self,
@@ -448,11 +454,7 @@ class TelegramDeliveryService:
         try:
             yield task
         finally:
-            if not task.done():
-                task.cancel()
-            result = (await asyncio.gather(task, return_exceptions=True))[0]
-            if isinstance(result, tuple):
-                self._close_thumbnail(result)
+            await cancel_and_dispose([task], dispose=_dispose_media)
 
     async def _download_with_prepared_thumbnail(
         self,
@@ -468,13 +470,7 @@ class TelegramDeliveryService:
             cover_result, thumbnail = await cover_task
             return media_result, cover_result, thumbnail
         except BaseException:
-            media_task.cancel()
-            cover_task.cancel()
-            results = await asyncio.gather(media_task, cover_task, return_exceptions=True)
-            if isinstance(results[0], DownloadedAsset):
-                results[0].file.close()
-            if isinstance(results[1], tuple):
-                self._close_thumbnail(results[1])
+            await cancel_and_dispose([media_task, cover_task], dispose=_dispose_media)
             raise
 
     async def _thumbnail(
@@ -627,7 +623,7 @@ class TelegramDeliveryService:
                 )
                 return TelegramDeliveryOutcome([response])
             finally:
-                video.file.close()
+                await _close_files([video.file])
 
         fields = self._fields(request.telegram, _VIDEO_FIELDS)
         self._default(fields, request.telegram, "duration", extraction.duration_seconds)
@@ -672,10 +668,7 @@ class TelegramDeliveryService:
             response = await self._call("sendVideo", fields, uploads)
             return TelegramDeliveryOutcome([response])
         finally:
-            video.file.close()
-            if cover is not None:
-                cover.file.close()
-            _close_files(extra_files)
+            await _dispose_media((video, cover, extra_files))
 
     async def _music_for_request(
         self, request: TikTokTelegramDeliveryRequest
@@ -729,10 +722,7 @@ class TelegramDeliveryService:
             response = await self._call("sendAudio", fields, uploads)
             return TelegramDeliveryOutcome([response])
         finally:
-            audio.file.close()
-            if cover is not None:
-                cover.file.close()
-            _close_files(extra_files)
+            await _dispose_media((audio, cover, extra_files))
 
     async def _prepare_instagram_item(
         self,
@@ -887,12 +877,7 @@ class TelegramDeliveryService:
             response = await self._call("sendVideo", fields, uploads)
             return TelegramDeliveryOutcome([response])
         finally:
-            downloaded.file.close()
-            if thumbnail is not None:
-                thumbnail.file.close()
-            _close_files(extra_files)
-            if converted_thumbnail is not None:
-                converted_thumbnail[0].close()
+            await _dispose_media((downloaded, thumbnail, extra_files, converted_thumbnail))
 
     async def _deliver_instagram_carousel(
         self,
@@ -941,9 +926,9 @@ class TelegramDeliveryService:
             return downloaded, downloaded_cover, None
 
         download_started_at = perf_counter()
-        download_outcomes = await asyncio.gather(
-            *[download_item(item) for item in extraction.media],
-            return_exceptions=True,
+        download_outcomes = await ordered_results(
+            [download_item(item) for item in extraction.media],
+            dispose=_dispose_media,
         )
         downloaded_items: list[
             tuple[
@@ -959,12 +944,7 @@ class TelegramDeliveryService:
             else:
                 downloaded_items.append(download_outcome)
         if download_failure is not None:
-            for media, thumbnail, converted_thumbnail in downloaded_items:
-                media.file.close()
-                if thumbnail is not None:
-                    thumbnail.file.close()
-                if converted_thumbnail is not None:
-                    converted_thumbnail[0].close()
+            await _dispose_media(downloaded_items)
             log_event(
                 logger,
                 "telegram.album_downloads.failed",
@@ -997,8 +977,8 @@ class TelegramDeliveryService:
         extra_files: list[BinaryIO] = []
         try:
             preparation_started_at = perf_counter()
-            preparation_outcomes = await asyncio.gather(
-                *[
+            preparation_outcomes = await ordered_results(
+                [
                     self._prepare_instagram_item(
                         item,
                         downloaded[0],
@@ -1013,7 +993,7 @@ class TelegramDeliveryService:
                         strict=True,
                     )
                 ],
-                return_exceptions=True,
+                dispose=_dispose_media,
             )
             prepared: list[_PreparedInstagramItem] = []
             preparation_failure: BaseException | None = None
@@ -1130,13 +1110,7 @@ class TelegramDeliveryService:
                     break
             return TelegramDeliveryOutcome(calls)
         finally:
-            for media, thumbnail, converted_thumbnail in downloaded_items:
-                media.file.close()
-                if thumbnail is not None:
-                    thumbnail.file.close()
-                if converted_thumbnail is not None:
-                    converted_thumbnail[0].close()
-            _close_files(extra_files)
+            await _dispose_media((downloaded_items, extra_files))
 
     async def _prepare_slideshow_item(
         self, descriptor: AssetDescriptor, downloaded: DownloadedAsset, *, document: bool
@@ -1144,9 +1118,7 @@ class TelegramDeliveryService:
         filename = filename_for_type(descriptor.filename, downloaded.content_type)
         if document:
             return _PreparedUpload(downloaded.file, filename, downloaded.content_type), None
-        downloaded.file.seek(0)
-        prefix = downloaded.file.read(32)
-        downloaded.file.seek(0)
+        prefix = await read_file(downloaded.file, 32, rewind=True)
         detected = detect_image_format(prefix)
         if detected in {"jpeg", "png", "webp"}:
             compliant = is_native_telegram_photo(prefix) and (
@@ -1194,11 +1166,11 @@ class TelegramDeliveryService:
             fields = self._fields(request.telegram, _MEDIA_GROUP_FIELDS)
         download_started_at = perf_counter()
         tasks = [asyncio.create_task(self._download(item)) for item in extraction.media]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await ordered_results(tasks, dispose=_dispose_media)
         downloaded = [item for item in results if isinstance(item, DownloadedAsset)]
         failures = [item for item in results if isinstance(item, BaseException)]
         if failures:
-            _close_files([item.file for item in downloaded])
+            await _close_files([item.file for item in downloaded])
             log_event(
                 logger,
                 "telegram.album_downloads.failed",
@@ -1227,8 +1199,8 @@ class TelegramDeliveryService:
         converted_files: list[BinaryIO] = []
         try:
             preparation_started_at = perf_counter()
-            prepared_outcomes = await asyncio.gather(
-                *[
+            prepared_outcomes = await ordered_results(
+                [
                     self._prepare_slideshow_item(
                         descriptor,
                         item,
@@ -1236,7 +1208,7 @@ class TelegramDeliveryService:
                     )
                     for descriptor, item in zip(extraction.media, downloaded, strict=True)
                 ],
-                return_exceptions=True,
+                dispose=_dispose_media,
             )
             prepared_results: list[tuple[_PreparedUpload, BinaryIO | None]] = []
             preparation_failure: BaseException | None = None
@@ -1340,5 +1312,4 @@ class TelegramDeliveryService:
                     break
             return TelegramDeliveryOutcome(calls)
         finally:
-            _close_files([item.file for item in downloaded])
-            _close_files(converted_files)
+            await _dispose_media((downloaded, converted_files))

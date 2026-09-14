@@ -12,6 +12,7 @@ from tt_scrap.logging import (
     RequestIdFilter,
     bind_request_context,
     configure_logging,
+    flush_logging,
     log_event,
     record_recovery,
     request_id_var,
@@ -142,6 +143,143 @@ def test_configured_level_filters_dependencies_with_explicit_lower_levels(capsys
         with patch.object(dependency, "level", logging.INFO):
             dependency.warning("filtered-warning")
             dependency.error("visible-error")
+        flush_logging()
+        for handler in root.handlers:
+            handler.close()
     output = capsys.readouterr().err
     assert "filtered-warning" not in output
     assert "visible-error" in output
+
+
+def test_background_logging_snapshots_context_and_prioritizes_warnings():
+    import threading
+
+    from tt_scrap.logging import BackgroundLogHandler
+
+    entered, release = threading.Event(), threading.Event()
+    records = []
+
+    class SlowSink(logging.Handler):
+        def emit(self, record):
+            if not records:
+                entered.set()
+                assert release.wait(2)
+            records.append(record)
+
+    handler = BackgroundLogHandler(SlowSink(), capacity=2)
+    try:
+        handler.handle(logging.makeLogRecord({"msg": "blocking", "levelno": logging.INFO}))
+        assert entered.wait(1)
+        token = request_id_var.set("before-enqueue")
+        try:
+            for message, level in [
+                ("evicted", logging.INFO),
+                ("retained", logging.INFO),
+                ("dropped", logging.INFO),
+                ("warning", logging.WARNING),
+            ]:
+                handler.handle(logging.LogRecord("test", level, "", 0, message, (), None))
+        finally:
+            request_id_var.reset(token)
+        assert len(handler._normal) + len(handler._important) == 2
+        release.set()
+        handler.flush()
+        assert [record.msg for record in records if not hasattr(record, "event")] == [
+            "blocking",
+            "retained",
+            "warning",
+        ]
+        assert records[-1].request_id == "before-enqueue"
+        dropped = [record for record in records if hasattr(record, "dropped_records")]
+        assert len(dropped) == 1
+        assert dropped[0].dropped_records == {"INFO": 2}
+    finally:
+        release.set()
+        handler.close()
+
+
+async def test_loop_lag_warning_is_rate_limited(monkeypatch, log_records):
+    import asyncio
+
+    from tt_scrap.logging import monitor_event_loop
+
+    times = iter([0, 3, 3, 6, 62, 65])
+    monkeypatch.setattr("tt_scrap.logging.perf_counter", lambda: next(times))
+    calls = 0
+
+    async def sleep(interval):
+        nonlocal calls
+        assert interval == 1
+        calls += 1
+        if calls > 3:
+            raise asyncio.CancelledError
+
+    # Stop before requesting a seventh clock sample.
+    def clock():
+        try:
+            return next(times)
+        except StopIteration:
+            raise asyncio.CancelledError from None
+
+    monkeypatch.setattr("tt_scrap.logging.perf_counter", clock)
+    monkeypatch.setattr("tt_scrap.logging.asyncio.sleep", sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await monitor_event_loop()
+    assert len(log_records) == 2
+    assert all(record.event_loop_lag_ms == 2000 for record in log_records)
+
+
+def test_sibling_success_does_not_erase_upstream_failure(request_log_context):
+    logger = logging.getLogger("tt_scrap.test")
+    log_event(
+        logger,
+        "media.upstream_download.failed",
+        level=logging.DEBUG,
+        status_code=404,
+        failure_reason="http_status",
+        error_type="NetworkError",
+    )
+    log_event(logger, "media.upstream_download.completed", level=logging.DEBUG, success=True)
+    assert request_log_context.summary()["upstream_status_code"] == 404
+    assert request_log_context.summary()["failure_stage"] == "media.upstream_download"
+
+
+@pytest.mark.parametrize("malformed", ["arguments", "string_conversion", "exception_formatting"])
+def test_background_logging_contains_formatting_failure_and_reports_drop(malformed, monkeypatch):
+    from tt_scrap.logging import BackgroundLogHandler
+
+    records = []
+
+    class Sink(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    class BadString:
+        def __str__(self):
+            raise ValueError("secret diagnostic must not escape")
+
+    def broken_exception_formatter(self, exc_info):
+        raise ValueError("secret traceback must not escape")
+
+    handler = BackgroundLogHandler(Sink())
+    logger = logging.Logger("review-formatting-test", logging.INFO)
+    logger.addHandler(handler)
+    try:
+        if malformed == "arguments":
+            logger.error("secret invalid message %s %s", "one argument")
+        elif malformed == "string_conversion":
+            logger.error("secret invalid argument %s", BadString())
+        else:
+            monkeypatch.setattr(logging.Formatter, "formatException", broken_exception_formatter)
+            error = ValueError("secret error")
+            logger.error("secret exception", exc_info=(type(error), error, None))
+        logger.info("request completed")
+        handler.flush()
+        assert [record.getMessage() for record in records] == [
+            "request completed",
+            "Log records dropped",
+        ]
+        assert records[-1].event == "logging.records_dropped"
+        assert records[-1].dropped_records == {"ERROR": 1}
+    finally:
+        handler.close()

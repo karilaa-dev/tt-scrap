@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterable
@@ -19,6 +20,7 @@ from ..errors import (
     TelegramTimeoutError,
 )
 from ..logging import elapsed_ms, log_event
+from ..resources import await_completion, memory_file, run_io
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,70 @@ class _SizedAsyncIterablePayload(aiohttp.payload.AsyncIterablePayload):
         self._size = size
 
 
+class _BorrowedFilePayload(aiohttp.payload.Payload):
+    """Stream a caller-owned file without fileno(), rollover, or implicit close."""
+
+    _autoclose = True
+
+    def __init__(self, file: BinaryIO, size: int | None, chunk_bytes: int, **kwargs: Any) -> None:
+        super().__init__(file, **kwargs)
+        self.file = file
+        self._size = size
+        self._chunk_bytes = chunk_bytes
+        self._writers: set[asyncio.Task[Any]] = set()
+
+    def decode(self, encoding: str = "utf-8", errors: str = "strict") -> str:
+        raise TypeError("Media file payloads cannot be decoded as text")
+
+    async def write(self, writer: Any) -> None:
+        await self.write_with_length(writer, None)
+
+    async def write_with_length(self, writer: Any, content_length: int | None) -> None:
+        if task := asyncio.current_task():
+            self._writers.add(task)
+        in_memory = memory_file(self.file)
+        remaining = self._size if content_length is None else content_length
+        first = True
+
+        def read_chunks() -> list[bytes]:
+            if first:
+                self.file.seek(0)
+            available = remaining
+            chunks = []
+            # Bound disk read-ahead to 256 KiB while preserving individual 64 KiB
+            # reads and writes. One worker job amortizes cancellation tracking.
+            for _ in range(1 if in_memory else 4):
+                if available == 0:
+                    break
+                amount = (
+                    self._chunk_bytes if available is None else min(self._chunk_bytes, available)
+                )
+                chunk = self.file.read(amount)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if available is not None:
+                    available -= len(chunk)
+            return chunks
+
+        while remaining is None or remaining > 0:
+            chunks = read_chunks() if in_memory else await run_io(read_chunks)
+            first = False
+            if not chunks:
+                break
+            for chunk in chunks:
+                await writer.write(chunk)
+                if remaining is not None:
+                    remaining -= len(chunk)
+
+    async def finish(self) -> None:
+        for task in self._writers:
+            if not task.done():
+                task.cancel()
+        if self._writers:
+            await await_completion(asyncio.gather(*self._writers, return_exceptions=True))
+
+
 def _file_size(upload: TelegramUpload) -> int | None:
     if upload.size is not None:
         return upload.size
@@ -108,6 +174,9 @@ class TelegramClient:
         self._token = settings.telegram_bot_token.get_secret_value()
         self._base_url = settings.telegram_api_base_url
         self._upload_max_bytes = settings.telegram_upload_max_mb * 1024 * 1024
+        # Match aiohttp's existing IOBasePayload reads. Relay chunks continue to
+        # use DOWNLOAD_CHUNK_BYTES in the downloader.
+        self._chunk_bytes = 64 * 1024
         timeout = aiohttp.ClientTimeout(
             total=settings.telegram_upload_timeout_seconds,
             connect=min(30.0, settings.telegram_upload_timeout_seconds),
@@ -137,7 +206,12 @@ class TelegramClient:
         if not self._token:
             raise ConfigurationError("Telegram delivery is not configured")
         started_at = perf_counter()
-        upload_sizes = [_file_size(upload) for upload in uploads]
+        upload_sizes = [
+            _file_size(upload)
+            if isinstance(upload.file, AsyncIterable) or memory_file(upload.file)
+            else await run_io(_file_size, upload)
+            for upload in uploads
+        ]
         upload_bytes = (
             sum(size for size in upload_sizes if size is not None)
             if all(size is not None for size in upload_sizes)
@@ -160,22 +234,29 @@ class TelegramClient:
             )
             raise AssetTooLargeError("Telegram upload exceeds TELEGRAM_UPLOAD_MAX_MB")
         form = aiohttp.FormData(quote_fields=False)
+        borrowed: list[_BorrowedFilePayload] = []
         for name, value in fields.items():
             if value is not None:
                 form.add_field(name, _form_value(value))
-        for upload in uploads:
+        for upload, size in zip(uploads, upload_sizes, strict=True):
             if isinstance(upload.file, AsyncIterable):
                 if upload.size is None:
                     raise ValueError("Streaming Telegram uploads require a known size")
-                upload_value: BinaryIO | aiohttp.payload.Payload = _SizedAsyncIterablePayload(
+                upload_value: aiohttp.payload.Payload = _SizedAsyncIterablePayload(
                     upload.file,
                     upload.size,
                     filename=upload.filename,
                     content_type=upload.content_type,
                 )
             else:
-                upload.file.seek(0)
-                upload_value = upload.file
+                upload_value = _BorrowedFilePayload(
+                    upload.file,
+                    size,
+                    self._chunk_bytes,
+                    filename=upload.filename,
+                    content_type=upload.content_type,
+                )
+                borrowed.append(upload_value)
             form.add_field(
                 upload.field_name,
                 upload_value,
@@ -236,6 +317,11 @@ class TelegramClient:
                 error_type=type(exc).__name__,
             )
             raise TelegramNetworkError("Telegram upload failed before a response") from exc
+        finally:
+            # aiohttp may return an early rejection or cancel its body writer.
+            # Wait until any threaded reads have stopped before returning file ownership.
+            if any(not task.done() for payload in borrowed for task in payload._writers):
+                await await_completion(asyncio.gather(*(item.finish() for item in borrowed)))
 
     async def close(self) -> None:
         await self._session.close()

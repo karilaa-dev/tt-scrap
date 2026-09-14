@@ -628,3 +628,91 @@ async def test_cancelled_remux_kills_and_reaps_ffmpeg(settings, monkeypatch):
         assert killed and reaped
     finally:
         await downloader.close()
+
+
+async def test_cancelled_remux_launch_drains_before_closing_output(settings, monkeypatch):
+    import os
+    import tempfile
+
+    started, release = asyncio.Event(), asyncio.Event()
+    killed = reaped = False
+    output_fd = None
+
+    class Process:
+        returncode = None
+
+        def kill(self):
+            nonlocal killed
+            killed = True
+
+        async def communicate(self):
+            nonlocal reaped
+            assert killed
+            os.fstat(output_fd)  # Still owned until the subprocess has stopped.
+            reaped = True
+            self.returncode = -9
+            return b"", b""
+
+    async def create_process(*args, **kwargs):
+        nonlocal output_fd
+        output_fd = kwargs["pass_fds"][2]
+        started.set()
+        await release.wait()
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    downloader = AssetDownloader(settings, ProxyManager())
+    try:
+        with tempfile.TemporaryFile() as video, tempfile.TemporaryFile() as audio:
+            task = asyncio.create_task(downloader._remux_copy(video, audio))
+            await started.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert killed and reaped
+        with pytest.raises(OSError):
+            os.fstat(output_fd)
+    finally:
+        release.set()
+        await downloader.close()
+
+
+@pytest.mark.parametrize("permit", ["_semaphore", "_transfer_semaphore"])
+@respx.mock
+async def test_relay_records_capacity_wait_when_consumption_starts(
+    settings, monkeypatch, request_log_context, permit
+):
+    now = 100.0
+    monkeypatch.setattr("tt_scrap.media.downloader.perf_counter", lambda: now)
+    monkeypatch.setattr("tt_scrap.logging.perf_counter", lambda: now)
+    payload = b"video-data"
+    respx.get("https://cdn.test/video").respond(
+        200, content=payload, headers={"Content-Type": "video/mp4"}
+    )
+    downloader = AssetDownloader(settings, ProxyManager())
+    setattr(downloader, permit, asyncio.Semaphore(1))
+    context = AssetFetchContext(
+        platform="instagram",
+        upstream_url="https://cdn.test/video",
+        filename="video.mp4",
+        kind="video",
+    )
+    try:
+        async with downloader.stream(context) as streamed:
+            assert request_log_context.summary()["download_queue_wait_ms"] == 0
+
+            async def consume():
+                return b"".join([chunk async for chunk in streamed.chunks])
+
+            async with getattr(downloader, permit):
+                task = asyncio.create_task(consume())
+                await asyncio.sleep(0)
+                assert not task.done()
+                now += 0.025
+            assert await task == payload
+            assert request_log_context.summary()["download_queue_wait_ms"] == 25
+    finally:
+        await downloader.close()

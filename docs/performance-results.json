@@ -1,0 +1,1706 @@
+{
+  "environment": {
+    "python": "3.13.14 (main, Jul 18 2026, 17:02:37) [Clang 22.1.3 ]",
+    "platform": "Linux-7.0.0-30-generic-x86_64-with-glibc2.43",
+    "cpu_count": 8
+  },
+  "parameters": {
+    "source_root": "/home/agent/tt-scrap",
+    "baseline_root": "/tmp/tt-scrap-baseline-ePgqhv",
+    "runs": 5,
+    "requests": 96,
+    "concurrency": 8,
+    "output": "docs/performance-results.json",
+    "worker": false
+  },
+  "runs": {
+    "baseline": [
+      {
+        "healthy": {
+          "p50_ms": 69.347,
+          "p95_ms": 1004.837,
+          "p99_ms": 1047.743,
+          "requests": 96,
+          "throughput_rps": 39.092,
+          "statuses": {
+            "200": 96
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 14.188,
+              "p95_ms": 18.348,
+              "p99_ms": 18.348
+            },
+            "relay": {
+              "p50_ms": 19.16,
+              "p95_ms": 29.292,
+              "p99_ms": 29.292
+            },
+            "uncached": {
+              "p50_ms": 23.089,
+              "p95_ms": 28.872,
+              "p99_ms": 28.872
+            },
+            "remux": {
+              "p50_ms": 69.347,
+              "p95_ms": 87.534,
+              "p99_ms": 87.534
+            },
+            "slideshow": {
+              "p50_ms": 68.298,
+              "p95_ms": 85.108,
+              "p99_ms": 85.108
+            },
+            "album": {
+              "p50_ms": 138.791,
+              "p95_ms": 173.446,
+              "p99_ms": 173.446
+            },
+            "document": {
+              "p50_ms": 296.225,
+              "p95_ms": 346.644,
+              "p99_ms": 346.644
+            },
+            "disk": {
+              "p50_ms": 995.748,
+              "p95_ms": 1047.743,
+              "p99_ms": 1047.743
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 2.314,
+            "p95_ms": 4.667,
+            "p99_ms": 8.147,
+            "max_ms": 12.798
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 296258856,
+          "spool_rollovers": 180,
+          "peak_rss_mib": 191.176
+        },
+        "mixed_burst": {
+          "p50_ms": 152.971,
+          "p95_ms": 1514.786,
+          "p99_ms": 2069.045,
+          "requests": 96,
+          "throughput_rps": 42.397,
+          "statuses": {
+            "200": 80,
+            "404": 8,
+            "502": 8
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 35.363,
+              "p95_ms": 41.523,
+              "p99_ms": 41.523
+            },
+            "relay": {
+              "p50_ms": 46.313,
+              "p95_ms": 73.086,
+              "p99_ms": 73.086
+            },
+            "uncached": {
+              "p50_ms": 42.074,
+              "p95_ms": 48.322,
+              "p99_ms": 48.322
+            },
+            "invalid": {
+              "p50_ms": 45.228,
+              "p95_ms": 54.594,
+              "p99_ms": 54.594
+            },
+            "remux": {
+              "p50_ms": 111.49,
+              "p95_ms": 133.757,
+              "p99_ms": 133.757
+            },
+            "slideshow": {
+              "p50_ms": 143.883,
+              "p95_ms": 172.715,
+              "p99_ms": 172.715
+            },
+            "slow": {
+              "p50_ms": 258.398,
+              "p95_ms": 264.765,
+              "p99_ms": 264.765
+            },
+            "failedalbum": {
+              "p50_ms": 249.403,
+              "p95_ms": 273.215,
+              "p99_ms": 273.215
+            },
+            "album": {
+              "p50_ms": 319.015,
+              "p95_ms": 323.284,
+              "p99_ms": 323.284
+            },
+            "document": {
+              "p50_ms": 689.721,
+              "p95_ms": 782.346,
+              "p99_ms": 782.346
+            },
+            "disk": {
+              "p50_ms": 1514.786,
+              "p95_ms": 2069.045,
+              "p99_ms": 2069.045
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 4.938,
+            "p95_ms": 9.991,
+            "p99_ms": 14.053,
+            "max_ms": 15.238
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 223373758,
+          "spool_rollovers": 143,
+          "peak_rss_mib": 244.648
+        },
+        "probes": {
+          "unrelated_download_ms": 301.037,
+          "resolver_timeout_ms": 120.669,
+          "shared_failure_ms": 241.744,
+          "provider_failure_sequences": 8
+        },
+        "telegram_received": {
+          "files": 338,
+          "calls": 118
+        },
+        "provider_calls": {
+          "cached": 1,
+          "uncached": 22,
+          "album": 22,
+          "document": 22,
+          "disk": 22,
+          "invalid": 8,
+          "slow": 8,
+          "failedalbum": 8
+        }
+      },
+      {
+        "healthy": {
+          "p50_ms": 64.633,
+          "p95_ms": 974.071,
+          "p99_ms": 1068.944,
+          "requests": 96,
+          "throughput_rps": 40.138,
+          "statuses": {
+            "200": 96
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 17.235,
+              "p95_ms": 20.602,
+              "p99_ms": 20.602
+            },
+            "relay": {
+              "p50_ms": 18.532,
+              "p95_ms": 21.475,
+              "p99_ms": 21.475
+            },
+            "uncached": {
+              "p50_ms": 21.932,
+              "p95_ms": 27.586,
+              "p99_ms": 27.586
+            },
+            "remux": {
+              "p50_ms": 66.268,
+              "p95_ms": 87.251,
+              "p99_ms": 87.251
+            },
+            "slideshow": {
+              "p50_ms": 62.967,
+              "p95_ms": 81.798,
+              "p99_ms": 81.798
+            },
+            "album": {
+              "p50_ms": 132.59,
+              "p95_ms": 164.942,
+              "p99_ms": 164.942
+            },
+            "document": {
+              "p50_ms": 284.97,
+              "p95_ms": 361.745,
+              "p99_ms": 361.745
+            },
+            "disk": {
+              "p50_ms": 959.419,
+              "p95_ms": 1068.944,
+              "p99_ms": 1068.944
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 2.322,
+            "p95_ms": 5.152,
+            "p99_ms": 7.391,
+            "max_ms": 9.533
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 296258856,
+          "spool_rollovers": 180,
+          "peak_rss_mib": 205.887
+        },
+        "mixed_burst": {
+          "p50_ms": 144.677,
+          "p95_ms": 1334.299,
+          "p99_ms": 1848.389,
+          "requests": 96,
+          "throughput_rps": 46.931,
+          "statuses": {
+            "200": 80,
+            "404": 8,
+            "502": 8
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 30.208,
+              "p95_ms": 36.958,
+              "p99_ms": 36.958
+            },
+            "relay": {
+              "p50_ms": 48.914,
+              "p95_ms": 63.931,
+              "p99_ms": 63.931
+            },
+            "uncached": {
+              "p50_ms": 42.478,
+              "p95_ms": 52.992,
+              "p99_ms": 52.992
+            },
+            "invalid": {
+              "p50_ms": 47.31,
+              "p95_ms": 48.539,
+              "p99_ms": 48.539
+            },
+            "remux": {
+              "p50_ms": 118.934,
+              "p95_ms": 140.494,
+              "p99_ms": 140.494
+            },
+            "slideshow": {
+              "p50_ms": 139.557,
+              "p95_ms": 152.533,
+              "p99_ms": 152.533
+            },
+            "slow": {
+              "p50_ms": 235.206,
+              "p95_ms": 242.416,
+              "p99_ms": 242.416
+            },
+            "failedalbum": {
+              "p50_ms": 231.698,
+              "p95_ms": 249.851,
+              "p99_ms": 249.851
+            },
+            "album": {
+              "p50_ms": 290.153,
+              "p95_ms": 335.366,
+              "p99_ms": 335.366
+            },
+            "document": {
+              "p50_ms": 618.722,
+              "p95_ms": 665.083,
+              "p99_ms": 665.083
+            },
+            "disk": {
+              "p50_ms": 1334.299,
+              "p95_ms": 1848.389,
+              "p99_ms": 1848.389
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 4.499,
+            "p95_ms": 8.721,
+            "p99_ms": 11.116,
+            "max_ms": 17.279
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 223373758,
+          "spool_rollovers": 143,
+          "peak_rss_mib": 241.359
+        },
+        "probes": {
+          "unrelated_download_ms": 301.242,
+          "resolver_timeout_ms": 120.992,
+          "shared_failure_ms": 242.44,
+          "provider_failure_sequences": 8
+        },
+        "telegram_received": {
+          "files": 338,
+          "calls": 118
+        },
+        "provider_calls": {
+          "cached": 1,
+          "uncached": 22,
+          "album": 22,
+          "document": 22,
+          "disk": 22,
+          "invalid": 8,
+          "slow": 8,
+          "failedalbum": 8
+        }
+      },
+      {
+        "healthy": {
+          "p50_ms": 69.226,
+          "p95_ms": 992.684,
+          "p99_ms": 1149.481,
+          "requests": 96,
+          "throughput_rps": 38.102,
+          "statuses": {
+            "200": 96
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 15.812,
+              "p95_ms": 23.545,
+              "p99_ms": 23.545
+            },
+            "relay": {
+              "p50_ms": 18.838,
+              "p95_ms": 25.696,
+              "p99_ms": 25.696
+            },
+            "uncached": {
+              "p50_ms": 21.583,
+              "p95_ms": 31.427,
+              "p99_ms": 31.427
+            },
+            "slideshow": {
+              "p50_ms": 62.408,
+              "p95_ms": 98.795,
+              "p99_ms": 98.795
+            },
+            "remux": {
+              "p50_ms": 73.094,
+              "p95_ms": 105.492,
+              "p99_ms": 105.492
+            },
+            "album": {
+              "p50_ms": 136.523,
+              "p95_ms": 199.269,
+              "p99_ms": 199.269
+            },
+            "document": {
+              "p50_ms": 302.008,
+              "p95_ms": 422.549,
+              "p99_ms": 422.549
+            },
+            "disk": {
+              "p50_ms": 980.849,
+              "p95_ms": 1149.481,
+              "p99_ms": 1149.481
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 2.543,
+            "p95_ms": 5.308,
+            "p99_ms": 6.965,
+            "max_ms": 14.19
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 296258856,
+          "spool_rollovers": 180,
+          "peak_rss_mib": 209.148
+        },
+        "mixed_burst": {
+          "p50_ms": 153.607,
+          "p95_ms": 1335.574,
+          "p99_ms": 1945.937,
+          "requests": 96,
+          "throughput_rps": 44.899,
+          "statuses": {
+            "200": 80,
+            "404": 8,
+            "502": 8
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 29.054,
+              "p95_ms": 46.781,
+              "p99_ms": 46.781
+            },
+            "relay": {
+              "p50_ms": 40.76,
+              "p95_ms": 65.537,
+              "p99_ms": 65.537
+            },
+            "uncached": {
+              "p50_ms": 40.303,
+              "p95_ms": 47.138,
+              "p99_ms": 47.138
+            },
+            "invalid": {
+              "p50_ms": 44.196,
+              "p95_ms": 52.24,
+              "p99_ms": 52.24
+            },
+            "remux": {
+              "p50_ms": 119.438,
+              "p95_ms": 163.732,
+              "p99_ms": 163.732
+            },
+            "slideshow": {
+              "p50_ms": 145.542,
+              "p95_ms": 159.602,
+              "p99_ms": 159.602
+            },
+            "slow": {
+              "p50_ms": 242.759,
+              "p95_ms": 255.847,
+              "p99_ms": 255.847
+            },
+            "failedalbum": {
+              "p50_ms": 243.139,
+              "p95_ms": 323.951,
+              "p99_ms": 323.951
+            },
+            "album": {
+              "p50_ms": 293.386,
+              "p95_ms": 356.71,
+              "p99_ms": 356.71
+            },
+            "document": {
+              "p50_ms": 658.598,
+              "p95_ms": 768.585,
+              "p99_ms": 768.585
+            },
+            "disk": {
+              "p50_ms": 1335.574,
+              "p95_ms": 1945.937,
+              "p99_ms": 1945.937
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 4.493,
+            "p95_ms": 10.41,
+            "p99_ms": 12.384,
+            "max_ms": 22.001
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 223373758,
+          "spool_rollovers": 143,
+          "peak_rss_mib": 258.059
+        },
+        "probes": {
+          "unrelated_download_ms": 301.19,
+          "resolver_timeout_ms": 120.589,
+          "shared_failure_ms": 242.775,
+          "provider_failure_sequences": 8
+        },
+        "telegram_received": {
+          "files": 338,
+          "calls": 118
+        },
+        "provider_calls": {
+          "cached": 1,
+          "uncached": 22,
+          "album": 22,
+          "document": 22,
+          "disk": 22,
+          "invalid": 8,
+          "slow": 8,
+          "failedalbum": 8
+        }
+      },
+      {
+        "healthy": {
+          "p50_ms": 73.697,
+          "p95_ms": 1048.824,
+          "p99_ms": 1172.708,
+          "requests": 96,
+          "throughput_rps": 37.188,
+          "statuses": {
+            "200": 96
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 15.592,
+              "p95_ms": 19.815,
+              "p99_ms": 19.815
+            },
+            "relay": {
+              "p50_ms": 20.581,
+              "p95_ms": 31.814,
+              "p99_ms": 31.814
+            },
+            "uncached": {
+              "p50_ms": 23.096,
+              "p95_ms": 29.955,
+              "p99_ms": 29.955
+            },
+            "remux": {
+              "p50_ms": 73.858,
+              "p95_ms": 102.022,
+              "p99_ms": 102.022
+            },
+            "slideshow": {
+              "p50_ms": 69.288,
+              "p95_ms": 83.952,
+              "p99_ms": 83.952
+            },
+            "album": {
+              "p50_ms": 150.399,
+              "p95_ms": 196.048,
+              "p99_ms": 196.048
+            },
+            "document": {
+              "p50_ms": 318.797,
+              "p95_ms": 409.741,
+              "p99_ms": 409.741
+            },
+            "disk": {
+              "p50_ms": 1035.8,
+              "p95_ms": 1172.708,
+              "p99_ms": 1172.708
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 2.487,
+            "p95_ms": 5.476,
+            "p99_ms": 8.042,
+            "max_ms": 10.481
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 296258856,
+          "spool_rollovers": 180,
+          "peak_rss_mib": 201.758
+        },
+        "mixed_burst": {
+          "p50_ms": 170.692,
+          "p95_ms": 1412.463,
+          "p99_ms": 2080.772,
+          "requests": 96,
+          "throughput_rps": 42.32,
+          "statuses": {
+            "200": 80,
+            "404": 8,
+            "502": 8
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 33.061,
+              "p95_ms": 47.266,
+              "p99_ms": 47.266
+            },
+            "relay": {
+              "p50_ms": 44.419,
+              "p95_ms": 70.028,
+              "p99_ms": 70.028
+            },
+            "uncached": {
+              "p50_ms": 45.999,
+              "p95_ms": 56.518,
+              "p99_ms": 56.518
+            },
+            "invalid": {
+              "p50_ms": 52.739,
+              "p95_ms": 64.161,
+              "p99_ms": 64.161
+            },
+            "remux": {
+              "p50_ms": 115.057,
+              "p95_ms": 169.387,
+              "p99_ms": 169.387
+            },
+            "slideshow": {
+              "p50_ms": 166.391,
+              "p95_ms": 186.964,
+              "p99_ms": 186.964
+            },
+            "slow": {
+              "p50_ms": 258.904,
+              "p95_ms": 322.036,
+              "p99_ms": 322.036
+            },
+            "failedalbum": {
+              "p50_ms": 260.239,
+              "p95_ms": 328.232,
+              "p99_ms": 328.232
+            },
+            "album": {
+              "p50_ms": 369.065,
+              "p95_ms": 400.435,
+              "p99_ms": 400.435
+            },
+            "document": {
+              "p50_ms": 728.784,
+              "p95_ms": 842.329,
+              "p99_ms": 842.329
+            },
+            "disk": {
+              "p50_ms": 1412.463,
+              "p95_ms": 2080.772,
+              "p99_ms": 2080.772
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 5.016,
+            "p95_ms": 10.381,
+            "p99_ms": 12.716,
+            "max_ms": 15.073
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 223373758,
+          "spool_rollovers": 143,
+          "peak_rss_mib": 239.414
+        },
+        "probes": {
+          "unrelated_download_ms": 301.204,
+          "resolver_timeout_ms": 120.694,
+          "shared_failure_ms": 241.959,
+          "provider_failure_sequences": 8
+        },
+        "telegram_received": {
+          "files": 338,
+          "calls": 118
+        },
+        "provider_calls": {
+          "cached": 1,
+          "uncached": 22,
+          "album": 22,
+          "document": 22,
+          "disk": 22,
+          "invalid": 8,
+          "slow": 8,
+          "failedalbum": 8
+        }
+      },
+      {
+        "healthy": {
+          "p50_ms": 67.476,
+          "p95_ms": 1029.614,
+          "p99_ms": 1083.402,
+          "requests": 96,
+          "throughput_rps": 38.861,
+          "statuses": {
+            "200": 96
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 13.909,
+              "p95_ms": 18.237,
+              "p99_ms": 18.237
+            },
+            "relay": {
+              "p50_ms": 19.729,
+              "p95_ms": 21.691,
+              "p99_ms": 21.691
+            },
+            "uncached": {
+              "p50_ms": 22.614,
+              "p95_ms": 27.148,
+              "p99_ms": 27.148
+            },
+            "remux": {
+              "p50_ms": 67.476,
+              "p95_ms": 75.896,
+              "p99_ms": 75.896
+            },
+            "slideshow": {
+              "p50_ms": 65.619,
+              "p95_ms": 81.135,
+              "p99_ms": 81.135
+            },
+            "album": {
+              "p50_ms": 140.226,
+              "p95_ms": 182.701,
+              "p99_ms": 182.701
+            },
+            "document": {
+              "p50_ms": 308.819,
+              "p95_ms": 330.785,
+              "p99_ms": 330.785
+            },
+            "disk": {
+              "p50_ms": 1021.962,
+              "p95_ms": 1083.402,
+              "p99_ms": 1083.402
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 2.454,
+            "p95_ms": 5.04,
+            "p99_ms": 6.343,
+            "max_ms": 9.017
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 296258856,
+          "spool_rollovers": 180,
+          "peak_rss_mib": 189.707
+        },
+        "mixed_burst": {
+          "p50_ms": 148.811,
+          "p95_ms": 1330.371,
+          "p99_ms": 1889.992,
+          "requests": 96,
+          "throughput_rps": 46.06,
+          "statuses": {
+            "200": 80,
+            "404": 8,
+            "502": 8
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 31.374,
+              "p95_ms": 40.689,
+              "p99_ms": 40.689
+            },
+            "relay": {
+              "p50_ms": 40.245,
+              "p95_ms": 60.498,
+              "p99_ms": 60.498
+            },
+            "uncached": {
+              "p50_ms": 42.187,
+              "p95_ms": 55.79,
+              "p99_ms": 55.79
+            },
+            "invalid": {
+              "p50_ms": 44.121,
+              "p95_ms": 52.982,
+              "p99_ms": 52.982
+            },
+            "remux": {
+              "p50_ms": 112.52,
+              "p95_ms": 141.165,
+              "p99_ms": 141.165
+            },
+            "slideshow": {
+              "p50_ms": 143.865,
+              "p95_ms": 166.711,
+              "p99_ms": 166.711
+            },
+            "failedalbum": {
+              "p50_ms": 240.762,
+              "p95_ms": 303.842,
+              "p99_ms": 303.842
+            },
+            "slow": {
+              "p50_ms": 241.791,
+              "p95_ms": 295.745,
+              "p99_ms": 295.745
+            },
+            "album": {
+              "p50_ms": 290.309,
+              "p95_ms": 378.367,
+              "p99_ms": 378.367
+            },
+            "document": {
+              "p50_ms": 648.324,
+              "p95_ms": 697.074,
+              "p99_ms": 697.074
+            },
+            "disk": {
+              "p50_ms": 1330.371,
+              "p95_ms": 1889.992,
+              "p99_ms": 1889.992
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 4.846,
+            "p95_ms": 8.857,
+            "p99_ms": 11.29,
+            "max_ms": 15.354
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 223373758,
+          "spool_rollovers": 143,
+          "peak_rss_mib": 243.547
+        },
+        "probes": {
+          "unrelated_download_ms": 301.235,
+          "resolver_timeout_ms": 120.657,
+          "shared_failure_ms": 242.183,
+          "provider_failure_sequences": 8
+        },
+        "telegram_received": {
+          "files": 338,
+          "calls": 118
+        },
+        "provider_calls": {
+          "cached": 1,
+          "uncached": 22,
+          "album": 22,
+          "document": 22,
+          "disk": 22,
+          "invalid": 8,
+          "slow": 8,
+          "failedalbum": 8
+        }
+      }
+    ],
+    "candidate": [
+      {
+        "healthy": {
+          "p50_ms": 79.654,
+          "p95_ms": 867.455,
+          "p99_ms": 899.548,
+          "requests": 96,
+          "throughput_rps": 43.994,
+          "statuses": {
+            "200": 96
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 16.755,
+              "p95_ms": 20.744,
+              "p99_ms": 20.744
+            },
+            "relay": {
+              "p50_ms": 25.621,
+              "p95_ms": 38.148,
+              "p99_ms": 38.148
+            },
+            "uncached": {
+              "p50_ms": 26.719,
+              "p95_ms": 28.646,
+              "p99_ms": 28.646
+            },
+            "slideshow": {
+              "p50_ms": 63.274,
+              "p95_ms": 72.746,
+              "p99_ms": 72.746
+            },
+            "remux": {
+              "p50_ms": 86.073,
+              "p95_ms": 123.7,
+              "p99_ms": 123.7
+            },
+            "album": {
+              "p50_ms": 122.039,
+              "p95_ms": 132.486,
+              "p99_ms": 132.486
+            },
+            "document": {
+              "p50_ms": 225.446,
+              "p95_ms": 254.48,
+              "p99_ms": 254.48
+            },
+            "disk": {
+              "p50_ms": 862.258,
+              "p95_ms": 899.548,
+              "p99_ms": 899.548
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 2.977,
+            "p95_ms": 6.36,
+            "p99_ms": 9.315,
+            "max_ms": 14.631
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 223514376,
+          "spool_rollovers": 48,
+          "peak_rss_mib": 214.156
+        },
+        "mixed_burst": {
+          "p50_ms": 139.383,
+          "p95_ms": 1139.696,
+          "p99_ms": 1541.886,
+          "requests": 96,
+          "throughput_rps": 53.088,
+          "statuses": {
+            "200": 80,
+            "404": 8,
+            "502": 8
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 35.743,
+              "p95_ms": 46.682,
+              "p99_ms": 46.682
+            },
+            "relay": {
+              "p50_ms": 43.017,
+              "p95_ms": 67.384,
+              "p99_ms": 67.384
+            },
+            "uncached": {
+              "p50_ms": 44.794,
+              "p95_ms": 48.63,
+              "p99_ms": 48.63
+            },
+            "invalid": {
+              "p50_ms": 49.071,
+              "p95_ms": 54.916,
+              "p99_ms": 54.916
+            },
+            "slideshow": {
+              "p50_ms": 116.016,
+              "p95_ms": 126.618,
+              "p99_ms": 126.618
+            },
+            "remux": {
+              "p50_ms": 138.58,
+              "p95_ms": 152.988,
+              "p99_ms": 152.988
+            },
+            "failedalbum": {
+              "p50_ms": 233.029,
+              "p95_ms": 276.965,
+              "p99_ms": 276.965
+            },
+            "album": {
+              "p50_ms": 219.862,
+              "p95_ms": 280.909,
+              "p99_ms": 280.909
+            },
+            "slow": {
+              "p50_ms": 228.574,
+              "p95_ms": 260.336,
+              "p99_ms": 260.336
+            },
+            "document": {
+              "p50_ms": 424.815,
+              "p95_ms": 503.537,
+              "p99_ms": 503.537
+            },
+            "disk": {
+              "p50_ms": 1139.696,
+              "p95_ms": 1541.886,
+              "p99_ms": 1541.886
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 5.011,
+            "p95_ms": 9.664,
+            "p99_ms": 11.62,
+            "max_ms": 15.748
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 167635782,
+          "spool_rollovers": 36,
+          "peak_rss_mib": 267.402
+        },
+        "probes": {
+          "unrelated_download_ms": 0.046,
+          "resolver_timeout_ms": 20.517,
+          "shared_failure_ms": 30.511,
+          "provider_failure_sequences": 1
+        },
+        "telegram_received": {
+          "files": 338,
+          "calls": 118
+        },
+        "provider_calls": {
+          "cached": 1,
+          "uncached": 22,
+          "album": 22,
+          "document": 22,
+          "disk": 22,
+          "invalid": 8,
+          "slow": 8,
+          "failedalbum": 8
+        }
+      },
+      {
+        "healthy": {
+          "p50_ms": 77.554,
+          "p95_ms": 873.628,
+          "p99_ms": 905.963,
+          "requests": 96,
+          "throughput_rps": 41.388,
+          "statuses": {
+            "200": 96
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 18.607,
+              "p95_ms": 27.423,
+              "p99_ms": 27.423
+            },
+            "relay": {
+              "p50_ms": 23.306,
+              "p95_ms": 35.817,
+              "p99_ms": 35.817
+            },
+            "uncached": {
+              "p50_ms": 27.146,
+              "p95_ms": 37.92,
+              "p99_ms": 37.92
+            },
+            "slideshow": {
+              "p50_ms": 65.703,
+              "p95_ms": 76.927,
+              "p99_ms": 76.927
+            },
+            "remux": {
+              "p50_ms": 94.347,
+              "p95_ms": 121.195,
+              "p99_ms": 121.195
+            },
+            "album": {
+              "p50_ms": 126.423,
+              "p95_ms": 144.702,
+              "p99_ms": 144.702
+            },
+            "document": {
+              "p50_ms": 225.51,
+              "p95_ms": 281.864,
+              "p99_ms": 281.864
+            },
+            "disk": {
+              "p50_ms": 873.2,
+              "p95_ms": 905.963,
+              "p99_ms": 905.963
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 2.931,
+            "p95_ms": 6.182,
+            "p99_ms": 10.108,
+            "max_ms": 13.601
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 223514376,
+          "spool_rollovers": 48,
+          "peak_rss_mib": 209.238
+        },
+        "mixed_burst": {
+          "p50_ms": 136.531,
+          "p95_ms": 1123.347,
+          "p99_ms": 1515.986,
+          "requests": 96,
+          "throughput_rps": 53.093,
+          "statuses": {
+            "200": 80,
+            "404": 8,
+            "502": 8
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 31.865,
+              "p95_ms": 40.189,
+              "p99_ms": 40.189
+            },
+            "relay": {
+              "p50_ms": 46.855,
+              "p95_ms": 77.715,
+              "p99_ms": 77.715
+            },
+            "uncached": {
+              "p50_ms": 45.787,
+              "p95_ms": 52.819,
+              "p99_ms": 52.819
+            },
+            "invalid": {
+              "p50_ms": 50.237,
+              "p95_ms": 55.53,
+              "p99_ms": 55.53
+            },
+            "slideshow": {
+              "p50_ms": 118.09,
+              "p95_ms": 124.381,
+              "p99_ms": 124.381
+            },
+            "remux": {
+              "p50_ms": 136.531,
+              "p95_ms": 175.3,
+              "p99_ms": 175.3
+            },
+            "failedalbum": {
+              "p50_ms": 218.113,
+              "p95_ms": 243.836,
+              "p99_ms": 243.836
+            },
+            "album": {
+              "p50_ms": 234.507,
+              "p95_ms": 280.039,
+              "p99_ms": 280.039
+            },
+            "slow": {
+              "p50_ms": 236.535,
+              "p95_ms": 297.796,
+              "p99_ms": 297.796
+            },
+            "document": {
+              "p50_ms": 400.685,
+              "p95_ms": 432.198,
+              "p99_ms": 432.198
+            },
+            "disk": {
+              "p50_ms": 1123.347,
+              "p95_ms": 1515.986,
+              "p99_ms": 1515.986
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 4.812,
+            "p95_ms": 9.298,
+            "p99_ms": 13.788,
+            "max_ms": 16.004
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 167635782,
+          "spool_rollovers": 36,
+          "peak_rss_mib": 255.457
+        },
+        "probes": {
+          "unrelated_download_ms": 0.036,
+          "resolver_timeout_ms": 20.436,
+          "shared_failure_ms": 30.528,
+          "provider_failure_sequences": 1
+        },
+        "telegram_received": {
+          "files": 338,
+          "calls": 118
+        },
+        "provider_calls": {
+          "cached": 1,
+          "uncached": 22,
+          "album": 22,
+          "document": 22,
+          "disk": 22,
+          "invalid": 8,
+          "slow": 8,
+          "failedalbum": 8
+        }
+      },
+      {
+        "healthy": {
+          "p50_ms": 83.854,
+          "p95_ms": 818.452,
+          "p99_ms": 866.33,
+          "requests": 96,
+          "throughput_rps": 45.595,
+          "statuses": {
+            "200": 96
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 17.624,
+              "p95_ms": 20.231,
+              "p99_ms": 20.231
+            },
+            "relay": {
+              "p50_ms": 25.967,
+              "p95_ms": 32.082,
+              "p99_ms": 32.082
+            },
+            "uncached": {
+              "p50_ms": 26.357,
+              "p95_ms": 32.644,
+              "p99_ms": 32.644
+            },
+            "slideshow": {
+              "p50_ms": 58.975,
+              "p95_ms": 63.859,
+              "p99_ms": 63.859
+            },
+            "remux": {
+              "p50_ms": 93.388,
+              "p95_ms": 117.113,
+              "p99_ms": 117.113
+            },
+            "album": {
+              "p50_ms": 121.245,
+              "p95_ms": 137.24,
+              "p99_ms": 137.24
+            },
+            "document": {
+              "p50_ms": 215.39,
+              "p95_ms": 241.217,
+              "p99_ms": 241.217
+            },
+            "disk": {
+              "p50_ms": 800.9,
+              "p95_ms": 866.33,
+              "p99_ms": 866.33
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 2.816,
+            "p95_ms": 5.639,
+            "p99_ms": 10.037,
+            "max_ms": 11.269
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 223514376,
+          "spool_rollovers": 48,
+          "peak_rss_mib": 224.895
+        },
+        "mixed_burst": {
+          "p50_ms": 144.322,
+          "p95_ms": 1081.581,
+          "p99_ms": 1455.852,
+          "requests": 96,
+          "throughput_rps": 55.082,
+          "statuses": {
+            "200": 80,
+            "404": 8,
+            "502": 8
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 30.28,
+              "p95_ms": 40.933,
+              "p99_ms": 40.933
+            },
+            "relay": {
+              "p50_ms": 48.202,
+              "p95_ms": 65.483,
+              "p99_ms": 65.483
+            },
+            "uncached": {
+              "p50_ms": 42.595,
+              "p95_ms": 49.842,
+              "p99_ms": 49.842
+            },
+            "invalid": {
+              "p50_ms": 48.036,
+              "p95_ms": 51.201,
+              "p99_ms": 51.201
+            },
+            "slideshow": {
+              "p50_ms": 110.682,
+              "p95_ms": 120.061,
+              "p99_ms": 120.061
+            },
+            "remux": {
+              "p50_ms": 144.322,
+              "p95_ms": 171.393,
+              "p99_ms": 171.393
+            },
+            "album": {
+              "p50_ms": 218.756,
+              "p95_ms": 255.823,
+              "p99_ms": 255.823
+            },
+            "failedalbum": {
+              "p50_ms": 228.767,
+              "p95_ms": 256.441,
+              "p99_ms": 256.441
+            },
+            "slow": {
+              "p50_ms": 221.179,
+              "p95_ms": 308.825,
+              "p99_ms": 308.825
+            },
+            "document": {
+              "p50_ms": 415.202,
+              "p95_ms": 434.885,
+              "p99_ms": 434.885
+            },
+            "disk": {
+              "p50_ms": 1081.581,
+              "p95_ms": 1455.852,
+              "p99_ms": 1455.852
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 4.769,
+            "p95_ms": 9.948,
+            "p99_ms": 12.278,
+            "max_ms": 17.178
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 167635782,
+          "spool_rollovers": 36,
+          "peak_rss_mib": 248.477
+        },
+        "probes": {
+          "unrelated_download_ms": 0.049,
+          "resolver_timeout_ms": 20.498,
+          "shared_failure_ms": 30.702,
+          "provider_failure_sequences": 1
+        },
+        "telegram_received": {
+          "files": 338,
+          "calls": 118
+        },
+        "provider_calls": {
+          "cached": 1,
+          "uncached": 22,
+          "album": 22,
+          "document": 22,
+          "disk": 22,
+          "invalid": 8,
+          "slow": 8,
+          "failedalbum": 8
+        }
+      },
+      {
+        "healthy": {
+          "p50_ms": 74.82,
+          "p95_ms": 828.718,
+          "p99_ms": 878.988,
+          "requests": 96,
+          "throughput_rps": 45.526,
+          "statuses": {
+            "200": 96
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 17.139,
+              "p95_ms": 21.14,
+              "p99_ms": 21.14
+            },
+            "relay": {
+              "p50_ms": 24.442,
+              "p95_ms": 28.169,
+              "p99_ms": 28.169
+            },
+            "uncached": {
+              "p50_ms": 25.968,
+              "p95_ms": 27.746,
+              "p99_ms": 27.746
+            },
+            "slideshow": {
+              "p50_ms": 60.593,
+              "p95_ms": 70.667,
+              "p99_ms": 70.667
+            },
+            "remux": {
+              "p50_ms": 85.467,
+              "p95_ms": 107.018,
+              "p99_ms": 107.018
+            },
+            "album": {
+              "p50_ms": 120.632,
+              "p95_ms": 129.898,
+              "p99_ms": 129.898
+            },
+            "document": {
+              "p50_ms": 223.712,
+              "p95_ms": 234.114,
+              "p99_ms": 234.114
+            },
+            "disk": {
+              "p50_ms": 820.387,
+              "p95_ms": 878.988,
+              "p99_ms": 878.988
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 2.856,
+            "p95_ms": 5.339,
+            "p99_ms": 9.253,
+            "max_ms": 12.808
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 223514376,
+          "spool_rollovers": 48,
+          "peak_rss_mib": 212.328
+        },
+        "mixed_burst": {
+          "p50_ms": 131.444,
+          "p95_ms": 1099.154,
+          "p99_ms": 1491.398,
+          "requests": 96,
+          "throughput_rps": 55.112,
+          "statuses": {
+            "200": 80,
+            "404": 8,
+            "502": 8
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 29.702,
+              "p95_ms": 40.056,
+              "p99_ms": 40.056
+            },
+            "relay": {
+              "p50_ms": 47.293,
+              "p95_ms": 63.155,
+              "p99_ms": 63.155
+            },
+            "uncached": {
+              "p50_ms": 45.271,
+              "p95_ms": 50.87,
+              "p99_ms": 50.87
+            },
+            "invalid": {
+              "p50_ms": 47.288,
+              "p95_ms": 52.264,
+              "p99_ms": 52.264
+            },
+            "slideshow": {
+              "p50_ms": 109.069,
+              "p95_ms": 118.074,
+              "p99_ms": 118.074
+            },
+            "remux": {
+              "p50_ms": 131.444,
+              "p95_ms": 156.433,
+              "p99_ms": 156.433
+            },
+            "album": {
+              "p50_ms": 212.635,
+              "p95_ms": 250.145,
+              "p99_ms": 250.145
+            },
+            "failedalbum": {
+              "p50_ms": 227.339,
+              "p95_ms": 248.847,
+              "p99_ms": 248.847
+            },
+            "slow": {
+              "p50_ms": 234.621,
+              "p95_ms": 301.68,
+              "p99_ms": 301.68
+            },
+            "document": {
+              "p50_ms": 392.801,
+              "p95_ms": 459.76,
+              "p99_ms": 459.76
+            },
+            "disk": {
+              "p50_ms": 1099.154,
+              "p95_ms": 1491.398,
+              "p99_ms": 1491.398
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 4.891,
+            "p95_ms": 10.072,
+            "p99_ms": 11.461,
+            "max_ms": 13.165
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 167635782,
+          "spool_rollovers": 36,
+          "peak_rss_mib": 271.363
+        },
+        "probes": {
+          "unrelated_download_ms": 0.045,
+          "resolver_timeout_ms": 20.378,
+          "shared_failure_ms": 30.58,
+          "provider_failure_sequences": 1
+        },
+        "telegram_received": {
+          "files": 338,
+          "calls": 118
+        },
+        "provider_calls": {
+          "cached": 1,
+          "uncached": 22,
+          "album": 22,
+          "document": 22,
+          "disk": 22,
+          "invalid": 8,
+          "slow": 8,
+          "failedalbum": 8
+        }
+      },
+      {
+        "healthy": {
+          "p50_ms": 80.456,
+          "p95_ms": 900.811,
+          "p99_ms": 929.169,
+          "requests": 96,
+          "throughput_rps": 42.616,
+          "statuses": {
+            "200": 96
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 17.596,
+              "p95_ms": 24.377,
+              "p99_ms": 24.377
+            },
+            "relay": {
+              "p50_ms": 25.2,
+              "p95_ms": 39.269,
+              "p99_ms": 39.269
+            },
+            "uncached": {
+              "p50_ms": 26.273,
+              "p95_ms": 33.318,
+              "p99_ms": 33.318
+            },
+            "slideshow": {
+              "p50_ms": 59.019,
+              "p95_ms": 84.135,
+              "p99_ms": 84.135
+            },
+            "remux": {
+              "p50_ms": 92.068,
+              "p95_ms": 112.764,
+              "p99_ms": 112.764
+            },
+            "album": {
+              "p50_ms": 135.465,
+              "p95_ms": 144.319,
+              "p99_ms": 144.319
+            },
+            "document": {
+              "p50_ms": 237.067,
+              "p95_ms": 265.305,
+              "p99_ms": 265.305
+            },
+            "disk": {
+              "p50_ms": 900.63,
+              "p95_ms": 929.169,
+              "p99_ms": 929.169
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 2.871,
+            "p95_ms": 6.638,
+            "p99_ms": 9.361,
+            "max_ms": 12.016
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 223514376,
+          "spool_rollovers": 48,
+          "peak_rss_mib": 214.211
+        },
+        "mixed_burst": {
+          "p50_ms": 150.303,
+          "p95_ms": 1154.958,
+          "p99_ms": 1555.591,
+          "requests": 96,
+          "throughput_rps": 51.52,
+          "statuses": {
+            "200": 80,
+            "404": 8,
+            "502": 8
+          },
+          "by_scenario": {
+            "cached": {
+              "p50_ms": 33.303,
+              "p95_ms": 42.128,
+              "p99_ms": 42.128
+            },
+            "relay": {
+              "p50_ms": 45.1,
+              "p95_ms": 60.248,
+              "p99_ms": 60.248
+            },
+            "uncached": {
+              "p50_ms": 47.114,
+              "p95_ms": 53.856,
+              "p99_ms": 53.856
+            },
+            "invalid": {
+              "p50_ms": 45.409,
+              "p95_ms": 63.445,
+              "p99_ms": 63.445
+            },
+            "slideshow": {
+              "p50_ms": 111.596,
+              "p95_ms": 124.514,
+              "p99_ms": 124.514
+            },
+            "remux": {
+              "p50_ms": 150.303,
+              "p95_ms": 179.423,
+              "p99_ms": 179.423
+            },
+            "slow": {
+              "p50_ms": 229.973,
+              "p95_ms": 257.373,
+              "p99_ms": 257.373
+            },
+            "album": {
+              "p50_ms": 217.741,
+              "p95_ms": 281.376,
+              "p99_ms": 281.376
+            },
+            "failedalbum": {
+              "p50_ms": 201.773,
+              "p95_ms": 284.544,
+              "p99_ms": 284.544
+            },
+            "document": {
+              "p50_ms": 445.642,
+              "p95_ms": 496.472,
+              "p99_ms": 496.472
+            },
+            "disk": {
+              "p50_ms": 1154.958,
+              "p95_ms": 1555.591,
+              "p99_ms": 1555.591
+            }
+          },
+          "event_loop_lag": {
+            "p50_ms": 4.935,
+            "p95_ms": 10.941,
+            "p99_ms": 12.651,
+            "max_ms": 13.562
+          },
+          "disk_write_bytes": 0,
+          "spool_write_bytes": 167635782,
+          "spool_rollovers": 36,
+          "peak_rss_mib": 265.859
+        },
+        "probes": {
+          "unrelated_download_ms": 0.045,
+          "resolver_timeout_ms": 20.364,
+          "shared_failure_ms": 30.503,
+          "provider_failure_sequences": 1
+        },
+        "telegram_received": {
+          "files": 338,
+          "calls": 118
+        },
+        "provider_calls": {
+          "cached": 1,
+          "uncached": 22,
+          "album": 22,
+          "document": 22,
+          "disk": 22,
+          "invalid": 8,
+          "slow": 8,
+          "failedalbum": 8
+        }
+      }
+    ]
+  },
+  "medians": {
+    "baseline": {
+      "healthy": {
+        "p50_ms": 69.226,
+        "p95_ms": 1004.837,
+        "p99_ms": 1083.402,
+        "throughput_rps": 38.861,
+        "disk_write_bytes": 0,
+        "peak_rss_mib": 201.758
+      },
+      "mixed_burst": {
+        "p50_ms": 152.971,
+        "p95_ms": 1335.574,
+        "p99_ms": 1945.937,
+        "throughput_rps": 44.899,
+        "disk_write_bytes": 0,
+        "peak_rss_mib": 243.547
+      }
+    },
+    "candidate": {
+      "healthy": {
+        "p50_ms": 79.654,
+        "p95_ms": 867.455,
+        "p99_ms": 899.548,
+        "throughput_rps": 43.994,
+        "disk_write_bytes": 0,
+        "peak_rss_mib": 214.156
+      },
+      "mixed_burst": {
+        "p50_ms": 139.383,
+        "p95_ms": 1123.347,
+        "p99_ms": 1515.986,
+        "throughput_rps": 53.093,
+        "disk_write_bytes": 0,
+        "peak_rss_mib": 265.859
+      }
+    }
+  },
+  "healthy_p95_change_percent": -13.672,
+  "source_snapshots": {
+    "baseline": {
+      "base_commit": "2429756d5da44896d966ddc2a739f8cdef7c3a9a",
+      "source_sha256": "eb6c7ddf3b676576cb4569e9ac465379a3da7f4f8ec227c1c0abde057da5d357"
+    },
+    "candidate": {
+      "base_commit": "2429756d5da44896d966ddc2a739f8cdef7c3a9a",
+      "source_sha256": "8cbe198651256a5d55d0ff2f54a844f7afe9142020b6cc21650d97dece3820ff"
+    }
+  },
+  "recorded_on": "2026-09-14",
+  "acceptance": {
+    "healthy_p95_within_5_percent": true,
+    "healthy_requests_successful": true
+  }
+}

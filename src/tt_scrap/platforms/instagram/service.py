@@ -8,6 +8,7 @@ import random
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
 from typing import Any, Literal
@@ -26,8 +27,16 @@ from ...errors import (
     InvalidLinkError,
     NetworkError,
     RateLimitError,
+    ScraperError,
 )
-from ...logging import bind_request_context, elapsed_ms, log_event, record_recovery
+from ...logging import (
+    bind_request_context,
+    elapsed_ms,
+    log_event,
+    record_queue_wait,
+    record_recovery,
+    request_log_var,
+)
 from ...models import (
     AssetFetchContext,
     InstagramExtractionResponse,
@@ -38,6 +47,14 @@ _PATH_RE = re.compile(r"^/(?:p|reels?|tv|stories)/[\w-]+", re.IGNORECASE)
 _RAPIDAPI_HOST = "instagram-downloader-download-instagram-stories-videos4.p.rapidapi.com"
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _RequestGroup:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+    failure: ScraperError | None = None
+    failure_context: dict[str, Any] = field(default_factory=dict)
 
 
 def validate_instagram_url(url: str) -> None:
@@ -89,7 +106,7 @@ class InstagramService:
             min(settings.instagram_concurrency, settings.extraction_concurrency)
         )
         self._key_lock_guard = asyncio.Lock()
-        self._key_locks: dict[str, tuple[asyncio.Lock, int]] = {}
+        self._key_locks: dict[str, _RequestGroup] = {}
         self._http = httpx.AsyncClient(
             follow_redirects=True,
             timeout=httpx.Timeout(settings.instagram_request_timeout_seconds),
@@ -107,23 +124,44 @@ class InstagramService:
     async def _key_lock(self, key: str) -> AsyncIterator[bool]:
         """Serialize one post and report whether this call joined existing work."""
         async with self._key_lock_guard:
-            lock, users = self._key_locks.get(key, (asyncio.Lock(), 0))
-            joined = users > 0
-            self._key_locks[key] = (lock, users + 1)
+            group = self._key_locks.get(key)
+            if group is None or group.failure is not None:
+                group = _RequestGroup()
+                self._key_locks[key] = group
+            joined = group.users > 0
+            group.users += 1
         acquired = False
+        started = perf_counter()
         try:
-            await lock.acquire()
+            await group.lock.acquire()
             acquired = True
+            record_queue_wait("extraction", elapsed_ms(started))
+            if group.failure is not None:
+                bind_request_context(**group.failure_context)
+                raise group.failure
             yield joined
+        except ScraperError as exc:
+            if group.failure is None and (context := request_log_var.get()):
+                group.failure_context = {
+                    key: value
+                    for key, value in context.summary().items()
+                    if key
+                    in {
+                        "failure_stage",
+                        "failure_reason",
+                        "upstream_status_code",
+                        "upstream_error_type",
+                    }
+                }
+            group.failure = exc
+            raise
         finally:
             if acquired:
-                lock.release()
+                group.lock.release()
             async with self._key_lock_guard:
-                current, users = self._key_locks[key]
-                if users == 1:
+                group.users -= 1
+                if group.users == 0 and self._key_locks.get(key) is group:
                     del self._key_locks[key]
-                else:
-                    self._key_locks[key] = (current, users - 1)
 
     async def _rapidapi(self, source_url: str) -> dict[str, Any]:
         key = self.settings.rapidapi_key.get_secret_value()
@@ -142,7 +180,9 @@ class InstagramService:
                 attempt_status: int | None = None
                 attempt_retry_after: float | None = None
                 try:
+                    queue_started = perf_counter()
                     async with self._semaphore:
+                        record_queue_wait("extraction", elapsed_ms(queue_started))
                         response = await self._http.get(
                             f"https://{_RAPIDAPI_HOST}/convert",
                             params={"url": source_url},
@@ -311,6 +351,7 @@ class InstagramService:
         log_event(
             logger,
             "instagram.extraction.completed",
+            level=logging.DEBUG,
             message="Instagram extraction served from cache",
             platform="instagram",
             source_id=media_id,
@@ -415,6 +456,7 @@ class InstagramService:
         log_event(
             logger,
             "instagram.extraction.completed",
+            level=logging.DEBUG,
             message="Instagram extraction completed",
             platform="instagram",
             source_id=media_id,
