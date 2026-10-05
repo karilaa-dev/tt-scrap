@@ -180,3 +180,58 @@ establish whether the remaining production stalls are host or upstream delays.
 Rollback uses the previous image with the same configuration and one worker.
 Restarting either version discards process-local caches and temporary asset tokens,
 as before. No deployment was performed as part of this change.
+
+## October 5 DNS recovery
+
+The supplied October 5, 2026 log covers 20:41:35 through 20:53:17 UTC. It contains
+1,218 TikTok resolution failures and 84 Instagram failures with `ConnectTimeout`,
+plus 11 Telegram failures with `ConnectionTimeoutError`. Application queue waits
+remain low. Thirteen TikTok extractions succeed through the separate yt-dlp
+transport. Four event-loop warnings report stalls between 3.28 and 4.61 seconds.
+The operator reports that restarting only the tt-scrap service restored operation.
+
+These observations suggest shared async networking state, with event-loop DNS as
+the leading explanation. HTTPX through AnyIO and aiohttp's threaded resolver both
+call `loop.getaddrinfo`. Replacing TikTok's HTTP pool, which the application already
+does on transport errors, cannot replace that shared resolver. The incident logs
+do not separate DNS, TCP, and TLS time, so they cannot establish the original
+trigger or rule out other network failures.
+
+The application now installs `DNSRecovery` for its lifespan and restores the
+original resolver at shutdown. Healthy lookups use the native resolver. A lookup
+that exceeds one second switches requests to a separate four-thread resolver for
+60 seconds. These workers call `socket.getaddrinfo` with the original arguments
+and system resolver configuration. They share identical active lookups without
+caching completed results or errors. Worker slots remain occupied after caller
+cancellation until the underlying lookup finishes. The executor cannot accumulate
+an unbounded queue. After the cooldown, one lookup probes the native resolver while
+other callers continue through the fallback. A cancelled or failed probe releases
+its slot and starts another cooldown. A successful probe restores normal native
+resolution.
+
+This change handles a stalled event-loop resolver or a saturated default executor.
+It does not repair an unavailable DNS server, a host network outage, or a TCP/TLS
+failure. OS lookups that have already started cannot be forcibly cancelled. If
+all four fallback workers block too, HTTP request deadlines still apply and new
+lookups wait for capacity. The new `runtime.dns.*` events distinguish a successful
+DNS fallback from connection failures that occur after DNS.
+
+`tests/integration/test_dns_recovery.py` stalls the native resolver while a local
+server remains available. Before the change, both HTTPX clients raise
+`ConnectTimeout` and Telegram raises `TelegramTimeoutError`, on both asyncio and
+uvloop. With recovery, all three clients succeed and a fresh HTTP client also
+connects while the native resolver remains stalled. The server receives exactly
+one Telegram request. Unit tests cover normal resolution, DNS errors, cancellation,
+worker limits, shared lookups, and return to the native resolver. Concurrent burst
+tests confirm that only one native probe runs after the cooldown, and other callers
+finish through the fallback before that probe completes. This reproduces
+the suspected failure mechanism, not the unknown production trigger.
+
+Run the focused checks with:
+
+```bash
+uv run pytest tests/unit/test_dns.py tests/integration/test_dns_recovery.py
+```
+
+Rebuild and redeploy the service to activate the change. No new configuration,
+dependency, API, or database migration is required.

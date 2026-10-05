@@ -394,6 +394,25 @@ Instagram RapidAPI requests and CDN downloads are direct by default. Network
 errors, rate limits, and server failures are retried; definitive missing/private
 responses are not.
 
+The async HTTP clients share the event loop's DNS resolver. If a lookup takes more
+than one second, the application switches DNS lookups to four dedicated workers
+for 60 seconds. After the cooldown, one caller probes the native resolver while
+other callers continue through the fallback. A cancelled or failed probe starts
+another cooldown. This fallback uses the same system DNS configuration. It keeps
+HTTP hostnames, TLS verification, and proxy routing unchanged, and does not resend
+Telegram uploads. Request deadlines still apply. Identical in-flight lookups share
+a worker, and cancelled requests do not free occupied worker slots or queue more
+work in the executor.
+
+`runtime.dns.fallback_started` records the switch at WARNING.
+`runtime.dns.fallback_succeeded` records the first successful fallback lookup, and
+`runtime.dns.native_recovered` records a successful return to the native resolver.
+These events contain no hostnames or credentials. An unavailable system DNS server
+or an upstream TCP/TLS outage can still cause timeouts.
+
+See [the October 5 incident analysis](docs/performance-and-resilience.md#october-5-dns-recovery)
+for the evidence and reproduction limits.
+
 ## Tests
 
 ```bash
