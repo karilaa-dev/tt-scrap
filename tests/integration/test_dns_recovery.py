@@ -1,12 +1,41 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 
+import httpx
 import pytest
 from aiohttp import web
 from pydantic import SecretStr
+from uvicorn import Config
 
 from tt_scrap.app import create_app
+
+
+def test_uvicorn_auto_loop_starts_with_unmodified_native_dns(settings):
+    uvloop = pytest.importorskip("uvloop")
+    app = create_app(settings)
+    config = Config(app, loop="auto")
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        assert isinstance(loop, uvloop.Loop)
+        native_dns = loop.getaddrinfo
+        async with app.router.lifespan_context(app):
+            addresses = await asyncio.wait_for(
+                loop.getaddrinfo("localhost", 443, family=socket.AF_INET, type=socket.SOCK_STREAM),
+                2,
+            )
+            assert (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443)) in addresses
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app), base_url="http://test"
+            ) as client:
+                assert (await client.get("/health/live")).status_code == 200
+                assert (await client.get("/health/ready")).status_code == 200
+        assert loop.getaddrinfo == native_dns
+
+    with asyncio.Runner(loop_factory=config.get_loop_factory()) as runner:
+        runner.run(scenario())
 
 
 @pytest.mark.parametrize("loop_name", ["asyncio", "uvloop"])
