@@ -19,6 +19,7 @@ from starlette.responses import Response
 from .api.routes import assets, health, instagram, tiktok
 from .cache import CacheStore
 from .config import Settings, get_settings
+from .dns import DNSRecovery
 from .errors import ScraperError
 from .logging import (
     RequestLogContext,
@@ -155,50 +156,51 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        cache = CacheStore(
-            configured_settings.cache_ttl_seconds,
-            configured_settings.cache_max_entries,
-        )
-        proxy_manager = ProxyManager(
-            configured_settings.proxy_file,
-            include_host=configured_settings.proxy_include_host,
-        )
-        app.state.settings = configured_settings
-        app.state.cache = cache
-        app.state.proxy_manager = proxy_manager
-        app.state.asset_downloader = AssetDownloader(configured_settings, proxy_manager)
-        app.state.image_preparation = ImagePreparationService(configured_settings)
-        app.state.tiktok = TikTokService(configured_settings, cache, proxy_manager)
-        app.state.instagram = InstagramService(configured_settings, cache)
-        app.state.telegram_client = TelegramClient(configured_settings)
-        app.state.telegram_delivery = TelegramDeliveryService(
-            configured_settings,
-            cache,
-            app.state.tiktok,
-            app.state.asset_downloader,
-            app.state.image_preparation,
-            app.state.telegram_client,
-            instagram=app.state.instagram,
-        )
-        image_warm_task = asyncio.create_task(app.state.image_preparation.warm())
-        lag_monitor = asyncio.create_task(monitor_event_loop())
-        logger.info("tt-scrap started")
-        try:
-            yield
-        finally:
-            lag_monitor.cancel()
-            await asyncio.gather(lag_monitor, return_exceptions=True)
-            if not image_warm_task.done():
-                image_warm_task.cancel()
-            await asyncio.gather(image_warm_task, return_exceptions=True)
-            await app.state.telegram_client.close()
-            await app.state.image_preparation.close()
-            await app.state.instagram.close()
-            await app.state.tiktok.close()
-            await app.state.asset_downloader.close()
-            await cache.close()
-            logger.info("tt-scrap stopped")
-            await asyncio.to_thread(flush_logging)
+        with DNSRecovery():
+            cache = CacheStore(
+                configured_settings.cache_ttl_seconds,
+                configured_settings.cache_max_entries,
+            )
+            proxy_manager = ProxyManager(
+                configured_settings.proxy_file,
+                include_host=configured_settings.proxy_include_host,
+            )
+            app.state.settings = configured_settings
+            app.state.cache = cache
+            app.state.proxy_manager = proxy_manager
+            app.state.asset_downloader = AssetDownloader(configured_settings, proxy_manager)
+            app.state.image_preparation = ImagePreparationService(configured_settings)
+            app.state.tiktok = TikTokService(configured_settings, cache, proxy_manager)
+            app.state.instagram = InstagramService(configured_settings, cache)
+            app.state.telegram_client = TelegramClient(configured_settings)
+            app.state.telegram_delivery = TelegramDeliveryService(
+                configured_settings,
+                cache,
+                app.state.tiktok,
+                app.state.asset_downloader,
+                app.state.image_preparation,
+                app.state.telegram_client,
+                instagram=app.state.instagram,
+            )
+            image_warm_task = asyncio.create_task(app.state.image_preparation.warm())
+            lag_monitor = asyncio.create_task(monitor_event_loop())
+            logger.info("tt-scrap started")
+            try:
+                yield
+            finally:
+                lag_monitor.cancel()
+                await asyncio.gather(lag_monitor, return_exceptions=True)
+                if not image_warm_task.done():
+                    image_warm_task.cancel()
+                await asyncio.gather(image_warm_task, return_exceptions=True)
+                await app.state.telegram_client.close()
+                await app.state.image_preparation.close()
+                await app.state.instagram.close()
+                await app.state.tiktok.close()
+                await app.state.asset_downloader.close()
+                await cache.close()
+                logger.info("tt-scrap stopped")
+                await asyncio.to_thread(flush_logging)
 
     app = FastAPI(
         title="tt-scrap",
