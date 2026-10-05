@@ -204,7 +204,10 @@ that exceeds one second switches requests to a separate four-thread resolver for
 and system resolver configuration. They share identical active lookups without
 caching completed results or errors. Worker slots remain occupied after caller
 cancellation until the underlying lookup finishes. The executor cannot accumulate
-an unbounded queue. A later lookup retries the native resolver after the cooldown.
+an unbounded queue. After the cooldown, one lookup probes the native resolver while
+other callers continue through the fallback. A cancelled or failed probe releases
+its slot and starts another cooldown. A successful probe restores normal native
+resolution.
 
 This change handles a stalled event-loop resolver or a saturated default executor.
 It does not repair an unavailable DNS server, a host network outage, or a TCP/TLS
@@ -219,7 +222,9 @@ server remains available. Before the change, both HTTPX clients raise
 uvloop. With recovery, all three clients succeed and a fresh HTTP client also
 connects while the native resolver remains stalled. The server receives exactly
 one Telegram request. Unit tests cover normal resolution, DNS errors, cancellation,
-worker limits, shared lookups, and return to the native resolver. This reproduces
+worker limits, shared lookups, and return to the native resolver. Concurrent burst
+tests confirm that only one native probe runs after the cooldown, and other callers
+finish through the fallback before that probe completes. This reproduces
 the suspected failure mechanism, not the unknown production trigger.
 
 Run the focused checks with:

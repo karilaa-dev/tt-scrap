@@ -6,6 +6,7 @@ import asyncio
 import logging
 import socket
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import partial
 from types import TracebackType
 
@@ -23,6 +24,13 @@ type AddressInfo = tuple[
 type Lookup = tuple[bytes | str | None, bytes | str | int | None, int, int, int, int]
 
 
+@dataclass(slots=True)
+class _Recovery:
+    retry_at: float
+    probing: bool = False
+    reported_success: bool = False
+
+
 class DNSRecovery:
     def __init__(
         self, *, fallback_after: float = 1.0, cooldown: float = 60.0, workers: int = 4
@@ -31,8 +39,7 @@ class DNSRecovery:
         self._native = self._loop.getaddrinfo
         self._fallback_after = fallback_after
         self._cooldown = cooldown
-        self._fallback_until = 0.0
-        self._reported_success = False
+        self._recovery: _Recovery | None = None
         self._workers = workers
         self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dns-recovery")
         self._slots = asyncio.Semaphore(workers)
@@ -69,17 +76,18 @@ class DNSRecovery:
     ) -> list[AddressInfo]:
         if self._closed:
             raise RuntimeError("DNS recovery is closed")
-        episode = self._fallback_until
-        if self._loop.time() >= episode:
+        episode = self._recovery
+        if episode is None or (not episode.probing and self._loop.time() >= episode.retry_at):
+            if episode is not None:
+                episode.probing = True
             try:
                 async with asyncio.timeout(self._fallback_after):
                     result = await self._native(
                         host, port, family=family, type=type, proto=proto, flags=flags
                     )
             except TimeoutError:
-                if self._loop.time() >= self._fallback_until:
-                    self._fallback_until = self._loop.time() + self._cooldown
-                    self._reported_success = False
+                if self._recovery is episode:
+                    self._recovery = _Recovery(self._loop.time() + self._cooldown)
                     log_event(
                         logger,
                         "runtime.dns.fallback_started",
@@ -89,14 +97,21 @@ class DNSRecovery:
                         worker_count=self._workers,
                     )
             else:
-                if episode and self._fallback_until == episode:
-                    self._fallback_until = 0.0
+                if episode is not None and self._recovery is episode:
+                    self._recovery = None
                     log_event(logger, "runtime.dns.native_recovered", success=True)
                 return result
+            finally:
+                if episode is not None:
+                    # Cancellation and DNS errors must release the probe without
+                    # sending the next caller straight back to a stalled resolver.
+                    episode.retry_at = self._loop.time() + self._cooldown
+                    episode.probing = False
 
         result = await self._fallback((host, port, family, type, proto, flags))
-        if not self._reported_success:
-            self._reported_success = True
+        recovery = self._recovery
+        if recovery is not None and not recovery.reported_success:
+            recovery.reported_success = True
             log_event(logger, "runtime.dns.fallback_succeeded", success=True)
         return result
 

@@ -188,6 +188,89 @@ async def test_native_resolver_is_retried_after_cooldown(monkeypatch, log_record
     ]
 
 
+@pytest.mark.parametrize("probe_succeeds", [True, False])
+async def test_expired_cooldown_allows_one_probe_while_burst_uses_fallback(
+    monkeypatch, probe_succeeds
+):
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    native_calls = []
+
+    async def native(host, *args, **kwargs):
+        native_calls.append(host)
+        if host == "initial.test":
+            raise TimeoutError
+        entered.set()
+        await release.wait()
+        if not probe_succeeds:
+            raise TimeoutError
+        return ADDRESS
+
+    monkeypatch.setattr(loop, "getaddrinfo", native)
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args: ADDRESS)
+    with DNSRecovery(fallback_after=5, cooldown=0):
+        assert await loop.getaddrinfo("initial.test", 443) == ADDRESS
+        probe = asyncio.create_task(loop.getaddrinfo("probe.test", 443))
+        burst = []
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            burst = [
+                asyncio.create_task(loop.getaddrinfo(f"burst-{index}.test", 443))
+                for index in range(20)
+            ]
+            await asyncio.sleep(0)
+            assert native_calls == ["initial.test", "probe.test"]
+            assert await asyncio.wait_for(asyncio.gather(*burst), 1) == [ADDRESS] * 20
+            assert not probe.done(), "Other callers must not wait for the native probe"
+            release.set()
+            assert await asyncio.wait_for(probe, 1) == ADDRESS
+        finally:
+            release.set()
+            await asyncio.gather(probe, *burst, return_exceptions=True)
+
+
+@pytest.mark.parametrize("outcome", ["cancel", "dns_error"])
+async def test_interrupted_native_probe_allows_later_recovery(monkeypatch, outcome):
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    native_calls = []
+    error = socket.gaierror(socket.EAI_NONAME, "does not exist")
+
+    async def native(host, *args, **kwargs):
+        native_calls.append(host)
+        if host == "initial.test":
+            raise TimeoutError
+        if host == "probe.test":
+            entered.set()
+            await release.wait()
+            raise error
+        return ADDRESS
+
+    monkeypatch.setattr(loop, "getaddrinfo", native)
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args: ADDRESS)
+    with DNSRecovery(fallback_after=5, cooldown=0):
+        assert await loop.getaddrinfo("initial.test", 443) == ADDRESS
+        probe = asyncio.create_task(loop.getaddrinfo("probe.test", 443))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            if outcome == "cancel":
+                probe.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await probe
+            else:
+                release.set()
+                with pytest.raises(socket.gaierror) as caught:
+                    await probe
+                assert caught.value is error
+            assert await asyncio.wait_for(loop.getaddrinfo("recovered.test", 443), 1) == ADDRESS
+            assert native_calls == ["initial.test", "probe.test", "recovered.test"]
+        finally:
+            release.set()
+            await asyncio.gather(probe, return_exceptions=True)
+
+
 def test_real_dns_resolves_while_default_executor_is_occupied():
     async def scenario():
         loop = asyncio.get_running_loop()

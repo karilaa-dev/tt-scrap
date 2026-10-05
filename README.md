@@ -396,11 +396,13 @@ responses are not.
 
 The async HTTP clients share the event loop's DNS resolver. If a lookup takes more
 than one second, the application switches DNS lookups to four dedicated workers
-for 60 seconds, then tries the native resolver again. This fallback uses the same
-system DNS configuration. It keeps HTTP hostnames, TLS verification, and proxy
-routing unchanged, and does not resend Telegram uploads. Request deadlines still
-apply. Identical in-flight lookups share a worker, and cancelled requests do not
-free occupied worker slots or queue more work in the executor.
+for 60 seconds. After the cooldown, one caller probes the native resolver while
+other callers continue through the fallback. A cancelled or failed probe starts
+another cooldown. This fallback uses the same system DNS configuration. It keeps
+HTTP hostnames, TLS verification, and proxy routing unchanged, and does not resend
+Telegram uploads. Request deadlines still apply. Identical in-flight lookups share
+a worker, and cancelled requests do not free occupied worker slots or queue more
+work in the executor.
 
 `runtime.dns.fallback_started` records the switch at WARNING.
 `runtime.dns.fallback_succeeded` records the first successful fallback lookup, and
