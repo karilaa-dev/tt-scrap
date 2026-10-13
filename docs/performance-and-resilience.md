@@ -1,12 +1,14 @@
 # Go performance and resilience
 
-The service uses pooled native HTTP transports, bounded work queues, metadata request coalescing, TTL/LRU caches and streamed media files. App identity selection and health checks run in RAM; PostgreSQL is read at startup and receives completed operation state afterward. A periodic ownership-connection ping detects an idle database failure.
+The service uses pooled native HTTP transports, bounded work queues, metadata request coalescing, TTL/LRU caches and streamed media files. Caches track expiry separately from access order, purging expired entries before evicting live data without scanning the live cache. Request URLs retain the original 2,083-byte limit before parsing or caching. App identity selection and health checks run in RAM; PostgreSQL is read at startup and receives completed operation state afterward. A periodic ownership-connection ping detects an idle database failure.
 
 An identity stays on one proxy and is exclusively leased while its request or media stream uses mutable session state. Ten slots per proxy are filled on demand. Three-hour signing renewal and recovery are lazy. Explicit signature rejection renews the seed; an invalid registration recreates the device in the same slot. Rate limits cool down an identity, and network failures cool down its proxy. Recovery retries once per identity operation. Single-process ownership and revision checks stop conflicting writers.
 
 Related app quality probes share one exclusive lease and run with up to three workers. All bodies finish before the group checkpoints once; cancellation closes outstanding bodies, and a failed checkpoint rejects the extraction. Cached clients preserve cookie jars between operations. Cookie snapshots rebuild only after a change or expiry. See the [app-only before/after comparison](go-app-optimization.md) for measured gains and remaining network tails.
 
 App downloads keep one identity lease across fallback URLs and adaptive tracks, then save one completion checkpoint. Adaptive video and audio download concurrently, cancel together on failure, and share one cumulative byte budget before muxing. Failed attempts release their budget after temporary-file cleanup. With `PROXY_DATA_ONLY=true`, CDN bytes use a direct transport while signed app endpoints keep their identity proxy. Web media retries rotate through the configured proxies after the initial sticky choice fails.
+
+Slideshow assets sharing an identity wait for its exclusive lease before starting their transfer timeout. Caller cancellation still applies while queued, and local cancellation or transfer deadlines do not mark the identity or proxy unhealthy.
 
 A canceled metadata leader releases its flight so still-active followers can retry. Trailing-slash redirects use relative locations to preserve the public HTTPS origin behind an ingress. Thumbnail pass-through validates the complete JPEG stream.
 

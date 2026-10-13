@@ -1,6 +1,7 @@
 package core
 
 import (
+	"container/heap"
 	"container/list"
 	"context"
 	"crypto/rand"
@@ -11,14 +12,17 @@ import (
 )
 
 type cacheItem[T any] struct {
-	key     string
-	value   T
-	expires time.Time
+	key         string
+	value       T
+	expires     time.Time
+	recency     *list.Element
+	expiryIndex int
 }
 type Cache[T any] struct {
 	mu       sync.Mutex
-	entries  map[string]*list.Element
+	entries  map[string]*cacheItem[T]
 	order    *list.List
+	expiry   expiryHeap[T]
 	capacity int
 	ttl      time.Duration
 }
@@ -27,23 +31,21 @@ func NewCache[T any](ttl time.Duration, capacity int) *Cache[T] {
 	if capacity < 1 {
 		capacity = 1
 	}
-	return &Cache[T]{entries: make(map[string]*list.Element), order: list.New(), capacity: capacity, ttl: ttl}
+	return &Cache[T]{entries: make(map[string]*cacheItem[T]), order: list.New(), capacity: capacity, ttl: ttl}
 }
 func (c *Cache[T]) Get(key string) (T, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var zero T
-	e, ok := c.entries[key]
+	entry, ok := c.entries[key]
 	if !ok {
 		return zero, false
 	}
-	entry := e.Value.(cacheItem[T])
-	if time.Now().After(entry.expires) {
-		c.order.Remove(e)
-		delete(c.entries, key)
+	if !entry.expires.After(time.Now()) {
+		c.remove(entry)
 		return zero, false
 	}
-	c.order.MoveToFront(e)
+	c.order.MoveToFront(entry.recency)
 	return entry.value, true
 }
 func (c *Cache[T]) Set(key string, value T) {
@@ -52,28 +54,51 @@ func (c *Cache[T]) Set(key string, value T) {
 func (c *Cache[T]) SetUntil(key string, value T, expires time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	entry := cacheItem[T]{key: key, value: value, expires: expires}
-	if e, ok := c.entries[key]; ok {
-		e.Value = entry
-		c.order.MoveToFront(e)
+	now := time.Now()
+	for len(c.expiry) > 0 && !c.expiry[0].expires.After(now) {
+		c.remove(c.expiry[0])
+	}
+	if !expires.After(now) {
+		if entry := c.entries[key]; entry != nil {
+			c.remove(entry)
+		}
+		return
+	}
+	if entry := c.entries[key]; entry != nil {
+		entry.value, entry.expires = value, expires
+		c.order.MoveToFront(entry.recency)
+		heap.Fix(&c.expiry, entry.expiryIndex)
 		return
 	}
 	if len(c.entries) >= c.capacity {
-		e := c.order.Back()
-		delete(c.entries, e.Value.(cacheItem[T]).key)
-		c.order.Remove(e)
+		c.remove(c.order.Back().Value.(*cacheItem[T]))
 	}
-	c.entries[key] = c.order.PushFront(entry)
+	entry := &cacheItem[T]{key: key, value: value, expires: expires}
+	entry.recency = c.order.PushFront(entry)
+	c.entries[key] = entry
+	heap.Push(&c.expiry, entry)
+}
+func (c *Cache[T]) remove(entry *cacheItem[T]) {
+	heap.Remove(&c.expiry, entry.expiryIndex)
+	c.order.Remove(entry.recency)
+	delete(c.entries, entry.key)
 }
 func (c *Cache[T]) Delete(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if e := c.entries[key]; e != nil {
-		c.order.Remove(e)
-		delete(c.entries, key)
+	if entry := c.entries[key]; entry != nil {
+		c.remove(entry)
 	}
 }
-func (c *Cache[T]) Clear() { c.mu.Lock(); defer c.mu.Unlock(); clear(c.entries); c.order.Init() }
+func (c *Cache[T]) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	clear(c.entries)
+	c.order.Init()
+	clear(c.expiry)
+	c.expiry = c.expiry[:0]
+}
+
 func NewID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {

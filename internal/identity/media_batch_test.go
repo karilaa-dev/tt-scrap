@@ -342,3 +342,86 @@ func TestAppDataOnlyUsesDirectCDNWithPinnedPlayRequest(t *testing.T) {
 		t.Fatal("identity route changed", cdnCalls.Load(), plays.Load(), fixture)
 	}
 }
+
+func TestPinnedDownloadWaitDoesNotConsumeTransferTimeout(t *testing.T) {
+	cfg, _ := testDatabase(t)
+	cfg.TempDir = t.TempDir()
+	cfg.DownloadTimeout = 200 * time.Millisecond
+	p := openTestPool(t, cfg, "")
+	var calls atomic.Int32
+	p.clientFactory = func(s *tiktokapp.Session, _ *http.Client) *tiktokapp.Client {
+		return tiktokapp.NewClient(s, fixtureDoer(func(r *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return fixtureResponse(200, []byte{255, 216, 255, 0, 1, 2}), nil
+		}))
+	}
+	active := mustAcquire(t, p, "")
+	id := active.entry.id
+	defer active.finish(nil)
+	d := platform.NewDownloader(cfg, p, nil)
+	defer d.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		file, err := d.Download(ctx, core.AssetContext{Platform: "tiktok", Kind: "image", Filename: "slide.jpg", IdentityID: id, UpstreamURL: "https://cdn.example/slide"}, 0)
+		file.Cleanup()
+		done <- err
+	}()
+	waitStats(t, p, func(s Stats) bool { return s.Queued == 1 })
+	time.Sleep(2 * cfg.DownloadTimeout)
+	finishLease(t, active, nil)
+	if err := <-done; err != nil {
+		t.Fatal("queued slide used up its transfer timeout", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatal("queued slide was not downloaded exactly once", calls.Load())
+	}
+
+	active = mustAcquire(t, p, id)
+	defer active.finish(nil)
+	queued, stop := context.WithCancel(context.Background())
+	go func() {
+		file, err := d.Download(queued, core.AssetContext{Platform: "tiktok", Kind: "image", IdentityID: id, UpstreamURL: "https://cdn.example/slide"}, 0)
+		file.Cleanup()
+		done <- err
+	}()
+	waitStats(t, p, func(s Stats) bool { return s.Queued == 1 })
+	stop()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatal("caller cancellation was lost while queued", err)
+	}
+	finishLease(t, active, nil)
+	if calls.Load() != 1 {
+		t.Fatal("canceled queued slide contacted upstream")
+	}
+}
+
+func TestPinnedDownloadTransferTimeoutRemainsEnforced(t *testing.T) {
+	cfg, _ := testDatabase(t)
+	cfg.DownloadTimeout = 20 * time.Millisecond
+	cfg.TempDir = t.TempDir()
+	p := openTestPool(t, cfg, "")
+	active := mustAcquire(t, p, "")
+	id := active.entry.id
+	finishLease(t, active, nil)
+	p.clientFactory = func(s *tiktokapp.Session, _ *http.Client) *tiktokapp.Client {
+		return tiktokapp.NewClient(s, fixtureDoer(func(r *http.Request) (*http.Response, error) {
+			<-r.Context().Done()
+			return nil, r.Context().Err()
+		}))
+	}
+	d := platform.NewDownloader(cfg, p, nil)
+	defer d.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	file, err := d.Download(ctx, core.AssetContext{Platform: "tiktok", Kind: "image", IdentityID: id, UpstreamURL: "https://cdn.example/slow"}, 0)
+	file.Cleanup()
+	var api *core.Error
+	if !errors.As(err, &api) || api.Code != "upstream_timeout" || ctx.Err() != nil {
+		t.Fatal("per-transfer timeout lost", err, ctx.Err())
+	}
+	if p.entries[id].health.CooldownUntil != 0 || p.entries[id].proxy.health.CooldownUntil != 0 {
+		t.Fatal("local transfer deadline penalized the identity or its proxy")
+	}
+}

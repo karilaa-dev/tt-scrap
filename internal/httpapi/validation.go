@@ -51,7 +51,7 @@ func readBody(w http.ResponseWriter, r *http.Request) (fields, error) {
 
 func httpURL(value any) (string, error) {
 	text, ok := value.(string)
-	if !ok {
+	if !ok || len(text) > 2083 {
 		return "", invalidRequest()
 	}
 	text = strings.TrimSpace(text)

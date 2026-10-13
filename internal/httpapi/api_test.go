@@ -334,3 +334,44 @@ func TestTrailingSlashRedirectPreservesPublicOrigin(t *testing.T) {
 		t.Fatalf("redirect must retain the client's origin: %d %q", w.Code, w.Header().Get("Location"))
 	}
 }
+
+func TestURLLengthLimitAcrossPublicRoutes(t *testing.T) {
+	dependencies, _, _, _ := fixture(t)
+	handler := NewHandler(dependencies)
+	for _, route := range []string{"/v1/tiktok/resolutions", "/v1/tiktok/extractions", "/v1/instagram/extractions", "/v1/tiktok/telegram-deliveries", "/v1/instagram/telegram-deliveries"} {
+		t.Run(route, func(t *testing.T) {
+			prefix := "https://www.tiktok.com/@x/video/123?"
+			if strings.Contains(route, "instagram") {
+				prefix = "https://www.instagram.com/p/test/?"
+			}
+			url := prefix + strings.Repeat("x", 2084-len(prefix))
+			body := fields{"url": url}
+			if strings.HasSuffix(route, "telegram-deliveries") {
+				body = fields{"source": fields{"url": url}, "telegram": fields{"chat_id": 1}}
+			}
+			encoded, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := request(handler, "POST", route, string(encoded), true)
+			if response.Code != 422 || !strings.Contains(response.Body.String(), `"code":"validation_error"`) {
+				t.Fatalf("overlong URL accepted: %d", response.Code)
+			}
+		})
+	}
+	prefix := "https://www.tiktok.com/@x/video/123?"
+	boundary := prefix + strings.Repeat("x", 2083-len(prefix))
+	for _, tc := range []struct {
+		url    string
+		status int
+	}{
+		{boundary, 200}, {boundary + "x", 422}, {" " + boundary, 422},
+		{prefix + strings.Repeat("é", 2083-len(prefix)), 422},
+	} {
+		body, _ := json.Marshal(fields{"url": tc.url})
+		response := request(handler, "POST", "/v1/tiktok/resolutions", string(body), true)
+		if response.Code != tc.status {
+			t.Errorf("input bytes %d: got %d, want %d", len(tc.url), response.Code, tc.status)
+		}
+	}
+}

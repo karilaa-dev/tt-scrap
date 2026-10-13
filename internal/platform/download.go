@@ -35,13 +35,21 @@ func (d *Downloader) Download(ctx context.Context, asset core.AssetContext, maxB
 		return nil, e
 	}
 	defer release()
-	ctx, cancel := context.WithTimeout(ctx, d.cfg.DownloadTimeout)
-	defer cancel()
+	var cancel context.CancelFunc
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+	}()
 	if d.cfg.MaxAssetBytes > 0 && (maxBytes <= 0 || d.cfg.MaxAssetBytes < maxBytes) {
 		maxBytes = d.cfg.MaxAssetBytes
 	}
 	var video, audio *core.Downloaded
 	transfer := func(open core.OpenAppMedia) error {
+		// Identity queue time is outside the transfer budget; caller cancellation still applies.
+		if cancel == nil {
+			ctx, cancel = context.WithTimeout(ctx, d.cfg.DownloadTimeout)
+		}
 		video.Cleanup()
 		audio.Cleanup()
 		video, audio = nil, nil

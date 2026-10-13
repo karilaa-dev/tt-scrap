@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -70,4 +71,56 @@ func TestConfigRejectsInvalidLimitsAndDoesNotRequireDBForWeb(t *testing.T) {
 	if _, err := ParseConfig(base); err == nil {
 		t.Fatal("app accepted absent database")
 	}
+}
+
+func TestCacheExpiresRecentEntryBeforeEvictingLiveLRU(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := NewCache[string](time.Hour, 2)
+		c.SetUntil("short", "expires first", time.Now().Add(time.Second))
+		c.Set("live", "keep this")
+		if _, ok := c.Get("short"); !ok {
+			t.Fatal("new entry missing")
+		}
+		time.Sleep(2 * time.Second)
+		c.Set("new", "new value")
+		if value, ok := c.Get("live"); !ok || value != "keep this" {
+			t.Fatal("expired recent entry displaced a live token")
+		}
+		if _, ok := c.Get("short"); ok {
+			t.Fatal("expired entry survived")
+		}
+	})
+}
+
+func TestCacheExpirationTracksReplacementDeleteAndClear(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := NewCache[int](time.Hour, 2)
+		c.SetUntil("updated", 1, time.Now().Add(time.Second))
+		c.Set("updated", 2)
+		c.Set("live", 3)
+		time.Sleep(2 * time.Second)
+		if value, ok := c.Get("updated"); !ok || value != 2 {
+			t.Fatal("replacement kept the old expiry")
+		}
+		c.SetUntil("expired", 4, time.Now().Add(-time.Second))
+		if value, ok := c.Get("live"); !ok || value != 3 {
+			t.Fatal("past-due insertion evicted a live entry")
+		}
+		c.Delete("updated")
+		c.Set("new", 5)
+		c.SetUntil("live", 6, time.Now().Add(time.Second))
+		time.Sleep(2 * time.Second)
+		c.Set("replacement", 7)
+		if value, ok := c.Get("new"); !ok || value != 5 {
+			t.Fatal("updated expiry was ignored")
+		}
+		c.Clear()
+		c.Set("after-clear", 8)
+		if _, ok := c.Get("replacement"); ok {
+			t.Fatal("clear retained a value")
+		}
+		if value, ok := c.Get("after-clear"); !ok || value != 8 {
+			t.Fatal("cache unusable after clear")
+		}
+	})
 }

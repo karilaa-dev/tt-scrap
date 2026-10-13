@@ -187,6 +187,9 @@ func (l *lease) finish(operationErr error) error {
 	return l.finishErr
 }
 func (p *Pool) failedLocked(e *entry, err error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
 	var typed *tiktokapp.UpstreamError
 	var network net.Error
 	isNetwork := errors.As(err, &network)

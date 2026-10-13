@@ -42,3 +42,14 @@ All eight code findings from the initial PR review were reproduced before their 
 | Small JPEG thumbnails require valid pixel data | `TestSmallJPEGThumbnailValidatesPixelStream` |
 
 After these fixes, `make check` passed from a fresh Git-index export against disposable PostgreSQL 18, including race tests, vet, formatting, module consistency, and the release build. The production Docker build also passed. Container checks covered app mode with direct CDN configuration, readiness, relative redirects, unchanged OpenAPI bytes, and graceful shutdown. No live upstream requests or new performance measurements were run for these correctness fixes.
+
+The next review's three code findings were also reproduced and fixed:
+
+| Behavior | Regression check |
+| --- | --- |
+| A pinned slideshow transfer gets its full timeout after waiting for its identity; caller cancellation still stops queued work | `TestPinnedDownloadWaitDoesNotConsumeTransferTimeout` |
+| Transfer deadlines remain enforced without cooling down a healthy identity or proxy | `TestPinnedDownloadTransferTimeoutRemainsEnforced` |
+| Expired entries are purged before live LRU victims, including changed expiry, deletion, and clearing | `TestCacheExpiresRecentEntryBeforeEvictingLiveLRU`, `TestCacheExpirationTracksReplacementDeleteAndClear` |
+| All URL routes enforce the original 2,083-byte input limit before parsing or caching | `TestURLLengthLimitAcrossPublicRoutes` |
+
+Slideshow assets still take separate exclusive leases; waiting for a lease no longer consumes the transfer budget. URL length behavior, including whitespace and UTF-8 input, was checked against the archived Python `HttpUrl` validator. The full clean-export `make check` passed again with disposable PostgreSQL 18, as did the production Docker build. The built container passed readiness, its built-in health check, unchanged OpenAPI, the 2,083/2,084-byte URL boundary, and graceful shutdown. These checks used fixtures and direct-ID resolution without contacting TikTok, Instagram, or Telegram.
