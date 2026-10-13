@@ -376,3 +376,37 @@ func TestRegisteredSessionSerializesEmptyDeviceTokenForPythonCompatibility(t *te
 		t.Fatal("registered session omitted required empty deviceToken, breaking preserved Python/Node readers")
 	}
 }
+
+func TestDirectMediaTransportKeepsAppSigningAndCDNRedirectCookies(t *testing.T) {
+	primary, direct := 0, 0
+	client := NewClient(registeredTestSession(t), doerFunc(func(r *http.Request) (*http.Response, error) {
+		primary++
+		if r.URL.Host != "api19-va.tiktokv.com" || r.Header.Get("X-Argus") == "" {
+			t.Error("app play did not use the signed primary route", r.URL)
+		}
+		return testResponse(302, nil, http.Header{"Location": {"https://cdn.example/start"}}), nil
+	}))
+	client.SetMediaTransport(doerFunc(func(r *http.Request) (*http.Response, error) {
+		direct++
+		if r.URL.Host != "cdn.example" || r.Header.Get("X-Argus") != "" || r.Header.Get("X-Tt-Store-Region") != "" {
+			t.Error("CDN received app credentials", r.URL)
+		}
+		if r.URL.Path == "/start" {
+			return testResponse(302, nil, http.Header{"Location": {"/final"}, "Set-Cookie": {"cdn=saved; Path=/; Secure"}}), nil
+		}
+		cookie, err := r.Cookie("cdn")
+		if err != nil || cookie.Value != "saved" {
+			t.Error("direct redirect lost cookies", err)
+		}
+		return testResponse(200, []byte("video"), nil), nil
+	}))
+	response, err := client.MediaRequest(context.Background(), "https://api19-va.tiktokv.com/aweme/v1/play/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil || string(body) != "video" || primary != 1 || direct != 2 {
+		t.Fatal(string(body), err, primary, direct)
+	}
+}

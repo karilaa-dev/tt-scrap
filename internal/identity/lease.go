@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -26,6 +27,9 @@ type lease struct {
 func (l *lease) client() *tiktokapp.Client {
 	if l.entry.client == nil {
 		l.entry.client = l.pool.clientFactory(l.entry.session, l.entry.proxy.client)
+		if l.pool.mediaTransport != nil {
+			l.entry.client.SetMediaTransport(&http.Client{Transport: l.pool.mediaTransport})
+		}
 	}
 	return l.entry.client
 }

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 
 	"github.com/karilaa-dev/tt-scrap/internal/core"
 	"github.com/karilaa-dev/tt-scrap/internal/media"
@@ -18,13 +19,14 @@ import (
 type Downloader struct {
 	cfg        core.Config
 	app        core.AppBackend
+	proxies    []string
 	transports *transports
 	gate       *core.Limiter
 	buffers    sync.Pool
 }
 
-func NewDownloader(cfg core.Config, backend core.AppBackend) *Downloader {
-	return &Downloader{cfg: cfg, app: backend, transports: newTransports(cfg.HTTPMaxConnections), gate: core.NewLimiter(cfg.DownloadConcurrency, cfg.MaxQueuedRequests), buffers: sync.Pool{New: func() any { return make([]byte, 128<<10) }}}
+func NewDownloader(cfg core.Config, backend core.AppBackend, proxies []string) *Downloader {
+	return &Downloader{cfg: cfg, app: backend, proxies: append([]string(nil), proxies...), transports: newTransports(cfg.HTTPMaxConnections), gate: core.NewLimiter(cfg.DownloadConcurrency, cfg.MaxQueuedRequests), buffers: sync.Pool{New: func() any { return make([]byte, 128<<10) }}}
 }
 func (d *Downloader) Close() { d.transports.close() }
 func (d *Downloader) Download(ctx context.Context, asset core.AssetContext, maxBytes int64) (*core.Downloaded, error) {
@@ -38,27 +40,77 @@ func (d *Downloader) Download(ctx context.Context, asset core.AssetContext, maxB
 	if d.cfg.MaxAssetBytes > 0 && (maxBytes <= 0 || d.cfg.MaxAssetBytes < maxBytes) {
 		maxBytes = d.cfg.MaxAssetBytes
 	}
-	video, e := d.download(ctx, asset, maxBytes)
+	var video, audio *core.Downloaded
+	transfer := func(open core.OpenAppMedia) error {
+		video.Cleanup()
+		audio.Cleanup()
+		video, audio = nil, nil
+		var budget *downloadBudget
+		if maxBytes > 0 {
+			budget = &downloadBudget{}
+			budget.remaining.Store(maxBytes)
+		}
+		if asset.Audio == nil {
+			var err error
+			video, err = d.download(ctx, asset, maxBytes, budget, open)
+			return err
+		}
+		audioAsset := asset
+		audioAsset.Kind = "audio"
+		audioAsset.Filename = "audio.m4a"
+		audioAsset.ContentType = asset.Audio.ContentType
+		audioAsset.UpstreamURL = asset.Audio.UpstreamURL
+		audioAsset.AlternateURLs = asset.Audio.AlternateURLs
+		audioAsset.Cookies = asset.Audio.Cookies
+		audioAsset.Audio = nil
+		audioAsset.ExpectedWidth = 0
+		audioAsset.ExpectedHeight = 0
+		tracks, cancelTracks := context.WithCancel(ctx)
+		defer cancelTracks()
+		type result struct {
+			index int
+			file  *core.Downloaded
+			err   error
+		}
+		results := make(chan result, 2)
+		for i, track := range []core.AssetContext{asset, audioAsset} {
+			go func() {
+				file, err := d.download(tracks, track, maxBytes, budget, open)
+				results <- result{i, file, err}
+				if err != nil {
+					cancelTracks()
+				}
+			}()
+		}
+		var failure error
+		for range 2 {
+			r := <-results
+			if r.index == 0 {
+				video = r.file
+			} else {
+				audio = r.file
+			}
+			if failure == nil {
+				failure = r.err
+			}
+		}
+		return failure
+	}
+	if asset.IdentityID != "" {
+		if d.app == nil {
+			return nil, core.Upstream("TikTok app backend is unavailable")
+		}
+		e = d.app.WithMedia(ctx, asset.IdentityID, transfer)
+	} else {
+		e = transfer(nil)
+	}
 	if e != nil {
+		video.Cleanup()
+		audio.Cleanup()
 		return nil, e
 	}
 	if asset.Audio == nil {
 		return video, nil
-	}
-	audioAsset := asset
-	audioAsset.Kind = "audio"
-	audioAsset.Filename = "audio.m4a"
-	audioAsset.ContentType = asset.Audio.ContentType
-	audioAsset.UpstreamURL = asset.Audio.UpstreamURL
-	audioAsset.AlternateURLs = asset.Audio.AlternateURLs
-	audioAsset.Cookies = asset.Audio.Cookies
-	audioAsset.Audio = nil
-	audioAsset.ExpectedWidth = 0
-	audioAsset.ExpectedHeight = 0
-	audio, e := d.download(ctx, audioAsset, maxBytes)
-	if e != nil {
-		video.Cleanup()
-		return nil, e
 	}
 	defer video.Cleanup()
 	defer audio.Cleanup()
@@ -103,14 +155,25 @@ func (d *Downloader) Download(ctx context.Context, asset core.AssetContext, maxB
 	ok = true
 	return &core.Downloaded{Path: path, Filename: asset.Filename, ContentType: "video/mp4", Size: info.Size(), SHA256: hex.EncodeToString(digest.Sum(nil)), Width: w, Height: h, Remove: func() { os.Remove(path) }}, nil
 }
-func (d *Downloader) download(ctx context.Context, asset core.AssetContext, maximum int64) (*core.Downloaded, error) {
+func (d *Downloader) download(ctx context.Context, asset core.AssetContext, maximum int64, budget *downloadBudget, open core.OpenAppMedia) (*core.Downloaded, error) {
 	sources := append([]string{asset.UpstreamURL}, asset.AlternateURLs...)
 	var last error
 	for attempt := 0; attempt < max(len(sources), d.cfg.DownloadRetries); attempt++ {
 		if e := ctx.Err(); e != nil {
 			return nil, networkError(ctx, e)
 		}
-		result, e := d.downloadOnce(ctx, asset, sources[attempt%len(sources)], maximum)
+		current := asset
+		if asset.Platform == "tiktok" && asset.IdentityID == "" && !d.cfg.ProxyDataOnly && attempt > 0 && len(d.proxies) > 0 {
+			start := -1
+			for i, proxy := range d.proxies {
+				if proxy == asset.ProxyURL {
+					start = i
+					break
+				}
+			}
+			current.ProxyURL = d.proxies[(start+attempt)%len(d.proxies)]
+		}
+		result, e := d.downloadOnce(ctx, current, sources[attempt%len(sources)], maximum, budget, open)
 		if e == nil {
 			return result, nil
 		}
@@ -127,7 +190,7 @@ func (d *Downloader) download(ctx context.Context, asset core.AssetContext, maxi
 	}
 	return nil, last
 }
-func (d *Downloader) open(ctx context.Context, asset core.AssetContext, source string) (*http.Response, error) {
+func (d *Downloader) open(ctx context.Context, asset core.AssetContext, source string, appOpen core.OpenAppMedia) (*http.Response, error) {
 	headers := asset.Headers.Clone()
 	if headers == nil {
 		headers = make(http.Header)
@@ -140,10 +203,7 @@ func (d *Downloader) open(ctx context.Context, asset core.AssetContext, source s
 		headers.Set("Referer", asset.Referer)
 	}
 	if asset.IdentityID != "" {
-		if d.app == nil {
-			return nil, core.Upstream("TikTok app backend is unavailable")
-		}
-		return d.app.OpenMedia(ctx, asset.IdentityID, source, headers)
+		return appOpen(ctx, source, headers)
 	}
 	proxy := asset.ProxyURL
 	if asset.Platform == "tiktok" && d.cfg.ProxyDataOnly {
@@ -164,8 +224,8 @@ func (d *Downloader) open(ctx context.Context, asset core.AssetContext, source s
 	}
 	return client.Do(req)
 }
-func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, source string, maximum int64) (*core.Downloaded, error) {
-	res, e := d.open(ctx, asset, source)
+func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, source string, maximum int64, budget *downloadBudget, open core.OpenAppMedia) (*core.Downloaded, error) {
+	res, e := d.open(ctx, asset, source, open)
 	if e != nil {
 		return nil, networkError(ctx, e)
 	}
@@ -182,10 +242,12 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 	}
 	path := file.Name()
 	good := false
+	var reserved int64
 	defer func() {
 		file.Close()
 		if !good {
 			os.Remove(path)
+			budget.refund(reserved)
 		}
 	}()
 	digest := sha256.New()
@@ -196,9 +258,10 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 	for {
 		n, readErr := res.Body.Read(buffer)
 		if n > 0 {
-			if maximum > 0 && received+int64(n) > maximum {
+			if !budget.take(int64(n)) {
 				return nil, tooLarge()
 			}
+			reserved += int64(n)
 			if len(prefix) < 512 {
 				prefix = append(prefix, buffer[:min(n, 512-len(prefix))]...)
 			}
@@ -266,4 +329,24 @@ func detectedFilename(name, mime string) string { return media.FilenameForType(n
 
 func tooLarge() error {
 	return core.NewError("asset_too_large", "Media exceeds the configured download limit", 413)
+}
+
+// Tracks share a byte budget. Failed attempts return their reservation after cleanup.
+type downloadBudget struct{ remaining atomic.Int64 }
+
+func (b *downloadBudget) take(n int64) bool {
+	if b == nil {
+		return true
+	}
+	for left := b.remaining.Load(); left >= n; left = b.remaining.Load() {
+		if b.remaining.CompareAndSwap(left, left-n) {
+			return true
+		}
+	}
+	return false
+}
+func (b *downloadBudget) refund(n int64) {
+	if b != nil {
+		b.remaining.Add(n)
+	}
 }

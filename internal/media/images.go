@@ -145,10 +145,9 @@ func (p *Processor) Prepare(ctx context.Context, path, filename string, thumbnai
 	if width <= 0 || height <= 0 || int64(width)*int64(height) > maxPixels {
 		return Prepared{}, fmt.Errorf("image dimensions exceed limits")
 	}
-	if thumbnail && kind == "image/jpeg" && width <= 320 && height <= 320 && stat.Size() < 200000 {
-		return Prepared{Path: path, Filename: FilenameForType(filename, kind), ContentType: kind, Size: stat.Size()}, nil
-	}
-	if !thumbnail && native && stat.Size() <= photoMaxBytes && width+height <= 10000 && max(float64(width)/float64(height), float64(height)/float64(width)) <= 20 {
+	thumbnailFits := thumbnail && kind == "image/jpeg" && width <= 320 && height <= 320 && stat.Size() < 200000
+	photoFits := !thumbnail && native && stat.Size() <= photoMaxBytes && width+height <= 10000 && max(float64(width)/float64(height), float64(height)/float64(width)) <= 20
+	if thumbnailFits || photoFits {
 		// Validate the pixel stream before forwarding a nominally valid image.
 		if _, err = f.Seek(0, 0); err != nil {
 			return Prepared{}, err

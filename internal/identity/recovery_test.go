@@ -21,7 +21,7 @@ type fixtureDoer func(*http.Request) (*http.Response, error)
 
 func (f fixtureDoer) Do(r *http.Request) (*http.Response, error) { return f(r) }
 func fixtureResponse(status int, body []byte) *http.Response {
-	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}
+	return &http.Response{StatusCode: status, ContentLength: int64(len(body)), Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}
 }
 
 type protocolFixture struct {

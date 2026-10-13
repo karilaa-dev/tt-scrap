@@ -183,3 +183,41 @@ func TestAnimatedImagesBecomeSingleJPEGFrames(t *testing.T) {
 		})
 	}
 }
+
+func TestSmallJPEGThumbnailValidatesPixelStream(t *testing.T) {
+	path := writeImage(t, 80, 40, "jpg")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := bytes.Index(data, []byte{0xff, 0xda})
+	if start < 0 {
+		t.Fatal("missing JPEG scan")
+	}
+	cut := start + 2 + int(binary.BigEndian.Uint16(data[start+2:start+4]))
+	broken := data[:cut]
+	if _, _, err = image.DecodeConfig(bytes.NewReader(broken)); err != nil {
+		t.Fatal("fixture lacks valid headers", err)
+	}
+	if _, _, err = image.Decode(bytes.NewReader(broken)); err == nil {
+		t.Fatal("fixture has valid pixels")
+	}
+	if err = os.WriteFile(path, broken, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := NewProcessor(1, t.TempDir()).Prepare(context.Background(), path, "cover.jpg", true); err == nil {
+		result.Cleanup()
+		t.Fatal("truncated JPEG accepted as a thumbnail")
+	}
+	if err = os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := NewProcessor(1, t.TempDir()).Prepare(context.Background(), path, "cover.jpg", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer result.Cleanup()
+	if result.Owned || result.Path != path {
+		t.Fatal("valid thumbnail was unnecessarily re-encoded")
+	}
+}

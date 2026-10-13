@@ -24,3 +24,21 @@ The race suite covers HTTP contracts, media conversion, streamed downloads, prot
 Before the final repository cleanup, native app and web tests extracted and downloaded the same 1080×1920 public video. Both produced **5,597,812 bytes** with SHA-256 `708f4144d1c517d0e9e81c42fa0cd39f9f1d8403b13913c3a804a057f9c3a9bf`. A separate native app feed test returned six playable videos. The final cleanup changed Go module imports and project files, not extraction behavior.
 
 The [Go/Python comparison](go-python-comparison.md) and [app optimization report](go-app-optimization.md) retain measured CPU, memory, latency, concurrency, failures, and limitations. Their binary hashes refer to the measured snapshots before the module rename. The reference implementations and old cross-runtime harnesses are archived outside this Go-only repository; see [baseline provenance](benchmark-baselines.md).
+
+## PR review regression checks
+
+All eight code findings from the initial PR review were reproduced before their fixes. The nine incoming comments included the review summary itself. Focused checks now cover:
+
+| Behavior | Regression check |
+| --- | --- |
+| App CDN fallback keeps one identity and checkpoint, preserving cookies and subsequent use | `TestDownloadFallbackRetainsPinnedIdentity` |
+| Adaptive video and audio start together; either failure cancels its sibling | `TestSeparateAudioMuxPreservesBothStreamsAndRejectsOversize`, `TestAdaptiveFailureCancelsSiblingAndCleansFiles` |
+| Both tracks share the byte cap before muxing, including chunked responses | `TestAdaptiveTracksShareByteBudgetBeforeMux` |
+| Failed attempts release their byte allowance before a fallback | `TestFailedDownloadReturnsByteBudgetBeforeFallback` |
+| A live metadata follower retries after its leader disconnects | `TestMetadataFollowerRetriesAfterLeaderCancellation` |
+| Relative redirects preserve HTTPS at an ingress and retain query parameters | `TestTrailingSlashRedirectPreservesPublicOrigin` |
+| Direct CDN transfers retain proxy-bound app signing and redirect cookies | `TestAppDataOnlyUsesDirectCDNWithPinnedPlayRequest`, `TestDirectMediaTransportKeepsAppSigningAndCDNRedirectCookies` |
+| Web retries retain the initial proxy, then use another configured proxy | `TestWebMediaRetryRotatesConfiguredProxies` |
+| Small JPEG thumbnails require valid pixel data | `TestSmallJPEGThumbnailValidatesPixelStream` |
+
+After these fixes, `make check` passed from a fresh Git-index export against disposable PostgreSQL 18, including race tests, vet, formatting, module consistency, and the release build. The production Docker build also passed. Container checks covered app mode with direct CDN configuration, readiness, relative redirects, unchanged OpenAPI bytes, and graceful shutdown. No live upstream requests or new performance measurements were run for these correctness fixes.

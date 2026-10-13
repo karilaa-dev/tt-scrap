@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/karilaa-dev/tt-scrap/internal/core"
+	"github.com/karilaa-dev/tt-scrap/internal/platform"
 	"github.com/karilaa-dev/tt-scrap/internal/tiktokapp"
 )
 
@@ -241,5 +243,102 @@ func TestMediaBatchCancellationStopsAllRequestsAndReleasesIdentity(t *testing.T)
 	}
 	if stats := p.Stats(); stopped.Load() != 3 || stats.Busy != 0 || stats.Queued != 0 || stats.Writes != before+1 || !stats.Ready {
 		t.Fatal("cancelled work leaked or invalidated the pool", stopped.Load(), stats)
+	}
+}
+
+func TestDownloadFallbackRetainsPinnedIdentity(t *testing.T) {
+	cfg, _ := testDatabase(t)
+	cfg.RetryDelay = time.Millisecond
+	cfg.TempDir = t.TempDir()
+	p := openTestPool(t, cfg, "http://proxy.example:8080")
+	l := mustAcquire(t, p, "")
+	id := l.entry.id
+	finishLease(t, l, nil)
+	var bad, good atomic.Int32
+	p.clientFactory = func(s *tiktokapp.Session, _ *http.Client) *tiktokapp.Client {
+		return tiktokapp.NewClient(s, fixtureDoer(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path == "/bad" {
+				bad.Add(1)
+				res := fixtureResponse(403, []byte("blocked"))
+				res.Header.Set("Set-Cookie", "fallback=saved; Path=/; Secure")
+				return res, nil
+			}
+			good.Add(1)
+			cookie, err := r.Cookie("fallback")
+			if err != nil || cookie.Value != "saved" {
+				t.Error("fallback lost identity cookies", err)
+			}
+			return fixtureResponse(200, []byte{255, 216, 255, 0, 1, 2}), nil
+		}))
+	}
+	d := platform.NewDownloader(cfg, p, nil)
+	defer d.Close()
+	before := p.Stats().Writes
+	asset := core.AssetContext{Platform: "tiktok", Kind: "image", Filename: "x.jpg", IdentityID: id, UpstreamURL: "https://cdn.example/bad", AlternateURLs: []string{"https://cdn.example/good"}}
+	file, err := d.Download(context.Background(), asset, 0)
+	if err != nil {
+		t.Fatal("backup URL was not usable", err)
+	}
+	file.Cleanup()
+	if bad.Load() != 1 || good.Load() != 1 || p.Stats().Writes != before+1 {
+		t.Fatal("fallback was not one operation", bad.Load(), good.Load(), p.Stats())
+	}
+	asset.UpstreamURL = "https://cdn.example/good"
+	asset.AlternateURLs = nil
+	file, err = d.Download(context.Background(), asset, 0)
+	if err != nil {
+		t.Fatal("successful fallback left the identity cooling down", err)
+	}
+	file.Cleanup()
+}
+
+func TestAppDataOnlyUsesDirectCDNWithPinnedPlayRequest(t *testing.T) {
+	var cdnCalls atomic.Int32
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cdnCalls.Add(1)
+		if r.Header.Get("X-Argus") != "" || r.Header.Get("User-Agent") == "" {
+			t.Error("incorrect CDN headers")
+		}
+		_, _ = w.Write([]byte{255, 216, 255, 0, 1, 2})
+	}))
+	defer cdn.Close()
+	cfg, _ := testDatabase(t)
+	cfg.ProxyDataOnly = true
+	cfg.TempDir = t.TempDir()
+	p := openTestPool(t, cfg, "http://proxy.example:8080")
+	l := mustAcquire(t, p, "")
+	id := l.entry.id
+	finishLease(t, l, nil)
+	fixture := newProtocolFixture(t, "", 0)
+	var plays atomic.Int32
+	p.clientFactory = func(s *tiktokapp.Session, _ *http.Client) *tiktokapp.Client {
+		return tiktokapp.NewClient(s, fixtureDoer(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Host == strings.TrimPrefix(cdn.URL, "http://") {
+				return nil, errors.New("CDN request used metadata proxy")
+			}
+			if r.URL.Path == "/aweme/v1/play/" {
+				plays.Add(1)
+				if r.Header.Get("X-Argus") == "" {
+					t.Error("play request lost signing")
+				}
+				return fixtureResponse(200, []byte{255, 216, 255, 0, 1, 2}), nil
+			}
+			return fixture.do(r)
+		}))
+	}
+	d := platform.NewDownloader(cfg, p, nil)
+	defer d.Close()
+	file, err := d.Download(context.Background(), core.AssetContext{Platform: "tiktok", Kind: "image", Filename: "x.jpg", IdentityID: id, UpstreamURL: "https://api19-va.tiktokv.com/aweme/v1/play/"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.Cleanup()
+	file, err = d.Download(context.Background(), core.AssetContext{Platform: "tiktok", Kind: "image", Filename: "x.jpg", IdentityID: id, UpstreamURL: cdn.URL}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.Cleanup()
+	if cdnCalls.Load() != 1 || plays.Load() != 1 || fixture.registrations != 1 || p.entries[id].proxy.key != "proxy.example:8080" {
+		t.Fatal("identity route changed", cdnCalls.Load(), plays.Load(), fixture)
 	}
 }

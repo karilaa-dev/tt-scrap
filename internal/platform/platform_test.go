@@ -104,7 +104,7 @@ func TestDownloadStreamsHashAndHonorsDeclaredAndChunkedLimits(t *testing.T) {
 	defer server.Close()
 	cfg := testConfig()
 	cfg.TempDir = t.TempDir()
-	d := NewDownloader(cfg, nil)
+	d := NewDownloader(cfg, nil, nil)
 	defer d.Close()
 	asset := core.AssetContext{Kind: "video", Filename: "123.mp4", UpstreamURL: server.URL + "/known"}
 	got, e := d.Download(context.Background(), asset, 0)
@@ -146,7 +146,7 @@ func TestDownloadRejectsHTMLAndFallbackPreservesCookies(t *testing.T) {
 		w.Write([]byte{255, 216, 255, 0, 1, 2})
 	}))
 	defer server.Close()
-	d := NewDownloader(testConfig(), nil)
+	d := NewDownloader(testConfig(), nil, nil)
 	defer d.Close()
 	got, e := d.Download(context.Background(), core.AssetContext{Kind: "image", Filename: "photo.png", UpstreamURL: server.URL + "/bad", AlternateURLs: []string{server.URL + "/good"}, Cookies: map[string]string{"session": "sticky"}}, 0)
 	if e != nil {
@@ -439,7 +439,7 @@ func TestIdentitySaveFailureRejectsDownloadedMediaAndProbe(t *testing.T) {
 	backend := &closeFailureBackend{fakeApp: fakeApp{server: "https://unused.example"}}
 	cfg := testConfig()
 	cfg.TempDir = t.TempDir()
-	downloader := NewDownloader(cfg, backend)
+	downloader := NewDownloader(cfg, backend, nil)
 	defer downloader.Close()
 	_, e := downloader.Download(context.Background(), core.AssetContext{Kind: "video", IdentityID: "sticky", Filename: "123.mp4", UpstreamURL: "https://unused.example/video"}, 0)
 	var api *core.Error
@@ -460,6 +460,11 @@ func TestIdentitySaveFailureRejectsDownloadedMediaAndProbe(t *testing.T) {
 
 type openFailureBackend struct{ fakeApp }
 
+func (f *openFailureBackend) WithMedia(ctx context.Context, id string, run func(core.OpenAppMedia) error) error {
+	return run(func(ctx context.Context, source string, headers http.Header) (*http.Response, error) {
+		return f.OpenMedia(ctx, id, source, headers)
+	})
+}
 func (f *openFailureBackend) OpenMedia(context.Context, string, string, http.Header) (*http.Response, error) {
 	f.mediaCalls.Add(1)
 	return nil, core.NewError("service_not_configured", "Identity owner lost", 503)
@@ -468,7 +473,7 @@ func TestOpenMediaOwnershipFailureIsPreservedWithoutRetries(t *testing.T) {
 	backend := &openFailureBackend{}
 	cfg := testConfig()
 	cfg.DownloadRetries = 5
-	downloader := NewDownloader(cfg, backend)
+	downloader := NewDownloader(cfg, backend, nil)
 	defer downloader.Close()
 	_, err := downloader.Download(context.Background(), core.AssetContext{Kind: "video", IdentityID: "sticky", UpstreamURL: "https://unused.example/video"}, 0)
 	var api *core.Error
@@ -515,7 +520,7 @@ func TestWebProxyDataOnlyDownloadsDirectly(t *testing.T) {
 	defer server.Close()
 	cfg := testConfig()
 	cfg.ProxyDataOnly = true
-	downloader := NewDownloader(cfg, nil)
+	downloader := NewDownloader(cfg, nil, nil)
 	defer downloader.Close()
 	file, err := downloader.Download(context.Background(), core.AssetContext{Platform: "tiktok", Kind: "image", Filename: "test.jpg", ProxyURL: "invalid-proxy", UpstreamURL: server.URL}, 0)
 	if err != nil {
@@ -537,7 +542,17 @@ func TestSeparateAudioMuxPreservesBothStreamsAndRejectsOversize(t *testing.T) {
 	}
 	video, _ := os.ReadFile(videoPath)
 	audio, _ := os.ReadFile(audioPath)
+	var trackRequests atomic.Int32
+	bothStarted := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if trackRequests.Add(1) == 2 {
+			close(bothStarted)
+		}
+		select {
+		case <-bothStarted:
+		case <-r.Context().Done():
+			return
+		}
 		if r.URL.Path == "/audio" {
 			w.Write(audio)
 		} else {
@@ -547,7 +562,8 @@ func TestSeparateAudioMuxPreservesBothStreamsAndRejectsOversize(t *testing.T) {
 	defer server.Close()
 	cfg := testConfig()
 	cfg.TempDir = dir
-	downloader := NewDownloader(cfg, nil)
+	cfg.DownloadTimeout = 2 * time.Second
+	downloader := NewDownloader(cfg, nil, nil)
 	defer downloader.Close()
 	asset := core.AssetContext{Platform: "tiktok", Kind: "video", Filename: "123.mp4", UpstreamURL: server.URL + "/video", Audio: &core.AuxiliaryAsset{UpstreamURL: server.URL + "/audio", ContentType: "audio/mp4"}}
 	file, err := downloader.Download(context.Background(), asset, 0)
@@ -605,5 +621,138 @@ func TestInstagramProviderAuthenticationFailureIsNetworkError(t *testing.T) {
 	var api *core.Error
 	if !errors.As(err, &api) || api.Code != "upstream_network_error" || api.Status != 502 {
 		t.Fatal(err)
+	}
+}
+
+func TestAdaptiveTracksShareByteBudgetBeforeMux(t *testing.T) {
+	for _, chunked := range []bool{false, true} {
+		t.Run(strconv.FormatBool(chunked), func(t *testing.T) {
+			video := testVideo(32, 24)
+			audio := append([]byte("ID3"), make([]byte, len(video)-3)...)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				data := video
+				if r.URL.Path == "/audio" {
+					data = audio
+				}
+				if chunked {
+					w.(http.Flusher).Flush()
+				} else {
+					w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				}
+				_, _ = w.Write(data)
+			}))
+			defer server.Close()
+			cfg := testConfig()
+			cfg.TempDir = t.TempDir()
+			d := NewDownloader(cfg, nil, nil)
+			defer d.Close()
+			asset := core.AssetContext{Kind: "video", Filename: "x.mp4", UpstreamURL: server.URL + "/video", Audio: &core.AuxiliaryAsset{UpstreamURL: server.URL + "/audio"}}
+			result, err := d.Download(context.Background(), asset, int64(len(video)+len(audio)-1))
+			result.Cleanup()
+			var api *core.Error
+			if !errors.As(err, &api) || api.Code != "asset_too_large" {
+				t.Fatal("track sum reached mux instead of byte limit", err)
+			}
+			files, err := os.ReadDir(cfg.TempDir)
+			if err != nil || len(files) != 0 {
+				t.Fatal("failed tracks leaked temporary files", files, err)
+			}
+		})
+	}
+}
+
+func TestWebMediaRetryRotatesConfiguredProxies(t *testing.T) {
+	var first, backup atomic.Int32
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { first.Add(1); w.WriteHeader(503) }))
+	defer bad.Close()
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backup.Add(1)
+		if r.URL.Host != "cdn.example" {
+			t.Error("proxy lost original URL", r.URL)
+		}
+		_, _ = w.Write([]byte{255, 216, 255, 0, 1, 2})
+	}))
+	defer good.Close()
+	cfg := testConfig()
+	cfg.DownloadRetries = 2
+	cfg.RetryDelay = time.Millisecond
+	d := NewDownloader(cfg, nil, []string{good.URL, bad.URL})
+	defer d.Close()
+	file, err := d.Download(context.Background(), core.AssetContext{Platform: "tiktok", Kind: "image", Filename: "x.jpg", UpstreamURL: "http://cdn.example/photo", ProxyURL: bad.URL}, 0)
+	if err != nil {
+		t.Fatal("healthy backup proxy was not attempted", err)
+	}
+	file.Cleanup()
+	if first.Load() != 1 || backup.Load() != 1 {
+		t.Fatal("initial proxy was not retained before rotation", first.Load(), backup.Load())
+	}
+}
+
+func TestAdaptiveFailureCancelsSiblingAndCleansFiles(t *testing.T) {
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/audio" {
+			close(started)
+			<-r.Context().Done()
+			close(stopped)
+			return
+		}
+		select {
+		case <-started:
+		case <-r.Context().Done():
+			return
+		}
+		w.WriteHeader(403)
+	}))
+	defer server.Close()
+	cfg := testConfig()
+	cfg.TempDir = t.TempDir()
+	d := NewDownloader(cfg, nil, nil)
+	defer d.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	file, err := d.Download(ctx, core.AssetContext{Kind: "video", UpstreamURL: server.URL + "/video", Audio: &core.AuxiliaryAsset{UpstreamURL: server.URL + "/audio"}}, 0)
+	file.Cleanup()
+	if err == nil || ctx.Err() != nil {
+		t.Fatal("failure did not cancel the sibling promptly", err, ctx.Err())
+	}
+	select {
+	case <-stopped:
+	case <-ctx.Done():
+		t.Fatal("audio request leaked")
+	}
+	files, err := os.ReadDir(cfg.TempDir)
+	if err != nil || len(files) != 0 {
+		t.Fatal("failed adaptive download leaked files", files, err)
+	}
+}
+
+func TestFailedDownloadReturnsByteBudgetBeforeFallback(t *testing.T) {
+	data := testVideo(32, 24)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/bad" {
+			_, _ = w.Write(bytes.Repeat([]byte("x"), len(data)/2))
+			return
+		}
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+	cfg := testConfig()
+	cfg.TempDir = t.TempDir()
+	cfg.RetryDelay = time.Millisecond
+	d := NewDownloader(cfg, nil, nil)
+	defer d.Close()
+	file, err := d.Download(context.Background(), core.AssetContext{Kind: "video", Filename: "x.mp4", UpstreamURL: server.URL + "/bad", AlternateURLs: []string{server.URL + "/good"}}, int64(len(data)))
+	if err != nil {
+		t.Fatal("failed attempt consumed fallback byte allowance", err)
+	}
+	if file.Size != int64(len(data)) {
+		t.Fatal(file.Size)
+	}
+	file.Cleanup()
+	files, err := os.ReadDir(cfg.TempDir)
+	if err != nil || len(files) != 0 {
+		t.Fatal("fallback leaked files", files, err)
 	}
 }

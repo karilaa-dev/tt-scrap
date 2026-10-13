@@ -148,7 +148,7 @@ func TestHTTPContract(t *testing.T) {
 		t.Fatal("lossless ID or refresh coercion failed")
 	}
 	response := request(handler, "POST", "/v1/tiktok/music/", `{}`, true)
-	if response.Code != 307 || response.Header().Get("Location") != "http://example.com/v1/tiktok/music" {
+	if response.Code != 307 || response.Header().Get("Location") != "/v1/tiktok/music" {
 		t.Fatalf("redirect: %d %v", response.Code, response.Header())
 	}
 	response = request(handler, "HEAD", "/openapi.json", "", false)
@@ -319,5 +319,18 @@ func TestRequestLogIncludesResponseTransfer(t *testing.T) {
 	NewHandler(dependencies).ServeHTTP(writer, r)
 	if writer.Code != 200 || event.Duration < writer.delay || event.Bytes != int64(len(downloader.data)) || event.Path != "/v1/assets/{token}" {
 		t.Fatalf("log omitted transfer: %#v", event)
+	}
+}
+
+func TestTrailingSlashRedirectPreservesPublicOrigin(t *testing.T) {
+	dependencies, _, _, _ := fixture(t)
+	handler := NewHandler(dependencies)
+	r := httptest.NewRequest("POST", "http://backend.internal/v1/tiktok/music/?q=a%2Fb", strings.NewReader(`{}`))
+	r.Header.Set("X-Forwarded-Proto", "https")
+	r.Header.Set("Authorization", "Bearer "+dependencies.Config.APIKey)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+	if w.Code != 307 || w.Header().Get("Location") != "/v1/tiktok/music?q=a%2Fb" {
+		t.Fatalf("redirect must retain the client's origin: %d %q", w.Code, w.Header().Get("Location"))
 	}
 }

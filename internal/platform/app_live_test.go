@@ -115,7 +115,7 @@ func TestLiveAppExtractionDownload(t *testing.T) {
 	assets := core.NewAssets(cfg.CacheTTL, cfg.CacheMaxEntries)
 	service := platform.NewTikTok(cfg, assets, pool, proxies)
 	defer service.Close()
-	downloader := platform.NewDownloader(cfg, pool)
+	downloader := platform.NewDownloader(cfg, pool, pool.ProxyAddresses())
 	defer downloader.Close()
 	started := time.Now()
 	post, e := service.ExtractURL(ctx, "https://www.tiktok.com/@wwe/video/7695962883523464478", true)

@@ -33,7 +33,7 @@ func TestLiveWebExtractionDownload(t *testing.T) {
 	assets := core.NewAssets(time.Minute, 100)
 	service := NewTikTok(cfg, assets, nil, []string{proxy})
 	defer service.Close()
-	download := NewDownloader(cfg, nil)
+	download := NewDownloader(cfg, nil, []string{proxy})
 	defer download.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()

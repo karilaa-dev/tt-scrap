@@ -69,6 +69,7 @@ type Pool struct {
 	queued, queueLimit            int
 	proxiesTable, identitiesTable string
 	reads, writes                 atomic.Uint64
+	mediaTransport                *http.Transport
 	clientFactory                 func(*tiktokapp.Session, *http.Client) *tiktokapp.Client
 	closeOnce                     sync.Once
 	closeErr                      error
@@ -103,6 +104,13 @@ func Open(ctx context.Context, cfg core.Config, addresses []string) (*Pool, erro
 		p.db.Close(context.Background())
 		stop()
 		return nil, err
+	}
+	if cfg.ProxyDataOnly {
+		p.mediaTransport, err = newTransport("", cfg.HTTPMaxConnections)
+		if err != nil {
+			_ = p.Close()
+			return nil, err
+		}
 	}
 	p.ready = true
 	go p.monitor()
@@ -293,6 +301,9 @@ func (p *Pool) Close() error {
 		p.wakeLocked()
 		p.mu.Unlock()
 		p.workers.Wait()
+		if p.mediaTransport != nil {
+			p.mediaTransport.CloseIdleConnections()
+		}
 		for _, proxy := range p.proxies {
 			proxy.transport.CloseIdleConnections()
 		}

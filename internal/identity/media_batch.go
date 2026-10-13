@@ -30,9 +30,12 @@ func (p *Pool) WithMedia(ctx context.Context, id string, run func(core.OpenAppMe
 		batch := &mediaBatch{ctx: batchCtx, cancel: cancel, client: client, bodies: make(map[*leasedBody]struct{})}
 		func() { defer batch.close(); err = run(batch.open) }()
 		client.SyncCookies()
-		operationErr = batch.err
-		if operationErr == nil {
-			operationErr = err
+		operationErr = err
+		var failure *tiktokapp.UpstreamError
+		if err != nil || batch.completed == 0 || (errors.As(batch.err, &failure) && failure.Recovery != tiktokapp.RecoveryNone) {
+			if batch.err != nil {
+				operationErr = batch.err
+			}
 		}
 		if attempt != 0 || !l.recover(operationErr) {
 			return err
@@ -42,14 +45,15 @@ func (p *Pool) WithMedia(ctx context.Context, id string, run func(core.OpenAppMe
 }
 
 type mediaBatch struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	client   *tiktokapp.Client
-	mu       sync.Mutex
-	requests sync.WaitGroup
-	bodies   map[*leasedBody]struct{}
-	closed   bool
-	err      error
+	ctx       context.Context
+	cancel    context.CancelFunc
+	client    *tiktokapp.Client
+	mu        sync.Mutex
+	requests  sync.WaitGroup
+	bodies    map[*leasedBody]struct{}
+	closed    bool
+	err       error
+	completed int
 }
 
 func (b *mediaBatch) recordLocked(err error) {
@@ -84,9 +88,13 @@ func (b *mediaBatch) open(ctx context.Context, address string, headers http.Head
 	}
 	body := &leasedBody{ReadCloser: response.Body}
 	body.finish = func(err error) error {
+		completed := err == nil && requestCtx.Err() == nil
 		unlink()
 		cancel()
 		b.mu.Lock()
+		if completed {
+			b.completed++
+		}
 		delete(b.bodies, body)
 		b.recordLocked(err)
 		b.mu.Unlock()

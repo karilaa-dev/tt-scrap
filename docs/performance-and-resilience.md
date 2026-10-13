@@ -6,6 +6,10 @@ An identity stays on one proxy and is exclusively leased while its request or me
 
 Related app quality probes share one exclusive lease and run with up to three workers. All bodies finish before the group checkpoints once; cancellation closes outstanding bodies, and a failed checkpoint rejects the extraction. Cached clients preserve cookie jars between operations. Cookie snapshots rebuild only after a change or expiry. See the [app-only before/after comparison](go-app-optimization.md) for measured gains and remaining network tails.
 
+App downloads keep one identity lease across fallback URLs and adaptive tracks, then save one completion checkpoint. Adaptive video and audio download concurrently, cancel together on failure, and share one cumulative byte budget before muxing. Failed attempts release their budget after temporary-file cleanup. With `PROXY_DATA_ONLY=true`, CDN bytes use a direct transport while signed app endpoints keep their identity proxy. Web media retries rotate through the configured proxies after the initial sticky choice fails.
+
+A canceled metadata leader releases its flight so still-active followers can retry. Trailing-slash redirects use relative locations to preserve the public HTTPS origin behind an ingress. Thumbnail pass-through validates the complete JPEG stream.
+
 Downloads use reusable copy buffers and temporary files, with actual size and checksum verification. Multipart Telegram uploads stream those files and provide an exact Content-Length. Native image conversion has a separate concurrency limit. Telegram album preparation completes before uploads start; uncertain upload failures are not automatically retried.
 
 The default extraction/download limits are 32/64, with 128 connections per host and 1,024 queued requests. Actual capacity depends on proxy count, upstream latency, media sizes, disk throughput and memory for decoded images. `MAX_ASSET_BYTES`, image concurrency and `GOMEMLIMIT` allow deployment-specific bounds.

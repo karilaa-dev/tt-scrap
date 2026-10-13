@@ -95,6 +95,7 @@ type Client struct {
 	APIBase          string
 	SDKBase          string
 	transport        Doer
+	mediaTransport   Doer
 	mu               sync.Mutex
 	registerMu       sync.Mutex
 	bootstrapMu      sync.Mutex
@@ -105,13 +106,21 @@ func NewClient(session *Session, doer Doer) *Client {
 	if doer == nil {
 		doer = &http.Client{Timeout: 30 * time.Second}
 	}
+	doer = withoutRedirects(doer)
+	return &Client{Session: session, transport: doer, RegistrationBase: "https://log-va.tiktokv.com", APIBase: "https://api19-va.tiktokv.com", SDKBase: "https://mssdk-va.tiktokv.com", jar: newPersistentJar(session.Cookies)}
+}
+
+// SetMediaTransport configures direct CDN traffic before the client is used.
+// Signed app endpoints continue to use the identity's primary transport.
+func (c *Client) SetMediaTransport(doer Doer) { c.mediaTransport = withoutRedirects(doer) }
+func withoutRedirects(doer Doer) Doer {
 	if h, ok := doer.(*http.Client); ok {
 		copy := *h
 		copy.Jar = nil
 		copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 		doer = &copy
 	}
-	return &Client{Session: session, transport: doer, RegistrationBase: "https://log-va.tiktokv.com", APIBase: "https://api19-va.tiktokv.com", SDKBase: "https://mssdk-va.tiktokv.com", jar: newPersistentJar(session.Cookies)}
+	return doer
 }
 func (c *Client) SyncCookies() {
 	c.mu.Lock()
@@ -119,6 +128,9 @@ func (c *Client) SyncCookies() {
 	c.Session.Cookies = c.jar.serialize()
 }
 func (c *Client) request(ctx context.Context, original *url.URL, method string, body []byte, headers http.Header) (*http.Response, error) {
+	return c.requestWithMedia(ctx, original, method, body, headers, false)
+}
+func (c *Client) requestWithMedia(ctx context.Context, original *url.URL, method string, body []byte, headers http.Header, media bool) (*http.Response, error) {
 	c.mu.Lock()
 	u := routeURL(original, c.Session.RoutingRules)
 	c.mu.Unlock()
@@ -171,7 +183,11 @@ func (c *Client) request(ctx context.Context, original *url.URL, method string, 
 		for _, cookie := range cookies {
 			req.AddCookie(cookie)
 		}
-		response, e := c.transport.Do(req)
+		doer := c.transport
+		if media && !appHost && c.mediaTransport != nil {
+			doer = c.mediaTransport
+		}
+		response, e := doer.Do(req)
 		if e != nil {
 			return nil, e
 		}
@@ -561,7 +577,7 @@ func (c *Client) MediaRequest(ctx context.Context, address string, headers http.
 		headers = make(http.Header)
 	}
 	headers.Set("Accept-Encoding", "identity")
-	response, err := c.request(ctx, u, "GET", nil, headers)
+	response, err := c.requestWithMedia(ctx, u, "GET", nil, headers, true)
 	if err != nil {
 		return nil, err
 	}

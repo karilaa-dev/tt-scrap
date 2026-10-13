@@ -105,7 +105,7 @@ func run(logger *slog.Logger) error {
 	defer tiktok.Close()
 	instagram := platform.NewInstagram(config, assets)
 	defer instagram.Close()
-	downloader := platform.NewDownloader(config, backend)
+	downloader := platform.NewDownloader(config, backend, proxies)
 	defer downloader.Close()
 	handler := httpapi.NewHandler(httpapi.Dependencies{Config: config, Assets: assets, TikTok: tiktok, Instagram: instagram, Downloader: downloader, IsReady: ready, OpenAPI: ttscrap.OpenAPI, OnRequest: func(event httpapi.RequestEvent) {
 		logLevel := slog.LevelInfo

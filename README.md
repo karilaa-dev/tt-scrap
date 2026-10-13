@@ -19,7 +19,7 @@ make build
 
 Configure `TT_SCRAP_API_KEY` with at least 16 characters. Set `TIKTOK_METHOD=app` for the Android app method or `TIKTOK_METHOD=web` for the web method. App mode requires `DB_URL`; web mode does not. Set `RAPIDAPI_KEY` for Instagram and readiness. Existing environment variables take precedence over `.env`.
 
-App mode reads saved proxies from PostgreSQL. `PROXY_FILE` optionally bootstraps addresses, one HTTP, HTTPS, or SOCKS5 address per line. `PROXY_INCLUDE_HOST=true` explicitly adds a direct-connection slot. Web mode accepts a Netscape-format cookie file through `YTDLP_COOKIES`, preserving the old environment name.
+App mode reads saved proxies from PostgreSQL. `PROXY_FILE` optionally bootstraps addresses, one HTTP, HTTPS, or SOCKS5 address per line. `PROXY_INCLUDE_HOST=true` explicitly adds a direct-connection slot. `PROXY_DATA_ONLY=true` sends CDN transfers directly while app registration, signing, and play API requests keep the assigned proxy. Web media retries try another configured proxy after a failure. Web mode accepts a Netscape-format cookie file through `YTDLP_COOKIES`, preserving the old environment name.
 
 ## API
 

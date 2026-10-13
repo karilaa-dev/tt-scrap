@@ -178,18 +178,7 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) (response, error
 	if method == "" {
 		trimmed := strings.TrimSuffix(path, "/")
 		if trimmed != path && routeMethod(trimmed) != "" {
-			target := *r.URL
-			target.Path = trimmed
-			target.RawPath = ""
-			if target.Host == "" {
-				target.Host = r.Host
-			}
-			if target.Scheme == "" {
-				target.Scheme = "http"
-				if r.TLS != nil {
-					target.Scheme = "https"
-				}
-			}
+			target := url.URL{Path: trimmed, RawQuery: r.URL.RawQuery}
 			return response{status: 307, headers: http.Header{"Location": []string{target.String()}}}, nil
 		}
 		return jsonResponse(404, fields{"detail": "Not Found"})
