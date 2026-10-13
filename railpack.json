@@ -1,10 +1,30 @@
 {
   "$schema": "https://schema.railpack.com",
-  "provider": "python",
+  "provider": "golang",
+  "packages": {
+    "go": "1.27.2"
+  },
+  "buildAptPackages": [
+    "gcc",
+    "libc6-dev",
+    "pkg-config",
+    "libheif-dev"
+  ],
+  "steps": {
+    "build": {
+      "commands": [
+        "CGO_ENABLED=1 go build -trimpath -ldflags='-s -w' -o out ./cmd/tt-scrap"
+      ]
+    }
+  },
   "deploy": {
-    "startCommand": "tt-scrap",
+    "startCommand": "./out",
     "aptPackages": [
-      "ffmpeg"
+      "ca-certificates",
+      "ffmpeg",
+      "libheif1",
+      "libheif-plugin-libde265",
+      "libheif-plugin-dav1d"
     ]
   }
 }

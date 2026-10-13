@@ -1,37 +1,26 @@
-# Secrets and local configuration
+# Local credentials and configuration
 .env
 .env.*
 !.env.example
-cookies.*
-!cookies.example.*
-proxies.*
-!proxies.example.*
+/cookies.*
+!/cookies.example.*
+/proxies.*
+!/proxies.example.*
 
-# Downloaded and temporary media
+# Build, profiling, and downloaded media
+/bin/
+/out
+/tt-scrap
+/bench-api
+*.test
+*.pprof
+*.trace
+coverage.out
 /downloads/
 /tmp/
 *.part
-*.ytdl
 
-# Python environments and generated packages
-.venv/
-venv/
-build/
-dist/
-*.egg-info/
-__pycache__/
-*.py[cod]
-
-# Test, type-checker, linter, and coverage output
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-.coverage.*
-coverage.xml
-htmlcov/
-
-# Local logs and editor/OS metadata
+# Logs and editors
 *.log
 *.log.txt
 .DS_Store

@@ -4,12 +4,7 @@ services:
     image: ghcr.io/karilaa-dev/tt-scrap:latest
     env_file:
       - .env
-    environment:
-      YTDLP_COOKIES: /run/secrets/cookies.txt
-      PROXY_FILE: /run/secrets/proxies.txt
-    volumes:
-      - ./cookies.txt:/run/secrets/cookies.txt:ro
-      - ./proxies.txt:/run/secrets/proxies.txt:ro
     ports:
-      - "8000:8000"
+      - "${PORT:-8000}:${PORT:-8000}"
+    stop_grace_period: 40s
     restart: unless-stopped

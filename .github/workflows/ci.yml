@@ -1,27 +1,40 @@
 name: CI
-
 on:
   pull_request:
   push:
     branches: [main]
-
 permissions:
   contents: read
-
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: scrap_test
+          POSTGRES_PASSWORD: scrap_test
+          POSTGRES_DB: scrap_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U scrap_test -d scrap_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: actions/setup-go@v6
         with:
-          enable-cache: true
-      - run: uv sync --locked --all-groups
-      - run: uv run ruff format --check src tests scripts
-      - run: uv run ruff check src tests scripts
-      - run: uv run mypy src/tt_scrap
-      - run: uv run pytest -m "not live" --cov=tt_scrap --cov-report=term-missing
-
+          go-version-file: go.mod
+          cache: true
+      - run: sudo apt-get update && sudo apt-get install -y libheif-dev libheif-plugin-libde265 libheif-plugin-dav1d pkg-config ffmpeg
+      - run: go mod download
+      - run: make check
+        env:
+          TIKTOK_APP_TEST_DB_URL: postgresql://scrap_test:scrap_test@127.0.0.1:5432/scrap_test
   docker:
     runs-on: ubuntu-latest
     steps:
