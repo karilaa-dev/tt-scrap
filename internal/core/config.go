@@ -14,7 +14,7 @@ import (
 )
 
 type Config struct {
-	APIKey, Host, AppVersion, DBURL, DBSchema                                         string
+	APIKey, Host, DBURL, DBSchema                                                     string
 	Port                                                                              int
 	ProxyFile                                                                         string
 	ProxyIncludeHost, ProxyDataOnly                                                   bool
@@ -41,7 +41,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		Host: "0.0.0.0", Port: 8000, AppVersion: "1.3.5", DBSchema: "public",
+		Host: "0.0.0.0", Port: 8000, DBSchema: "public",
 		CacheTTL: 600 * time.Second, MetadataTTL: 60 * time.Second, ResolutionTTL: 600 * time.Second, CacheMaxEntries: 10000,
 		ExtractionConcurrency: 32, DownloadConcurrency: 64, HTTPMaxConnections: 128, MaxQueuedRequests: 1024,
 		MaxVideoDuration: 0, UpstreamTimeout: 180 * time.Second, ResolveTimeout: 12 * time.Second, DownloadTimeout: 60 * time.Second,
@@ -111,7 +111,7 @@ func ParseConfig(env map[string]string) (Config, error) {
 			}
 		}
 	}
-	for key, dst := range map[string]*string{"TT_SCRAP_API_KEY": &c.APIKey, "HOST": &c.Host, "APP_VERSION": &c.AppVersion, "DB_URL": &c.DBURL, "DB_SCHEMA": &c.DBSchema, "PROXY_FILE": &c.ProxyFile, "TIKTOK_SESSION_ID": &c.TikTokSessionID, "TEMP_DIR": &c.TempDir, "RAPIDAPI_KEY": &c.RapidAPIKey, "RAPIDAPI_HOST": &c.RapidAPIHost, "RAPIDAPI_BASE_URL": &c.RapidAPIBaseURL, "TELEGRAM_BOT_TOKEN": &c.TelegramBotToken, "TELEGRAM_API_BASE_URL": &c.TelegramAPIBaseURL, "LOG_LEVEL": &c.LogLevel} {
+	for key, dst := range map[string]*string{"TT_SCRAP_API_KEY": &c.APIKey, "HOST": &c.Host, "DB_URL": &c.DBURL, "DB_SCHEMA": &c.DBSchema, "PROXY_FILE": &c.ProxyFile, "TIKTOK_SESSION_ID": &c.TikTokSessionID, "TEMP_DIR": &c.TempDir, "RAPIDAPI_KEY": &c.RapidAPIKey, "RAPIDAPI_HOST": &c.RapidAPIHost, "RAPIDAPI_BASE_URL": &c.RapidAPIBaseURL, "TELEGRAM_BOT_TOKEN": &c.TelegramBotToken, "TELEGRAM_API_BASE_URL": &c.TelegramAPIBaseURL, "LOG_LEVEL": &c.LogLevel} {
 		stringValue(key, dst)
 	}
 	number("PORT", &c.Port, 1, 65535)

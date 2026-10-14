@@ -354,6 +354,7 @@ func dynamicProof(version int, nonce uint32, query string, bodyDigest []byte) ([
 				return nil, e
 			}
 			encrypted := padded(in, 16)
+			//lint:ignore SA1019 signing variant 6 is defined by TikTok's SDK as AES-OFB.
 			cipher.NewOFB(block, key[16:]).XORKeyStream(encrypted, encrypted)
 			words[i] = binary.LittleEndian.Uint32(encrypted[len(encrypted)-4:])
 		}

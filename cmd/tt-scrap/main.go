@@ -29,9 +29,8 @@ func main() {
 		}
 		return
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	if err := run(logger); err != nil {
-		logger.Error("service stopped", "error", err)
+	if err := run(); err != nil {
+		slog.New(slog.NewJSONHandler(os.Stdout, nil)).Error("service stopped", "error", err)
 		os.Exit(1)
 	}
 }
@@ -51,7 +50,7 @@ func healthcheck() error {
 		return err
 	}
 	defer response.Body.Close()
-	if response.StatusCode != 200 {
+	if response.StatusCode != http.StatusOK {
 		return errors.New("not ready")
 	}
 	return nil
@@ -72,12 +71,12 @@ func logLevel(name string) slog.Level {
 	return level
 }
 
-func run(logger *slog.Logger) error {
+func run() error {
 	config, err := core.LoadConfig()
 	if err != nil {
 		return err
 	}
-	logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel(config.LogLevel)}))
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel(config.LogLevel)}))
 	if config.TempDir != "" {
 		if err := os.MkdirAll(config.TempDir, 0700); err != nil {
 			return errors.New("cannot create TEMP_DIR")
