@@ -90,6 +90,7 @@ type AssetContext struct {
 	Referer         string
 	ProxyURL        string
 	Cookies         map[string]string
+	CookieJar       http.CookieJar
 	Headers         http.Header
 	IdentityID      string
 	ExpectedWidth   int

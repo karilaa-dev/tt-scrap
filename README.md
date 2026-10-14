@@ -19,7 +19,7 @@ make build
 
 Configure `TT_SCRAP_API_KEY` with at least 16 characters. Set `TIKTOK_METHOD=app` for the Android app method or `TIKTOK_METHOD=web` for the web method. App mode requires `DB_URL`; web mode does not. Set `RAPIDAPI_KEY` for Instagram and readiness. Existing environment variables take precedence over `.env`.
 
-App mode reads saved proxies from PostgreSQL. `PROXY_FILE` optionally bootstraps addresses, one HTTP, HTTPS, or SOCKS5 address per line. `PROXY_INCLUDE_HOST=true` explicitly adds a direct-connection slot. `PROXY_DATA_ONLY=true` sends CDN transfers directly while app registration, signing, and play API requests keep the assigned proxy. Web media retries try another configured proxy after a failure. Web mode accepts a Netscape-format cookie file through `YTDLP_COOKIES`, preserving the old environment name.
+App mode reads saved proxies from PostgreSQL. `PROXY_FILE` optionally bootstraps addresses, one HTTP, HTTPS, or SOCKS5 address per line. `PROXY_INCLUDE_HOST=true` explicitly adds a direct-connection slot. `PROXY_DATA_ONLY=true` sends CDN transfers directly while app registration, signing, and play API requests keep the assigned proxy. Web media retries try another configured proxy after a failure. Both backends accept an optional account session through `TIKTOK_SESSION_ID`.
 
 ## API
 
@@ -40,7 +40,11 @@ Downloads preserve `Content-Length`, MIME type, SHA-256, ETag, and attachment he
 
 ## Identity lifecycle
 
-Video information retained by tt-bot stays in its database; tt-scrap caches API responses and temporary asset references in RAM. Only `scrap_proxies` and `scrap_identities` are managed by tt-scrap in PostgreSQL. App mode loads them once into RAM. Selection, balancing, cooldowns, and identity information reads then happen in memory; operation results are written to PostgreSQL after the operation finishes.
+Video information retained by tt-bot stays in its database; tt-scrap caches API responses and temporary asset references in RAM. tt-scrap manages `scrap_proxies` and `scrap_identities` in PostgreSQL. App mode loads them once into RAM. Selection, balancing, cooldowns, and identity information reads then happen in memory; operation results are written to PostgreSQL after the operation finishes.
+
+TikTok requests start anonymously. For restricted videos, set `TIKTOK_SESSION_ID` to the value of your TikTok `sessionid` cookie, without the `sessionid=` prefix. The session comes only from the environment (including `.env`) and stays in memory; it is never saved in PostgreSQL. An age, login, private-content, or regional restriction triggers one retry with the account. The account must have access to the post. Rate limits, bot challenges, network failures, and deleted posts do not trigger account use. Account cookies stay separate from device sessions, so later public requests remain anonymous.
+
+Restart after changing `TIKTOK_SESSION_ID`. Leaving it unset or empty disables account fallback. Cookie files and `YTDLP_COOKIES` are no longer used. Web mode uses the same environment setting and does not require PostgreSQL.
 
 Each proxy address has ten identity slots. Before opening the API listener, startup registers missing slots and refreshes expired signing material. One worker per proxy runs in parallel with the other proxies; each address waits at least ten seconds after an attempt completes before starting the next one. Fresh saved identities are reused. A slot retains its proxy permanently and renews signing material on use after three hours. Explicit signing failures trigger renewal; invalid device registrations trigger recreation. Network errors and rate limits apply cooldowns rather than discarding valid identities. Preparation waits for identity and proxy cooldowns before retrying. Each attempt bounds cooldown waiting, lease acquisition, and registration/signing by `TIKTOK_APP_TIMEOUT_SECONDS`; shutdown cancels these waits.
 
@@ -84,7 +88,7 @@ docker compose up --build -d
 
 The container runs as an unprivileged user and includes the Go binary, FFmpeg, and native HEIF codecs. `tt-scrap healthcheck` probes readiness. Shutdown drains requests for up to 30 seconds before cancelling remaining work.
 
-`DB_URL` must be reachable from the container. A host-only `127.0.0.1` address refers to the container itself: join the database's Docker network and use its service hostname, or configure a host gateway. The base Compose file uses saved database proxies without a file mount. To import `proxies.txt`, use `docker compose -f docker-compose.yml -f compose.proxies.yml up --build -d`. For a new app database, provide that file or explicitly set `PROXY_INCLUDE_HOST=true`. Leave `PROXY_FILE` unset when using only saved database proxies. For web cookies, mount the file and point `YTDLP_COOKIES` to its container path.
+`DB_URL` must be reachable from the container. A host-only `127.0.0.1` address refers to the container itself: join the database's Docker network and use its service hostname, or configure a host gateway. The base Compose file uses saved database proxies without a file mount. To import `proxies.txt`, use `docker compose -f docker-compose.yml -f compose.proxies.yml up --build -d`. For a new app database, provide that file or explicitly set `PROXY_INCLUDE_HOST=true`. Leave `PROXY_FILE` unset when using only saved database proxies. For account fallback, set `TIKTOK_SESSION_ID` in `.env`; Compose passes it to the service.
 
 `railpack.json` defines the CGO server build and native media packages. Railpack detects Go and its version from `go.mod` and supplies the default `./out` start command. The package settings follow the [Railpack Go](https://railpack.com/languages/golang/) and [configuration](https://railpack.com/config/file/) documentation. Docker provides the reproducible deployment path for the native codec dependencies.
 

@@ -32,7 +32,7 @@ func publicError(err error) error {
 		switch code {
 		case "content_deleted":
 			status = 404
-		case "content_private":
+		case "content_private", "content_restricted":
 			status = 403
 		case "region_blocked":
 			status = 451
@@ -63,9 +63,17 @@ func (p *Pool) Detail(ctx context.Context, id string) (result core.AppDetail, er
 		}
 		err = publicError(err)
 	}()
+	account := tiktokapp.Account{}
+	var restriction error
 	for attempt := 0; attempt < 2; attempt++ {
 		client := l.client()
-		result.Response, err = client.Detail(l.ctx, id)
+		result.Response, err = client.DetailWithAccount(l.ctx, id, account)
+		if tiktokapp.IsContentRestricted(err) && !account.Valid() && p.account.Valid() {
+			restriction = err
+			account = p.account
+			result.Response, err = client.DetailWithAccount(l.ctx, id, account)
+		}
+		err = accountFallbackError(restriction, err)
 		client.SyncCookies()
 		if err == nil {
 			result.IdentityID = l.entry.id
@@ -110,7 +118,7 @@ func (p *Pool) OpenMedia(ctx context.Context, identityID, address string, header
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		client := l.client()
-		response, err := client.MediaRequest(l.ctx, address, headers)
+		response, err := p.mediaRequest(l.ctx, client, address, headers)
 		client.SyncCookies()
 		if err == nil && response.StatusCode >= 400 {
 			response.Body.Close()

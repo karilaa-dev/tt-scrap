@@ -27,7 +27,9 @@ func (p *Pool) WithMedia(ctx context.Context, id string, run func(core.OpenAppMe
 	for attempt := 0; attempt < 2; attempt++ {
 		client := l.client()
 		batchCtx, cancel := context.WithCancel(l.ctx)
-		batch := &mediaBatch{ctx: batchCtx, cancel: cancel, client: client, bodies: make(map[*leasedBody]struct{})}
+		batch := &mediaBatch{ctx: batchCtx, cancel: cancel, openMedia: func(ctx context.Context, address string, headers http.Header) (*http.Response, error) {
+			return p.mediaRequest(ctx, client, address, headers)
+		}, bodies: make(map[*leasedBody]struct{})}
 		func() { defer batch.close(); err = run(batch.open) }()
 		client.SyncCookies()
 		operationErr = err
@@ -47,7 +49,7 @@ func (p *Pool) WithMedia(ctx context.Context, id string, run func(core.OpenAppMe
 type mediaBatch struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
-	client    *tiktokapp.Client
+	openMedia core.OpenAppMedia
 	mu        sync.Mutex
 	requests  sync.WaitGroup
 	bodies    map[*leasedBody]struct{}
@@ -77,7 +79,7 @@ func (b *mediaBatch) open(ctx context.Context, address string, headers http.Head
 	defer b.requests.Done()
 	requestCtx, cancel := context.WithCancel(ctx)
 	unlink := context.AfterFunc(b.ctx, cancel)
-	response, err := b.client.MediaRequest(requestCtx, address, headers)
+	response, err := b.openMedia(requestCtx, address, headers)
 	if err != nil {
 		unlink()
 		cancel()

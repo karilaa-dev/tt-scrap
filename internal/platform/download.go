@@ -269,7 +269,7 @@ func (d *Downloader) open(ctx context.Context, asset core.AssetContext, source s
 	if e != nil {
 		return nil, e
 	}
-	client := &http.Client{Transport: transport}
+	client := &http.Client{Transport: transport, Jar: asset.CookieJar}
 	req, e := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
 	if e != nil {
 		return nil, core.NewError("upstream_network_error", "Media URL is invalid", 502)

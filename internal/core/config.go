@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"math"
+	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -17,7 +18,7 @@ type Config struct {
 	Port                                                                              int
 	ProxyFile                                                                         string
 	ProxyIncludeHost, ProxyDataOnly                                                   bool
-	CookiesFile, TempDir                                                              string
+	TikTokSessionID, TempDir                                                          string
 	CacheTTL, MetadataTTL, ResolutionTTL                                              time.Duration
 	CacheMaxEntries                                                                   int
 	ExtractionConcurrency, DownloadConcurrency, HTTPMaxConnections, MaxQueuedRequests int
@@ -110,7 +111,7 @@ func ParseConfig(env map[string]string) (Config, error) {
 			}
 		}
 	}
-	for key, dst := range map[string]*string{"TT_SCRAP_API_KEY": &c.APIKey, "HOST": &c.Host, "APP_VERSION": &c.AppVersion, "DB_URL": &c.DBURL, "DB_SCHEMA": &c.DBSchema, "TIKTOK_METHOD": &c.TikTokMethod, "PROXY_FILE": &c.ProxyFile, "YTDLP_COOKIES": &c.CookiesFile, "TEMP_DIR": &c.TempDir, "RAPIDAPI_KEY": &c.RapidAPIKey, "RAPIDAPI_HOST": &c.RapidAPIHost, "RAPIDAPI_BASE_URL": &c.RapidAPIBaseURL, "TELEGRAM_BOT_TOKEN": &c.TelegramBotToken, "TELEGRAM_API_BASE_URL": &c.TelegramAPIBaseURL, "LOG_LEVEL": &c.LogLevel} {
+	for key, dst := range map[string]*string{"TT_SCRAP_API_KEY": &c.APIKey, "HOST": &c.Host, "APP_VERSION": &c.AppVersion, "DB_URL": &c.DBURL, "DB_SCHEMA": &c.DBSchema, "TIKTOK_METHOD": &c.TikTokMethod, "PROXY_FILE": &c.ProxyFile, "TIKTOK_SESSION_ID": &c.TikTokSessionID, "TEMP_DIR": &c.TempDir, "RAPIDAPI_KEY": &c.RapidAPIKey, "RAPIDAPI_HOST": &c.RapidAPIHost, "RAPIDAPI_BASE_URL": &c.RapidAPIBaseURL, "TELEGRAM_BOT_TOKEN": &c.TelegramBotToken, "TELEGRAM_API_BASE_URL": &c.TelegramAPIBaseURL, "LOG_LEVEL": &c.LogLevel} {
 		stringValue(key, dst)
 	}
 	number("PORT", &c.Port, 1, 65535)
@@ -165,6 +166,9 @@ func ParseConfig(env map[string]string) (Config, error) {
 	}
 	if c.TikTokMethod != "app" && c.TikTokMethod != "web" {
 		return c, ConfigError("TIKTOK_METHOD")
+	}
+	if (&http.Cookie{Name: "sessionid", Value: c.TikTokSessionID}).Valid() != nil {
+		return c, ConfigError("TIKTOK_SESSION_ID")
 	}
 	if c.TikTokMethod == "app" && c.DBURL == "" {
 		return c, ConfigError("DB_URL")

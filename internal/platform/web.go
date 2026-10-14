@@ -15,11 +15,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/karilaa-dev/tt-scrap/internal/core"
+	"github.com/karilaa-dev/tt-scrap/internal/tiktokapp"
 )
 
 var postIDPattern = regexp.MustCompile(`/(?:video|photo)/(\d+)`)
 var scriptPattern = regexp.MustCompile(`(?is)<script\b[^>]*\bid\s*=\s*["'](__UNIVERSAL_DATA_FOR_REHYDRATION__|SIGI_STATE|sigi-persisted-data)["'][^>]*>`)
 var challengeElementPattern = regexp.MustCompile(`(?is)<[^/!][^>]*\bid\s*=\s*["'](cs|wci|rci|rs)["'][^>]*>`)
+var webBotChallengePattern = regexp.MustCompile(`(?i)\b(?:captcha|challenge)\b`)
 var classPattern = regexp.MustCompile(`(?is)\bclass\s*=\s*["']([^"']*)["']`)
 
 func validTikTokURL(raw string) bool {
@@ -53,6 +57,10 @@ func ParseWebDetail(body []byte, id string) (object, int, error) {
 		if kind == "__UNIVERSAL_DATA_FOR_REHYDRATION__" {
 			scope := obj(data["__DEFAULT_SCOPE__"])
 			detail := obj(scope["webapp.video-detail"])
+			failure := tiktokapp.ClassifyFailure(http.StatusOK, integer(detail["statusCode"]), str(detail["statusMsg"]), false, 0)
+			if failure.Code == "content_restricted" {
+				return nil, integer(detail["statusCode"]), core.NewError(failure.Code, failure.Error(), 403)
+			}
 			item := obj(obj(detail["itemInfo"])["itemStruct"])
 			if len(item) > 0 {
 				return item, integer(detail["statusCode"]), nil
