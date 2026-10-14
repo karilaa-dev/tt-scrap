@@ -53,12 +53,16 @@ func TestAppShortLinkValidatesRedirectBeforeAcceptingID(t *testing.T) {
 
 func TestTTSiteShareLinkResolvesThroughWWWHost(t *testing.T) {
 	canonical := "https://www.tiktok.com/@user192675581/photo/7685286340551855380?_r=1&_t=ZS-9AWEUykgZfB"
-	for _, raw := range []string{"https://www.tt.site/t/ZSboJ1v8D/", "https://tt.site/t/ZSboJ1v8D/"} {
+	for raw, host := range map[string]string{
+		"https://www.tt.site/t/ZSboJ1v8D/":  "www.tt.site",
+		"https://tt.site/t/ZSboJ1v8D/":      "www.tt.site",
+		"https://tt.site:8443/t/ZSboJ1v8D/": "www.tt.site:8443",
+	} {
 		t.Run(raw, func(t *testing.T) {
 			var calls atomic.Int32
 			service := resolutionFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
-				if r.Host != "www.tt.site" || r.URL.Path != "/t/ZSboJ1v8D/" {
+				if r.Host != host || r.URL.Path != "/t/ZSboJ1v8D/" {
 					t.Errorf("requested %s%s", r.Host, r.URL.Path)
 				}
 				http.Redirect(w, r, canonical, http.StatusMovedPermanently)

@@ -2,6 +2,8 @@ package tiktokapp
 
 import (
 	"net/url"
+	"strconv"
+	"sync"
 	"testing"
 )
 
@@ -48,6 +50,35 @@ func TestRouteURLAppliesMatchingRulesInOrder(t *testing.T) {
 				t.Fatalf("original URL changed to %s", original)
 			}
 		})
+	}
+}
+
+func TestRoutePatternCacheStaysBoundedUnderConcurrentMisses(t *testing.T) {
+	reset := func() {
+		routePatternInserts.Lock()
+		defer routePatternInserts.Unlock()
+		routePatterns.Clear()
+		routePatternCount = 0
+	}
+	reset()
+	t.Cleanup(reset)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range maxRoutePatterns + 256 {
+		wg.Go(func() {
+			<-start
+			path := "/p" + strconv.Itoa(i) + "/"
+			if re := routePattern("^" + path); re == nil || !re.MatchString(path) {
+				t.Errorf("pattern for %s did not compile", path)
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
+	cached := 0
+	routePatterns.Range(func(any, any) bool { cached++; return true })
+	if cached != maxRoutePatterns {
+		t.Fatalf("cached %d patterns, want %d", cached, maxRoutePatterns)
 	}
 }
 

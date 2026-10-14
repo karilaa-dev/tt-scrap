@@ -37,8 +37,9 @@ func shareRequestURL(raw string) string {
 	if e != nil || normalizedHost(u) != "tt.site" {
 		return raw
 	}
+	port := u.Port()
 	u.Host = "www.tt.site"
-	if port := u.Port(); port != "" {
+	if port != "" {
 		u.Host = net.JoinHostPort(u.Host, port)
 	}
 	return u.String()

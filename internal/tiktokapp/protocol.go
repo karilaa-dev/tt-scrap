@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -74,16 +73,19 @@ var routeHostPattern = regexp.MustCompile(`^[a-z0-9.-]+\.tiktok(?:v|w)?\.(com|us
 const maxRoutePatterns = 1024
 
 var routePatterns sync.Map
-var routePatternCount atomic.Int32
+var routePatternInserts sync.Mutex
+var routePatternCount int
 
 func routePattern(pattern string) *regexp.Regexp {
 	if cached, ok := routePatterns.Load(pattern); ok {
 		return cached.(*regexp.Regexp)
 	}
 	re, _ := regexp.Compile(pattern)
-	if routePatternCount.Load() < maxRoutePatterns {
+	routePatternInserts.Lock()
+	defer routePatternInserts.Unlock()
+	if routePatternCount < maxRoutePatterns {
 		if _, loaded := routePatterns.LoadOrStore(pattern, re); !loaded {
-			routePatternCount.Add(1)
+			routePatternCount++
 		}
 	}
 	return re
