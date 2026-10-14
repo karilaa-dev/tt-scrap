@@ -351,12 +351,12 @@ func heifSize(r io.ReaderAt, size int64) (width, height int, err error) {
 		case "pitm":
 			// Version 0 has a 16-bit item ID; later versions, 32-bit.
 			var b [8]byte
-			if _, err = r.ReadAt(b[:6], body); err != nil {
+			if !readBody(r, body, next, b[:6]) {
 				return 0, 0, missing
 			}
 			primary = uint32(binary.BigEndian.Uint16(b[4:]))
 			if b[0] != 0 {
-				if _, err = r.ReadAt(b[6:], body+6); err != nil {
+				if !readBody(r, body, next, b[:]) {
 					return 0, 0, missing
 				}
 				primary = binary.BigEndian.Uint32(b[4:])
@@ -381,7 +381,7 @@ func heifSize(r io.ReaderAt, size int64) (width, height int, err error) {
 		}
 		if kind == "ispe" && slices.Contains(indexes, i) {
 			var b [12]byte
-			if _, err = r.ReadAt(b[:], body); err != nil {
+			if !readBody(r, body, next, b[:]) {
 				return 0, 0, missing
 			}
 			return int(binary.BigEndian.Uint32(b[4:])), int(binary.BigEndian.Uint32(b[8:])), nil
@@ -391,12 +391,34 @@ func heifSize(r io.ReaderAt, size int64) (width, height int, err error) {
 	return 0, 0, missing
 }
 
-// associations returns the 1-based ipco indexes of the item's properties.
+// associations returns the 1-based ipco indexes of the item's properties from
+// the first entry for it in the iprp's ipma boxes, which libheif merges in
+// order.
 func associations(r io.ReaderAt, start, end int64, item uint32) ([]int, error) {
-	ipma, ipmaEnd, ok := findBox(r, start, end, "ipma")
-	if !ok {
+	found := false
+	for start < end {
+		kind, body, next, ok := boxAt(r, start, end)
+		if !ok {
+			break
+		}
+		if kind == "ipma" {
+			found = true
+			indexes, err := ipmaEntry(r, body, next, item)
+			if indexes != nil || err != nil {
+				return indexes, err
+			}
+		}
+		start = next
+	}
+	if !found {
 		return nil, fmt.Errorf("HEIF properties missing")
 	}
+	return nil, fmt.Errorf("HEIF primary image properties missing")
+}
+
+// ipmaEntry returns the item's property indexes from an ipma box, or nil if
+// the box has no entry for it.
+func ipmaEntry(r io.ReaderAt, ipma, ipmaEnd int64, item uint32) ([]int, error) {
 	in := bufio.NewReader(io.NewSectionReader(r, ipma, ipmaEnd-ipma))
 	var header [8]byte
 	if _, err := io.ReadFull(in, header[:]); err != nil {
@@ -431,7 +453,16 @@ func associations(r io.ReaderAt, start, end int64, item uint32) ([]int, error) {
 		}
 		return indexes, nil
 	}
-	return nil, fmt.Errorf("HEIF primary image properties missing")
+	return nil, nil
+}
+
+// readBody fills b from the start of a box body ending at end.
+func readBody(r io.ReaderAt, body, end int64, b []byte) bool {
+	if end-body < int64(len(b)) {
+		return false
+	}
+	_, err := r.ReadAt(b, body)
+	return err == nil
 }
 
 // findBox returns the body of the first box of a kind within [start, end).

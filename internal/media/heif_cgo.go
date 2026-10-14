@@ -7,6 +7,9 @@ package media
 #include <libheif/heif.h>
 #include <stdlib.h>
 
+// C.malloc crashes the program when allocation fails; this returns NULL.
+static void *try_malloc(size_t n) { return malloc(n); }
+
 static struct heif_error decode_image(struct heif_image_handle *handle, struct heif_image **out) {
  struct heif_decoding_options *options = heif_decoding_options_alloc();
  if (options) options->convert_hdr_to_8bit = 1;
@@ -30,11 +33,17 @@ func decodeHEIF(r io.ReaderAt, size int64, check func(width, height int) error) 
 	if size <= 0 {
 		return nil, fmt.Errorf("empty HEIF image")
 	}
+	if int64(int(size)) != size {
+		return nil, fmt.Errorf("HEIF image too large")
+	}
 	// The context references this C copy until it is freed. Reading into it
 	// directly avoids a second, Go copy of the file.
-	encoded := C.malloc(C.size_t(size))
+	encoded := C.try_malloc(C.size_t(size))
+	if encoded == nil {
+		return nil, fmt.Errorf("cannot allocate %d bytes for HEIF image", size)
+	}
 	defer C.free(encoded)
-	if n, err := r.ReadAt(unsafe.Slice((*byte)(encoded), size), 0); int64(n) != size {
+	if n, err := r.ReadAt(unsafe.Slice((*byte)(encoded), int(size)), 0); int64(n) != size {
 		return nil, err
 	}
 	ctx := C.heif_context_alloc()
