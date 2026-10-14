@@ -2,13 +2,17 @@ package platform
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync/atomic"
 	"testing"
+
+	"github.com/karilaa-dev/tt-scrap/internal/core"
 )
 
 func TestWebSessionIsOnlyUsedAfterContentRestriction(t *testing.T) {
@@ -84,6 +88,57 @@ func TestWebHTTP401DoesNotAuthenticateChallenges(t *testing.T) {
 				t.Fatal("bot challenge triggered account fallback", err, calls)
 			}
 		})
+	}
+}
+
+func TestWebAccountRejectionPreservesRestrictionWithoutRetries(t *testing.T) {
+	for _, restriction := range []struct {
+		name, detail, code string
+		status             int
+	}{
+		{"private", `"statusCode":10216`, "content_private", 403},
+		{"age", `"statusCode":1,"statusMsg":"Age restricted"`, "content_restricted", 403},
+		{"region", `"statusCode":10204`, "region_blocked", 451},
+	} {
+		for _, accountResponse := range []struct {
+			status, attempts int
+			code             string
+			publicStatus     int
+		}{
+			{401, 1, restriction.code, restriction.status},
+			{403, 1, restriction.code, restriction.status},
+			{404, 1, "content_deleted", 404},
+			{429, 3, "upstream_rate_limited", 429},
+			{503, 3, "upstream_network_error", 502},
+		} {
+			t.Run(fmt.Sprintf("%s/%d", restriction.name, accountResponse.status), func(t *testing.T) {
+				var anonymous, authenticated atomic.Int32
+				service := resolutionFixture(t, "web", func(w http.ResponseWriter, r *http.Request) {
+					cookie, err := r.Cookie("sessionid")
+					if err == http.ErrNoCookie {
+						anonymous.Add(1)
+						fmt.Fprintf(w, `<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__">{"__DEFAULT_SCOPE__":{"webapp.video-detail":{%s}}}</script>`, restriction.detail)
+						return
+					}
+					authenticated.Add(1)
+					if err != nil || cookie.Value != "web-login" {
+						t.Error("web fallback missing configured account cookie")
+					}
+					w.WriteHeader(accountResponse.status)
+					fmt.Fprint(w, http.StatusText(accountResponse.status))
+				})
+				service.cfg.TikTokSessionID = "web-login"
+				service.cfg.VideoInfoMaxRetries = 3
+				_, err := service.ExtractURL(context.Background(), "https://www.tiktok.com/@creator/video/1234567890123456789", false)
+				var failure *core.Error
+				if !errors.As(err, &failure) || failure.Code != accountResponse.code || failure.Status != accountResponse.publicStatus {
+					t.Errorf("error=%#v, want %s (%d)", err, accountResponse.code, accountResponse.publicStatus)
+				}
+				if anonymous.Load() != int32(accountResponse.attempts) || authenticated.Load() != int32(accountResponse.attempts) {
+					t.Errorf("anonymous=%d authenticated=%d, want %d each", anonymous.Load(), authenticated.Load(), accountResponse.attempts)
+				}
+			})
+		}
 	}
 }
 
