@@ -2,16 +2,13 @@ package httpapi
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -49,7 +46,7 @@ type response struct {
 	status   int
 	headers  http.Header
 	data     []byte
-	file     *os.File
+	body     io.Reader
 	cleanup  func()
 	delivery *DeliveryEvent
 }
@@ -61,16 +58,10 @@ func NewHandler(dependencies Dependencies) http.Handler {
 
 func requestID(r *http.Request) string {
 	if value := strings.TrimSpace(r.Header.Get("X-Request-ID")); value != "" {
-		return string([]rune(value)[:min(len([]rune(value)), 128)])
+		runes := []rune(value)
+		return string(runes[:min(len(runes), 128)])
 	}
-	var data [16]byte
-	if _, err := rand.Read(data[:]); err != nil {
-		return strconv.FormatInt(time.Now().UnixNano(), 16)
-	}
-	data[6] = (data[6] & 15) | 64
-	data[8] = (data[8] & 63) | 128
-	value := hex.EncodeToString(data[:])
-	return value[:8] + "-" + value[8:12] + "-" + value[12:16] + "-" + value[16:20] + "-" + value[20:]
+	return core.NewID()
 }
 
 func jsonResponse(status int, value any) (response, error) {
@@ -113,24 +104,21 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if result.cleanup != nil {
 		defer result.cleanup()
 	}
-	if result.file != nil {
-		defer result.file.Close()
-	}
 	elapsed := time.Since(started)
 	for key, values := range result.headers {
 		w.Header()[key] = values
 	}
 	w.Header().Set("X-Request-ID", id)
 	w.Header().Set("Server-Timing", fmt.Sprintf("app;dur=%.3f", float64(elapsed)/float64(time.Millisecond)))
-	if result.file == nil {
+	if result.body == nil {
 		w.Header().Set("Content-Length", strconv.Itoa(len(result.data)))
 	}
 	written = true
 	w.WriteHeader(result.status)
 	var size int64
 	if r.Method != "HEAD" {
-		if result.file != nil {
-			size, _ = io.Copy(w, result.file)
+		if result.body != nil {
+			size, _ = io.Copy(w, result.body)
 		} else {
 			n, _ := w.Write(result.data)
 			size = int64(n)
@@ -147,6 +135,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 const preparationPath = "/v1/tiktok/identities/preparations"
+
+var attachmentFilename = strings.NewReplacer("\r", "_", "\n", "_", "\"", "_", "\\", "_")
 
 var routes = map[string]string{"/health/live": "GET", "/health/ready": "GET", "/v1/tiktok/resolutions": "POST", "/v1/tiktok/extractions": "POST", "/v1/tiktok/music": "POST", "/v1/tiktok/telegram-deliveries": "POST", "/v1/instagram/extractions": "POST", "/v1/instagram/telegram-deliveries": "POST", preparationPath: "GET, POST"}
 
@@ -233,14 +223,8 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) (response, error
 		if err != nil {
 			return response{}, err
 		}
-		file, err := os.Open(asset.Path)
-		if err != nil {
-			asset.Cleanup()
-			return response{}, err
-		}
-		filename := media.FilenameForType(assetContext.Filename, asset.ContentType)
-		filename = strings.NewReplacer("\r", "_", "\n", "_", "\"", "_", "\\", "_").Replace(filename)
-		return response{status: 200, file: file, cleanup: asset.Cleanup, headers: http.Header{"Content-Type": []string{asset.ContentType}, "Content-Length": []string{strconv.FormatInt(asset.Size, 10)}, "Content-Disposition": []string{`attachment; filename="` + filename + `"`}, "Etag": []string{`"` + asset.SHA256 + `"`}, "X-Content-Sha256": []string{asset.SHA256}, "Cache-Control": []string{"private, no-store"}}}, nil
+		filename := attachmentFilename.Replace(media.FilenameForType(assetContext.Filename, asset.ContentType))
+		return response{status: 200, body: asset.Data.Reader(r.Context(), 0, asset.Size), cleanup: asset.Cleanup, headers: http.Header{"Content-Type": []string{asset.ContentType}, "Content-Length": []string{strconv.FormatInt(asset.Size, 10)}, "Content-Disposition": []string{`attachment; filename="` + filename + `"`}, "Etag": []string{`"` + asset.SHA256 + `"`}, "X-Content-Sha256": []string{asset.SHA256}, "Cache-Control": []string{"private, no-store"}}}, nil
 	}
 	switch path {
 	case preparationPath:

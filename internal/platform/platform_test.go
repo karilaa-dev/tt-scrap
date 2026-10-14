@@ -73,9 +73,12 @@ func TestDownloadStreamsHashAndHonorsDeclaredAndChunkedLimits(t *testing.T) {
 	if got.Size != int64(len(data)) || got.SHA256 != hex.EncodeToString(sum[:]) || got.Width != 1080 || got.Height != 1920 {
 		t.Fatal(got)
 	}
+	if !got.Data.InMemory() || d.MemoryInUse() != int64(len(data)) {
+		t.Fatal("small download did not stay in RAM", d.MemoryInUse())
+	}
 	got.Cleanup()
-	if _, e = os.Stat(got.Path); !os.IsNotExist(e) {
-		t.Fatal("temp file not removed")
+	if got.Data.Err() == nil || d.MemoryInUse() != 0 {
+		t.Fatal("download buffer not released")
 	}
 	for _, path := range []string{"/known", "/chunked"} {
 		asset.UpstreamURL = server.URL + path

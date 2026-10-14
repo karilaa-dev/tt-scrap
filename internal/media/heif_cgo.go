@@ -7,6 +7,9 @@ package media
 #include <libheif/heif.h>
 #include <stdlib.h>
 
+// C.malloc crashes the program when allocation fails; this returns NULL.
+static void *try_malloc(size_t n) { return malloc(n); }
+
 static struct heif_error decode_image(struct heif_image_handle *handle, struct heif_image **out) {
  struct heif_decoding_options *options = heif_decoding_options_alloc();
  if (options) options->convert_hdr_to_8bit = 1;
@@ -20,10 +23,29 @@ import "C"
 import (
 	"fmt"
 	"image"
+	"io"
 	"unsafe"
 )
 
-func decodeHEIF(path string) (image.Image, error) {
+// decodeHEIF reads size bytes of r into C memory and calls check with the
+// primary image dimensions before decoding it.
+func decodeHEIF(r io.ReaderAt, size int64, check func(width, height int) error) (image.Image, error) {
+	if size <= 0 {
+		return nil, fmt.Errorf("empty HEIF image")
+	}
+	if int64(int(size)) != size {
+		return nil, fmt.Errorf("HEIF image too large")
+	}
+	// The context references this C copy until it is freed. Reading into it
+	// directly avoids a second, Go copy of the file.
+	encoded := C.try_malloc(C.size_t(size))
+	if encoded == nil {
+		return nil, fmt.Errorf("cannot allocate %d bytes for HEIF image", size)
+	}
+	defer C.free(encoded)
+	if n, err := r.ReadAt(unsafe.Slice((*byte)(encoded), int(size)), 0); int64(n) != size {
+		return nil, err
+	}
 	ctx := C.heif_context_alloc()
 	if ctx == nil {
 		return nil, fmt.Errorf("cannot allocate HEIF decoder")
@@ -31,9 +53,7 @@ func decodeHEIF(path string) (image.Image, error) {
 	defer C.heif_context_free(ctx)
 	C.heif_context_set_maximum_image_size_limit(ctx, 10000)
 	C.heif_context_set_max_decoding_threads(ctx, 1)
-	filename := C.CString(path)
-	defer C.free(unsafe.Pointer(filename))
-	if result := C.heif_context_read_from_file(ctx, filename, nil); result.code != C.heif_error_Ok {
+	if result := C.heif_context_read_from_memory_without_copy(ctx, encoded, C.size_t(size), nil); result.code != C.heif_error_Ok {
 		return nil, fmt.Errorf("cannot read HEIF image (%d)", result.code)
 	}
 	var handle *C.struct_heif_image_handle
@@ -42,8 +62,8 @@ func decodeHEIF(path string) (image.Image, error) {
 	}
 	defer C.heif_image_handle_release(handle)
 	w, h := int(C.heif_image_handle_get_width(handle)), int(C.heif_image_handle_get_height(handle))
-	if w <= 0 || h <= 0 || int64(w)*int64(h) > maxPixels {
-		return nil, fmt.Errorf("HEIF image dimensions exceed limit")
+	if err := check(w, h); err != nil {
+		return nil, err
 	}
 	var decoded *C.struct_heif_image
 	if result := C.decode_image(handle, &decoded); result.code != C.heif_error_Ok {
@@ -55,10 +75,10 @@ func decodeHEIF(path string) (image.Image, error) {
 	if plane == nil || int(stride) < w*4 {
 		return nil, fmt.Errorf("HEIF pixel plane missing")
 	}
-	data := unsafe.Slice((*byte)(unsafe.Pointer(plane)), int(stride)*h)
+	pixels := unsafe.Slice((*byte)(unsafe.Pointer(plane)), int(stride)*h)
 	img := image.NewNRGBA(image.Rect(0, 0, w, h))
 	for y := 0; y < h; y++ {
-		copy(img.Pix[y*img.Stride:y*img.Stride+w*4], data[y*int(stride):y*int(stride)+w*4])
+		copy(img.Pix[y*img.Stride:y*img.Stride+w*4], pixels[y*int(stride):y*int(stride)+w*4])
 	}
 	return img, nil
 }

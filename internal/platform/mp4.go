@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"os"
 )
 
 type box struct {
@@ -49,7 +48,7 @@ func boxes(r io.ReaderAt, start, end int64) ([]box, error) {
 	}
 	return result, nil
 }
-func mediaDimensions(file *os.File) (int, int, error) {
+func mediaDimensions(file io.ReaderAt) (int, int, error) {
 	d, e := readMovieDimensions(func(start, length int64) ([]byte, error) {
 		data := make([]byte, length)
 		n, err := file.ReadAt(data, start)

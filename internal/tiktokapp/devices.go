@@ -56,6 +56,9 @@ func randomIndex(n int) (int, error) {
 	}
 	return int(v.Int64()), nil
 }
+
+var androidAPILevels = map[int]int{12: 31, 13: 33, 14: 34, 15: 35, 16: 36, 17: 37}
+
 func PickProfile() (Profile, error) {
 	index, e := randomIndex(len(deviceCatalog))
 	if e != nil {
@@ -67,8 +70,7 @@ func PickProfile() (Profile, error) {
 		return Profile{}, e
 	}
 	release := device.Releases[releaseIndex]
-	api := map[int]int{12: 31, 13: 33, 14: 34, 15: 35, 16: 36, 17: 37}[release.Android]
-	return Profile{Model: device.Model, Brand: device.Brand, Manufacturer: device.Manufacturer, OSVersion: strconv.Itoa(release.Android), OSAPI: api, Build: release.Build, Resolution: device.Resolution, DPI: device.DPI, Language: "en", Region: "US", Timezone: "Etc/UTC", TimezoneOffset: 0, Channel: "googleplay"}, nil
+	return Profile{Model: device.Model, Brand: device.Brand, Manufacturer: device.Manufacturer, OSVersion: strconv.Itoa(release.Android), OSAPI: androidAPILevels[release.Android], Build: release.Build, Resolution: device.Resolution, DPI: device.DPI, Language: "en", Region: "US", Timezone: "Etc/UTC", TimezoneOffset: 0, Channel: "googleplay"}, nil
 }
 
 var openUDIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{13,20}$`)

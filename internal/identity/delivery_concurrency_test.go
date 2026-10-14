@@ -129,14 +129,16 @@ func TestTelegramRelatedMediaShareIdentityAndRunConcurrently(t *testing.T) {
 			}
 			var uploads atomic.Int32
 			telegram := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if p.Stats().Busy != 0 {
-					t.Error("identity held during Telegram upload")
-				}
 				if err := r.ParseMultipartForm(1 << 20); err != nil {
 					t.Error(err)
 					return
 				}
 				defer r.MultipartForm.RemoveAll()
+				// A video upload may start during the lease, but its body completes
+				// only after the identity checkpoint.
+				if p.Stats().Busy != 0 {
+					t.Error("Telegram upload completed while the identity was held")
+				}
 				if len(r.MultipartForm.File) != want {
 					t.Errorf("uploaded %d parts, want %d", len(r.MultipartForm.File), want)
 				}
@@ -327,12 +329,9 @@ func TestTelegramRecoveryRepreparesBeforeOneUpload(t *testing.T) {
 			post := core.TikTokExtraction{ContentType: "video", Media: []core.AssetDescriptor{register("video", "https://api19-va.tiktokv.com/aweme/v1/play/")}, Cover: core.Ptr(register("image", "https://cdn.example/cover"))}
 			var uploads atomic.Int32
 			telegram := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if p.Stats().Busy != 0 {
-					t.Error("identity held during upload")
-				}
 				files, err := os.ReadDir(cfg.TempDir)
-				if err != nil || len(files) != 2 {
-					t.Error("old preparation files survived recovery", files, err)
+				if err != nil || len(files) != 0 {
+					t.Error("small media was written to disk", files, err)
 				}
 				if err := r.ParseMultipartForm(1 << 20); err != nil {
 					t.Error(err)
@@ -341,6 +340,9 @@ func TestTelegramRecoveryRepreparesBeforeOneUpload(t *testing.T) {
 					if len(r.MultipartForm.File) != 2 {
 						t.Error("recovered delivery lost thumbnail")
 					}
+				}
+				if p.Stats().Busy != 0 {
+					t.Error("upload completed while the identity was held")
 				}
 				uploads.Add(1)
 				io.WriteString(w, `{"ok":true,"result":{"message_id":1}}`)

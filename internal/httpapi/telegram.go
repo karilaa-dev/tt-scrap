@@ -8,6 +8,7 @@ import (
 
 	"github.com/karilaa-dev/tt-scrap/internal/core"
 	"github.com/karilaa-dev/tt-scrap/internal/media"
+	"github.com/karilaa-dev/tt-scrap/internal/spool"
 )
 
 type stringSet map[string]bool
@@ -36,6 +37,10 @@ var documentFields = union(commonFields, "disable_content_type_detection")
 var audioFields = union(commonFields, "duration", "performer", "title")
 var photoFields = union(commonFields, "has_spoiler", "show_caption_above_media")
 var groupFields = set(strings.Fields("allow_paid_broadcast business_connection_id chat_id direct_messages_topic_id disable_notification message_effect_id message_thread_id protect_content reply_parameters")...)
+var carouselFields = union(groupFields, "caption", "caption_entities", "parse_mode")
+var carouselDocumentFields = union(carouselFields, "disable_content_type_detection")
+var carouselMediaFields = union(carouselFields, "show_caption_above_media", "has_spoiler", "start_timestamp", "supports_streaming")
+var sendMethods = map[string]string{"document": "sendDocument", "photo": "sendPhoto", "audio": "sendAudio", "video": "sendVideo"}
 var knownFields = func() stringSet {
 	result := set("chat_id", "caption_entities")
 	for _, list := range [][]string{telegramStringFields, telegramIntegerFields, telegramBoolFields, telegramObjectFields} {
@@ -129,7 +134,7 @@ type telegramService struct {
 }
 
 func newTelegramService(settings core.Config, dependencies Dependencies) *telegramService {
-	return &telegramService{settings: settings, tiktok: dependencies.TikTok, instagram: dependencies.Instagram, assets: dependencies.Assets, downloader: dependencies.Downloader, client: newTelegramClient(settings, dependencies.HTTPClient), images: media.NewProcessor(settings.ImageConcurrency, settings.TempDir), pipelines: core.NewLimiter(settings.TelegramPipelineConcurrency, settings.MaxQueuedRequests)}
+	return &telegramService{settings: settings, tiktok: dependencies.TikTok, instagram: dependencies.Instagram, assets: dependencies.Assets, downloader: dependencies.Downloader, client: newTelegramClient(settings, dependencies.HTTPClient), images: media.NewProcessor(settings.ImageConcurrency, settings.ImageMemoryBytes), pipelines: core.NewLimiter(settings.TelegramPipelineConcurrency, settings.MaxQueuedRequests)}
 }
 
 func (s *telegramService) deliver(ctx context.Context, request telegramRequest, instagram bool) (result deliveryResult, err error) {
@@ -241,11 +246,9 @@ func (s *telegramService) deliverInstagram(ctx context.Context, request telegram
 	document, multiple := request.Delivery == "document", len(extraction.Media) > 1
 	allowed := photoFields
 	if multiple {
-		allowed = union(groupFields, "caption", "caption_entities", "parse_mode")
+		allowed = carouselMediaFields
 		if document {
-			allowed = union(allowed, "disable_content_type_detection")
-		} else {
-			allowed = union(allowed, "show_caption_above_media", "has_spoiler", "start_timestamp", "supports_streaming")
+			allowed = carouselDocumentFields
 		}
 	} else if document {
 		allowed = documentFields
@@ -268,63 +271,96 @@ func (s *telegramService) deliverInstagram(ctx context.Context, request telegram
 	return s.send(ctx, items, parameters, document, true)
 }
 
-func (s *telegramService) prepare(ctx context.Context, item deliveryItem, document bool, download core.DownloadFunc) (result preparedItem, err error) {
+// thumbnailTask converts a cover alongside the media download.
+type thumbnailTask struct {
+	done  chan struct{}
+	image *media.Prepared
+	asset *core.Downloaded
+}
+
+func (t *thumbnailTask) wait() *media.Prepared {
+	if t == nil {
+		return nil
+	}
+	<-t.done
+	return t.image
+}
+
+func (s *telegramService) startThumbnail(ctx context.Context, item deliveryItem, document bool, download core.DownloadFunc) *thumbnailTask {
+	if item.Cover == nil || document || item.Kind == "image" || s.settings.ThumbnailWait <= 0 {
+		return nil
+	}
+	task := &thumbnailTask{done: make(chan struct{})}
+	go func() {
+		defer close(task.done)
+		ctx, cancel := context.WithTimeout(ctx, s.settings.ThumbnailWait)
+		defer cancel()
+		assetContext, err := s.assets.GetAsset(item.Cover.AssetID)
+		if err != nil {
+			return
+		}
+		asset, err := download(ctx, assetContext, 0, nil)
+		if err != nil {
+			return
+		}
+		task.asset = asset
+		converted, err := s.images.Prepare(ctx, asset.Data, item.Descriptor.AssetID+"_thumbnail.jpg", true)
+		if err != nil {
+			return
+		}
+		if ctx.Err() != nil {
+			converted.Cleanup()
+			return
+		}
+		task.image = &converted
+	}()
+	return task
+}
+
+// prepare downloads one item and its optional thumbnail. When stream is set, it
+// receives each transfer attempt whose bytes are still arriving, after the
+// thumbnail settles, so the upload can start before the download ends.
+func (s *telegramService) prepare(ctx context.Context, item deliveryItem, document bool, download core.DownloadFunc, stream func(preparedItem)) (result preparedItem, err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	result.Kind = item.Kind
-	if item.Cover != nil && !document && item.Kind != "image" && s.settings.ThumbnailWait > 0 {
-		type thumbnailResult struct {
-			image *media.Prepared
-			asset *core.Downloaded
+	thumbnail := s.startThumbnail(ctx, item, document, download)
+	var announcements sync.WaitGroup
+	defer func() {
+		if err != nil {
+			cancel()
 		}
-		thumbnail := make(chan thumbnailResult, 1)
-		go func() {
-			reply := thumbnailResult{}
-			defer func() { thumbnail <- reply }()
-			thumbnailContext, cancel := context.WithTimeout(ctx, s.settings.ThumbnailWait)
-			defer cancel()
-			assetContext, err := s.assets.GetAsset(item.Cover.AssetID)
-			if err != nil {
-				return
+		announcements.Wait()
+		if thumbnail != nil {
+			result.Thumbnail = thumbnail.wait()
+			if thumbnail.asset != nil {
+				result.Owned = append(result.Owned, thumbnail.asset)
 			}
-			asset, err := download(thumbnailContext, assetContext, 0)
-			if err != nil {
-				return
-			}
-			reply.asset = asset
-			converted, err := s.images.Prepare(thumbnailContext, asset.Path, item.Descriptor.AssetID+"_thumbnail.jpg", true)
-			if err != nil {
-				return
-			}
-			if thumbnailContext.Err() != nil {
-				converted.Cleanup()
-				return
-			}
-			reply.image = &converted
-		}()
-		defer func() {
-			if err != nil {
-				cancel()
-			}
-			reply := <-thumbnail
-			result.Thumbnail = reply.image
-			if reply.asset != nil {
-				result.Owned = append(result.Owned, reply.asset)
-			}
-		}()
+		}
+	}()
+	var started func(*core.Downloaded)
+	if stream != nil {
+		started = func(asset *core.Downloaded) {
+			announcements.Go(func() {
+				image := thumbnail.wait()
+				if ctx.Err() == nil {
+					stream(preparedItem{Kind: item.Kind, Media: preparedMedia(item, asset), Thumbnail: image})
+				}
+			})
+		}
 	}
 	limit := s.settings.TelegramMaxBytes
 	if item.Kind == "image" {
 		limit = 0
 	}
-	asset, err := download(ctx, item.Asset, limit)
+	asset, err := download(ctx, item.Asset, limit, started)
 	if err != nil {
 		return result, err
 	}
 	result.Owned = append(result.Owned, asset)
-	result.Media = media.Prepared{Path: asset.Path, Filename: media.FilenameForType(item.Descriptor.Filename, asset.ContentType), ContentType: asset.ContentType, Size: asset.Size}
+	result.Media = preparedMedia(item, asset)
 	if item.Kind == "image" && !document {
-		converted, err := s.images.Prepare(ctx, asset.Path, item.Descriptor.Filename, false)
+		converted, err := s.images.Prepare(ctx, asset.Data, item.Descriptor.Filename, false)
 		if err != nil {
 			if ctx.Err() != nil {
 				return result, ctx.Err()
@@ -334,6 +370,10 @@ func (s *telegramService) prepare(ctx context.Context, item deliveryItem, docume
 		result.Media = converted
 	}
 	return result, nil
+}
+
+func preparedMedia(item deliveryItem, asset *core.Downloaded) media.Prepared {
+	return media.Prepared{Data: asset.Data, Filename: media.FilenameForType(item.Descriptor.Filename, asset.ContentType), ContentType: asset.ContentType, Size: asset.Size}
 }
 
 func (s *telegramService) prepareItems(ctx context.Context, items []deliveryItem, indices []int, prepared []preparedItem, document bool, download core.DownloadFunc) error {
@@ -350,7 +390,7 @@ func (s *telegramService) prepareItems(ctx context.Context, items []deliveryItem
 					return
 				}
 				i := indices[offset]
-				value, err := s.prepare(ctx, items[i], document, download)
+				value, err := s.prepare(ctx, items[i], document, download, nil)
 				prepared[i] = value
 				if err != nil {
 					once.Do(func() { failure = err; cancel() })
@@ -366,17 +406,21 @@ func (s *telegramService) prepareItems(ctx context.Context, items []deliveryItem
 	return ctx.Err()
 }
 
+// streamUpload is one Telegram request fed by a transfer that is still running.
+type streamUpload struct {
+	media   *spool.Buffer
+	release chan struct{}
+	stop    context.CancelFunc
+	done    chan struct{}
+	call    telegramCall
+	err     error
+}
+
 func (s *telegramService) send(ctx context.Context, items []deliveryItem, parameters fields, document, instagram bool) (result deliveryResult, err error) {
 	event := &DeliveryEvent{FailedStage: "preparation", Batches: (len(items) + 9) / 10}
 	defer func() {
 		event.finish(err)
 		result.Event = event
-	}()
-	prepared := make([]preparedItem, len(items))
-	defer func() {
-		for i := range prepared {
-			prepared[i].cleanup()
-		}
 	}()
 	groups := make(map[string][]int)
 	var identities []string
@@ -391,6 +435,16 @@ func (s *telegramService) send(ctx context.Context, items []deliveryItem, parame
 		}
 		groups[asset.IdentityID] = append(groups[asset.IdentityID], i)
 	}
+	// Photos need complete bytes for conversion; other single media streams.
+	if len(items) == 1 && (document || items[0].Kind != "image") {
+		return s.sendStreamed(ctx, items[0], parameters, document, event)
+	}
+	prepared := make([]preparedItem, len(items))
+	defer func() {
+		for i := range prepared {
+			prepared[i].cleanup()
+		}
+	}()
 	// An extraction normally has one identity. Never hold multiple identity
 	// leases at once, even if cached assets originate from different extractions.
 	for _, id := range identities {
@@ -417,30 +471,7 @@ func (s *telegramService) send(ctx context.Context, items []deliveryItem, parame
 	}
 	event.FailedStage = "upload"
 	if len(prepared) == 1 {
-		first := prepared[0]
-		field := first.Kind
-		if document {
-			field = "document"
-		} else if field == "image" {
-			field = "photo"
-		}
-		method := map[string]string{"document": "sendDocument", "photo": "sendPhoto", "audio": "sendAudio", "video": "sendVideo"}[field]
-		uploads := []upload{{Prepared: first.Media, Field: field + "_file"}}
-		parameters[field] = "attach://" + field + "_file"
-		if first.Thumbnail != nil {
-			parameters["thumbnail"] = "attach://thumbnail_file"
-			if field == "video" {
-				parameters["cover"] = "attach://thumbnail_file"
-			}
-			uploads = append(uploads, upload{Prepared: *first.Thumbnail, Field: "thumbnail_file"})
-		}
-		event.Attempts++
-		call, err := s.client.call(ctx, method, parameters, uploads)
-		if err != nil {
-			return deliveryResult{}, err
-		}
-		event.record(call)
-		return telegramResponse([]telegramCall{call})
+		return s.sendSingle(ctx, prepared[0], parameters, document, event)
 	}
 	firstFields := take(parameters, "caption", "caption_entities", "parse_mode", "show_caption_above_media")
 	allFields := take(parameters, "has_spoiler")
@@ -501,4 +532,137 @@ func (s *telegramService) send(ctx context.Context, items []deliveryItem, parame
 		}
 	}
 	return telegramResponse(calls)
+}
+
+// singleUpload names the method, attachment fields, and files for one item.
+func singleUpload(item preparedItem, parameters fields, document bool) (string, fields, []upload) {
+	field := item.Kind
+	if document {
+		field = "document"
+	} else if field == "image" {
+		field = "photo"
+	}
+	uploads := []upload{{Prepared: item.Media, Field: field + "_file"}}
+	parameters[field] = "attach://" + field + "_file"
+	if item.Thumbnail != nil {
+		parameters["thumbnail"] = "attach://thumbnail_file"
+		if field == "video" {
+			parameters["cover"] = "attach://thumbnail_file"
+		}
+		uploads = append(uploads, upload{Prepared: *item.Thumbnail, Field: "thumbnail_file"})
+	}
+	return sendMethods[field], parameters, uploads
+}
+
+func (s *telegramService) sendSingle(ctx context.Context, item preparedItem, parameters fields, document bool, event *DeliveryEvent) (deliveryResult, error) {
+	method, parameters, uploads := singleUpload(item, parameters, document)
+	event.Attempts++
+	call, err := s.client.call(ctx, method, parameters, uploads)
+	if err != nil {
+		return deliveryResult{}, err
+	}
+	event.record(call)
+	return telegramResponse([]telegramCall{call})
+}
+
+// sendStreamed uploads one item while it downloads. Each upload withholds its
+// final bytes until preparation, including the identity checkpoint, succeeds,
+// so a failed or recovered transfer aborts a request Telegram never processes.
+// A retried or recovered transfer starts a new upload with the new bytes.
+func (s *telegramService) sendStreamed(ctx context.Context, item deliveryItem, parameters fields, document bool, event *DeliveryEvent) (deliveryResult, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	starts := make(chan preparedItem)
+	completed := make(chan *streamUpload)
+	finished := make(chan error, 1)
+	var final preparedItem
+	go func() {
+		finished <- s.downloader.WithIdentity(ctx, item.Asset.IdentityID, func(download core.DownloadFunc) error {
+			final.cleanup()
+			var err error
+			final, err = s.prepare(ctx, item, document, download, func(p preparedItem) {
+				select {
+				case starts <- p:
+				case <-ctx.Done():
+				}
+			})
+			return err
+		})
+	}()
+	var uploads []*streamUpload
+	prepared := false
+	defer func() {
+		cancel()
+		for _, u := range uploads {
+			<-u.done
+		}
+		if !prepared {
+			<-finished
+		}
+		final.cleanup()
+	}()
+	launch := func(p preparedItem) {
+		uploadContext, stop := context.WithCancel(ctx)
+		u := &streamUpload{media: p.Media.Data, release: make(chan struct{}), stop: stop, done: make(chan struct{})}
+		method, values, files := singleUpload(p, copyFields(parameters), document)
+		files[0].hold = func(ctx context.Context) error {
+			select {
+			case <-u.release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		uploads = append(uploads, u)
+		go func() {
+			u.call, u.err = s.client.call(uploadContext, method, values, files)
+			close(u.done)
+			select {
+			case completed <- u:
+			case <-ctx.Done():
+			}
+		}()
+	}
+	finish := func(u *streamUpload) (deliveryResult, error) {
+		event.FailedStage = "upload"
+		event.Attempts++
+		if u.err != nil {
+			return deliveryResult{}, u.err
+		}
+		event.record(u.call)
+		return telegramResponse([]telegramCall{u.call})
+	}
+	for !prepared {
+		select {
+		case p := <-starts:
+			launch(p)
+		case u := <-completed:
+			// A failed or replaced transfer closes its buffer and aborts its upload.
+			if u.media.Err() == nil {
+				// Telegram answered, or its connection failed, before the media finished.
+				return finish(u)
+			}
+		case err := <-finished:
+			prepared = true
+			if err != nil {
+				return deliveryResult{}, err
+			}
+		}
+	}
+	var current *streamUpload
+	for _, u := range uploads {
+		if u.media == final.Media.Data {
+			current = u
+		} else {
+			u.stop()
+		}
+	}
+	if current == nil {
+		// The transfer never announced a length; upload the complete media.
+		event.FailedStage = "upload"
+		return s.sendSingle(ctx, final, parameters, document, event)
+	}
+	close(current.release)
+	<-current.done
+	return finish(current)
 }

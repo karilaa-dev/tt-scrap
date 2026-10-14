@@ -10,7 +10,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +21,14 @@ import (
 type upload struct {
 	media.Prepared
 	Field string
+	// hold, when set, gates the final bytes of media that is still arriving.
+	// An error aborts the request while Telegram still lacks part of the body.
+	hold func(context.Context) error
 }
+
+// heldBytes stay unsent until a streamed upload's preparation commits.
+const heldBytes = 64 << 10
+
 type telegramCall struct {
 	Method      string
 	Status      int
@@ -73,13 +79,12 @@ func (c *telegramClient) call(ctx context.Context, method string, parameters fie
 		return telegramCall{}, err
 	}
 	defer release()
-	body, contentType, length, closeFiles, err := multipartBody(parameters, uploads)
+	callContext, cancel := context.WithTimeout(ctx, c.settings.TelegramTimeout)
+	defer cancel()
+	body, contentType, length, err := multipartBody(callContext, parameters, uploads)
 	if err != nil {
 		return telegramCall{}, err
 	}
-	defer closeFiles()
-	callContext, cancel := context.WithTimeout(ctx, c.settings.TelegramTimeout)
-	defer cancel()
 	request, err := http.NewRequestWithContext(callContext, "POST", strings.TrimRight(c.settings.TelegramAPIBaseURL, "/")+"/bot"+c.settings.TelegramBotToken+"/"+method, body)
 	if err != nil {
 		return telegramCall{}, core.NewError("telegram_network_error", "Telegram upload failed before a response", 502)
@@ -128,18 +133,15 @@ func (c *telegramClient) call(ctx context.Context, method string, parameters fie
 	return telegramCall{Method: method, Status: response.StatusCode, Body: data, ContentType: resultType, Value: value, OK: response.StatusCode >= 200 && response.StatusCode < 300 && ok}, nil
 }
 
-// Multipart headers are tiny; file readers stream directly from disk with exact length.
-func multipartBody(parameters fields, uploads []upload) (io.Reader, string, int64, func(), error) {
+var multipartQuote = strings.NewReplacer("\\", "\\\\", "\"", "\\\"", "\r", "_", "\n", "_")
+
+// Multipart headers are tiny; media streams from its buffer with exact length,
+// including media that is still downloading.
+func multipartBody(ctx context.Context, parameters fields, uploads []upload) (io.Reader, string, int64, error) {
 	var buffer bytes.Buffer
 	writer := multipart.NewWriter(&buffer)
 	readers := make([]io.Reader, 0, len(uploads)*2+1)
-	files := make([]*os.File, 0, len(uploads))
 	var size int64
-	cleanup := func() {
-		for _, f := range files {
-			_ = f.Close()
-		}
-	}
 	flush := func() {
 		if buffer.Len() > 0 {
 			data := bytes.Clone(buffer.Bytes())
@@ -167,48 +169,50 @@ func multipartBody(parameters fields, uploads []upload) (io.Reader, string, int6
 		default:
 			encoded, err := json.Marshal(value)
 			if err != nil {
-				return nil, "", 0, cleanup, err
+				return nil, "", 0, err
 			}
 			text = string(encoded)
 		}
 		if err := writer.WriteField(key, text); err != nil {
-			return nil, "", 0, cleanup, err
+			return nil, "", 0, err
 		}
 	}
 	for _, item := range uploads {
-		file, err := os.Open(item.Path)
-		if err != nil {
-			cleanup()
-			return nil, "", 0, func() {}, err
-		}
-		files = append(files, file)
-		stat, err := file.Stat()
-		if err != nil {
-			cleanup()
-			return nil, "", 0, func() {}, err
-		}
-		if stat.Size() != item.Size {
-			cleanup()
-			return nil, "", 0, func() {}, fmt.Errorf("prepared upload size changed")
+		if item.Data.Size() != item.Size {
+			return nil, "", 0, fmt.Errorf("prepared upload size changed")
 		}
 		header := make(textproto.MIMEHeader)
-		quote := strings.NewReplacer("\\", "\\\\", "\"", "\\\"", "\r", "_", "\n", "_")
-		header.Set("Content-Disposition", `form-data; name="`+quote.Replace(item.Field)+`"; filename="`+quote.Replace(item.Filename)+`"`)
+		header.Set("Content-Disposition", `form-data; name="`+multipartQuote.Replace(item.Field)+`"; filename="`+multipartQuote.Replace(item.Filename)+`"`)
 		header.Set("Content-Type", item.ContentType)
-		if _, err = writer.CreatePart(header); err != nil {
-			cleanup()
-			return nil, "", 0, func() {}, err
+		if _, err := writer.CreatePart(header); err != nil {
+			return nil, "", 0, err
 		}
 		flush()
-		readers = append(readers, file)
+		if item.hold == nil {
+			readers = append(readers, item.Data.Reader(ctx, 0, item.Size))
+		} else {
+			held := item.Size - min(item.Size, heldBytes)
+			readers = append(readers, item.Data.Reader(ctx, 0, held), holdReader{ctx: ctx, hold: item.hold}, item.Data.Reader(ctx, held, item.Size))
+		}
 		size += item.Size
 	}
 	if err := writer.Close(); err != nil {
-		cleanup()
-		return nil, "", 0, func() {}, err
+		return nil, "", 0, err
 	}
 	flush()
-	return io.MultiReader(readers...), writer.FormDataContentType(), size, cleanup, nil
+	return io.MultiReader(readers...), writer.FormDataContentType(), size, nil
+}
+
+type holdReader struct {
+	ctx  context.Context
+	hold func(context.Context) error
+}
+
+func (h holdReader) Read([]byte) (int, error) {
+	if err := h.hold(h.ctx); err != nil {
+		return 0, err
+	}
+	return 0, io.EOF
 }
 
 func telegramResponse(calls []telegramCall) (deliveryResult, error) {

@@ -8,10 +8,9 @@ import (
 	"image/color"
 	"image/draw"
 	"io"
-	"os"
 )
 
-func animatedPNG(file *os.File) bool {
+func animatedPNG(file io.ReadSeeker) bool {
 	if _, err := file.Seek(8, 0); err != nil {
 		return false
 	}
@@ -40,32 +39,30 @@ func putLittle24(data []byte, value int) {
 	data[2] = byte(value >> 16)
 }
 
-// A WebP animation embeds ordinary WebP chunks inside each ANMF frame.
-// Decode only the first frame and composite it onto the declared canvas.
-func firstWebPFrame(file *os.File, prefix []byte) (image.Image, error) {
+// webPCanvas reads the canvas size from an extended WebP header.
+func webPCanvas(prefix []byte) (width, height int, err error) {
 	if len(prefix) < 30 {
-		return nil, fmt.Errorf("truncated WebP canvas")
+		return 0, 0, fmt.Errorf("truncated WebP canvas")
 	}
-	w, h := little24(prefix[24:27])+1, little24(prefix[27:30])+1
-	if w <= 0 || h <= 0 || int64(w)*int64(h) > maxPixels {
-		return nil, fmt.Errorf("WebP dimensions exceed limits")
-	}
-	stat, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if _, err = file.Seek(12, 0); err != nil {
+	return little24(prefix[24:27]) + 1, little24(prefix[27:30]) + 1, nil
+}
+
+// A WebP animation embeds ordinary WebP chunks inside each ANMF frame.
+// Decode only the first frame and composite it onto the w×h canvas.
+func firstWebPFrame(file *io.SectionReader, w, h int) (image.Image, error) {
+	if _, err := file.Seek(12, 0); err != nil {
 		return nil, err
 	}
 	var background color.NRGBA
 	for count := 0; count < 1024; count++ {
 		var chunk [8]byte
+		var err error
 		if _, err = io.ReadFull(file, chunk[:]); err != nil {
 			return nil, err
 		}
 		length := int64(binary.LittleEndian.Uint32(chunk[4:]))
 		start, _ := file.Seek(0, io.SeekCurrent)
-		if start+length > stat.Size() {
+		if start+length > file.Size() {
 			return nil, fmt.Errorf("truncated WebP chunk")
 		}
 		switch string(chunk[:4]) {

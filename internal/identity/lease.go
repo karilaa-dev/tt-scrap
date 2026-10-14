@@ -43,7 +43,17 @@ func (p *Pool) acquire(ctx context.Context, id string) (*lease, error) {
 	p.workers.Add(1)
 	p.mu.Unlock()
 	acquired := false
+	// reserved is the busy identity this pinned request waits for.
+	var reserved *entry
 	defer func() {
+		if reserved != nil {
+			p.mu.Lock()
+			reserved.waiting--
+			if reserved.waiting == 0 && !reserved.busy {
+				p.wakeLocked()
+			}
+			p.mu.Unlock()
+		}
 		if !acquired {
 			p.workers.Done()
 		}
@@ -53,6 +63,10 @@ func (p *Pool) acquire(ctx context.Context, id string) (*lease, error) {
 			return nil, err
 		}
 		p.mu.Lock()
+		if reserved != nil {
+			reserved.waiting--
+			reserved = nil
+		}
 		if !p.ready || p.closing {
 			p.mu.Unlock()
 			return nil, core.NewError("service_not_configured", "The identity pool is unavailable.", 503)
@@ -71,6 +85,8 @@ func (p *Pool) acquire(ctx context.Context, id string) (*lease, error) {
 			if selected.health.CooldownUntil <= now && selected.proxy.health.CooldownUntil <= now {
 				eligible = true
 				if selected.busy {
+					selected.waiting++
+					reserved = selected
 					selected = nil
 				}
 			} else {
@@ -89,7 +105,7 @@ func (p *Pool) acquire(ctx context.Context, id string) (*lease, error) {
 						continue
 					}
 					eligible = true
-					if e != nil && e.busy {
+					if e != nil && (e.busy || e.waiting > 0) {
 						continue
 					}
 					var assignments int64

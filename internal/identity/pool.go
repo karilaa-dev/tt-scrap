@@ -42,9 +42,12 @@ type entry struct {
 	client                *tiktokapp.Client
 	assignments, revision int64
 	selected              uint64
-	busy, registered      bool
-	signedAt              time.Time
-	health                health
+	// waiting counts operations queued for this identity's own media; new
+	// unpinned work skips the identity so those operations run next.
+	waiting          int
+	busy, registered bool
+	signedAt         time.Time
+	health           health
 }
 type Stats struct {
 	Ready      bool   `json:"ready"`
@@ -81,8 +84,10 @@ type Pool struct {
 	preparationTimeout            time.Duration
 }
 
+var schemaPattern = regexp.MustCompile(`^[a-z_][a-z_0-9]{0,62}$`)
+
 func Open(ctx context.Context, cfg core.Config, addresses []string) (*Pool, error) {
-	if !regexp.MustCompile(`^[a-z_][a-z_0-9]{0,62}$`).MatchString(cfg.DBSchema) {
+	if !schemaPattern.MatchString(cfg.DBSchema) {
 		return nil, core.ConfigError("DB_SCHEMA")
 	}
 	lifetime, stop := context.WithCancel(context.Background())

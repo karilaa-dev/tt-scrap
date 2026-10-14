@@ -51,6 +51,75 @@ func TestAppShortLinkValidatesRedirectBeforeAcceptingID(t *testing.T) {
 	}
 }
 
+func TestTTSiteShareLinkResolvesThroughWWWHost(t *testing.T) {
+	canonical := "https://www.tiktok.com/@user192675581/photo/7685286340551855380?_r=1&_t=ZS-9AWEUykgZfB"
+	for raw, host := range map[string]string{
+		"https://www.tt.site/t/ZSboJ1v8D/":    "www.tt.site",
+		"https://tt.site/t/ZSboJ1v8D/":        "www.tt.site",
+		"https://tt.site:8443/t/ZSboJ1v8D/":   "www.tt.site:8443",
+		"https://tt.site/t/ZSboJ1v8D/?_r=1#x": "www.tt.site",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			var calls atomic.Int32
+			service := resolutionFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.Host != host || r.URL.Path != "/t/ZSboJ1v8D/" {
+					t.Errorf("requested %s%s", r.Host, r.URL.Path)
+				}
+				http.Redirect(w, r, canonical, http.StatusMovedPermanently)
+			})
+			result, err := service.ResolveURL(context.Background(), raw)
+			if err != nil || result.SourceID != "7685286340551855380" || result.SourceURL != raw || result.ResolvedURL != canonical || calls.Load() != 1 {
+				t.Fatalf("resolution = %+v, error = %v, requests = %d", result, err, calls.Load())
+			}
+		})
+	}
+}
+
+func TestShareHostRejectsLookalikesAndNonShareLinksWithoutRequests(t *testing.T) {
+	for _, raw := range []string{
+		"https://www.tt.site.example.com/t/ZSboJ1v8D/",
+		"https://xtt.site/t/ZSboJ1v8D/",
+		"https://m.tt.site/t/ZSboJ1v8D/",
+		"http://www.tt.site/t/ZSboJ1v8D/",
+		"https://user@www.tt.site/t/ZSboJ1v8D/",
+		"https://www.tt.site/video/7685286340551855380",
+		"https://tt.site/@creator/photo/7685286340551855380",
+		"https://www.tt.site/t/ZSboJ1v8D/video/7685286340551855380",
+		"https://tt.site/t/ZSboJ1v8D/photo/7685286340551855380",
+		"https://www.tt.site/t/ZSboJ1v8D%2Fvideo%2F7685286340551855380",
+		"https://www.tt.site/t/",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			var calls atomic.Int32
+			service := resolutionFixture(t, func(http.ResponseWriter, *http.Request) { calls.Add(1) })
+			_, err := service.ResolveURL(context.Background(), raw)
+			var failure *core.Error
+			if !errors.As(err, &failure) || failure.Code != "invalid_link" || calls.Load() != 0 {
+				t.Fatalf("error = %v, requests = %d", err, calls.Load())
+			}
+		})
+	}
+}
+
+func TestShortLinkDoesNotTrustPostIDsInShareHostRedirects(t *testing.T) {
+	for _, target := range []string{
+		"https://www.tt.site/t/ZSboJ1v8D/video/7685286340551855380",
+		"https://tt.site/t/ZSboJ1v8D/photo/7685286340551855380",
+	} {
+		t.Run(target, func(t *testing.T) {
+			var calls atomic.Int32
+			service := resolutionFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				http.Redirect(w, r, target, http.StatusFound)
+			})
+			if result, err := service.ResolveURL(context.Background(), "https://vm.tiktok.com/short"); err == nil || calls.Load() != 1 {
+				t.Fatalf("resolution = %+v, error = %v, requests = %d", result, err, calls.Load())
+			}
+		})
+	}
+}
+
 func TestAppShortLinkFollowsQueryOnlyIDAndRelativeRedirect(t *testing.T) {
 	var calls atomic.Int32
 	service := resolutionFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -160,6 +229,35 @@ func TestAppShortLinkStopsBeforePostPage(t *testing.T) {
 			wantPages := int32(0)
 			if redirects.Load() != 2 || pages.Load() != wantPages {
 				t.Fatalf("redirect requests = %d; post-page requests = %d, want %d", redirects.Load(), pages.Load(), wantPages)
+			}
+		})
+	}
+}
+
+func TestShareLinkStopsAtPagesThatCannotNameAPost(t *testing.T) {
+	for target, id := range map[string]string{
+		"https://www.tiktok.com/?_r=1":                        "",
+		"https://www.tiktok.com/@creator?_t=share":            "",
+		"https://m.tiktok.com/v/1234567890123456789.html?u=1": "1234567890123456789",
+	} {
+		t.Run(target, func(t *testing.T) {
+			var shares, pages atomic.Int32
+			service := resolutionFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/short" {
+					pages.Add(1)
+					w.Write([]byte("large TikTok page"))
+					return
+				}
+				shares.Add(1)
+				http.Redirect(w, r, target, http.StatusFound)
+			})
+			result, err := service.ResolveURL(context.Background(), "https://vm.tiktok.com/short")
+			var failure *core.Error
+			if id == "" && (!errors.As(err, &failure) || failure.Code != "invalid_link") || id != "" && (err != nil || result.SourceID != id || result.ResolvedURL != target) {
+				t.Fatalf("resolution = %+v, error = %v", result, err)
+			}
+			if shares.Load() != 1 || pages.Load() != 0 {
+				t.Fatalf("share requests = %d, page requests = %d", shares.Load(), pages.Load())
 			}
 		})
 	}
