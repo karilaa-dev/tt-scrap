@@ -109,7 +109,7 @@ func BenchmarkAppExtraction(b *testing.B) {
 							}
 							id := strconv.FormatInt(7600000000000000000+i, 10)
 							post, err := service.ExtractURL(context.Background(), "https://www.tiktok.com/@fixture/video/"+id, true)
-							if err != nil || post.Width == nil || *post.Width != 1080 || post.Height == nil || *post.Height != 1920 {
+							if err != nil || post.Width == nil || *post.Width != 2160 || post.Height == nil || *post.Height != 3840 {
 								failures.Add(1)
 								b.Errorf("extraction failed: %v", err)
 							}
@@ -118,7 +118,7 @@ func BenchmarkAppExtraction(b *testing.B) {
 				}
 				wg.Wait()
 				b.StopTimer()
-				if failures.Load() != 0 || details.Load() != int64(b.N) || probes.Load() != int64(b.N)*3 {
+				if failures.Load() != 0 || details.Load() != int64(b.N) || probes.Load() != 0 {
 					b.Fatalf("work mismatch details=%d probes=%d errors=%d", details.Load(), probes.Load(), failures.Load())
 				}
 				after := p.Stats()

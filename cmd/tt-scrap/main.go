@@ -85,10 +85,13 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	shutdownSignal, stopSignal := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignal()
 	lifetime, cancelLifetime := context.WithCancel(context.Background())
 	defer cancelLifetime()
 	var pool *identity.Pool
 	var backend core.AppBackend
+	var identities core.IdentityPreparer
 	ready := func() bool { return true }
 	if config.TikTokMethod == "app" {
 		pool, err = identity.Open(lifetime, config, proxies)
@@ -96,7 +99,17 @@ func run(logger *slog.Logger) error {
 			return err
 		}
 		defer pool.Close()
+		logger.Info("preparing identities before API startup", "status", pool.PreparationStatus())
+		if err = pool.Prepare(shutdownSignal); err != nil {
+			if shutdownSignal.Err() != nil {
+				return nil
+			}
+			logger.Error("identity preparation incomplete", "status", pool.PreparationStatus())
+			return err
+		}
+		logger.Info("identities prepared", "status", pool.PreparationStatus())
 		backend = pool
+		identities = pool
 		ready = pool.Ready
 		proxies = pool.ProxyAddresses()
 	}
@@ -107,7 +120,7 @@ func run(logger *slog.Logger) error {
 	defer instagram.Close()
 	downloader := platform.NewDownloader(config, backend, proxies)
 	defer downloader.Close()
-	handler := httpapi.NewHandler(httpapi.Dependencies{Config: config, Assets: assets, TikTok: tiktok, Instagram: instagram, Downloader: downloader, IsReady: ready, OpenAPI: ttscrap.OpenAPI, OnRequest: func(event httpapi.RequestEvent) {
+	handler := httpapi.NewHandler(httpapi.Dependencies{Config: config, Assets: assets, TikTok: tiktok, Instagram: instagram, Downloader: downloader, Identities: identities, IsReady: ready, OpenAPI: ttscrap.OpenAPI, OnRequest: func(event httpapi.RequestEvent) {
 		logLevel := slog.LevelInfo
 		if strings.HasPrefix(event.Path, "/health/") {
 			logLevel = slog.LevelDebug
@@ -122,9 +135,6 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	stopped := make(chan os.Signal, 1)
-	signal.Notify(stopped, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(stopped)
 	failures := make(chan error, 1)
 	go func() { failures <- server.Serve(listener) }()
 	logger.Info("service started", "address", listener.Addr().String(), "tiktok_method", config.TikTokMethod, "proxies", len(proxies))
@@ -137,7 +147,7 @@ func run(logger *slog.Logger) error {
 			return err
 		}
 		return nil
-	case <-stopped:
+	case <-shutdownSignal.Done():
 	}
 	logger.Info("service stopping")
 	shutdown, cancel := context.WithTimeout(context.Background(), 30*time.Second)

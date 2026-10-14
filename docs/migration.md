@@ -1,6 +1,6 @@
 # Migrate to the Go service
 
-The Go service replaces the Python server and its app worker with one binary. Both TikTok methods and Instagram remain available. Routes, authentication, error envelopes, and the embedded OpenAPI document retain the existing contract.
+The Go service replaces the Python server and its app worker with one binary. Both TikTok methods and Instagram remain available. Existing routes, authentication, and error envelopes retain their contracts. The embedded OpenAPI document adds GET/POST identity preparation at `/v1/tiktok/identities/preparations`.
 
 ## Prepare the deployment
 
@@ -11,6 +11,8 @@ Review `.env` against [`.env.example`](../.env.example). Existing environment va
 Set `TIKTOK_METHOD=web` to retain web extraction without PostgreSQL. The default is `app`, which requires `DB_URL` and creates only `scrap_proxies` and `scrap_identities` in `DB_SCHEMA` (default `public`). The schema must already exist. The database role needs permission to create, alter, and update those tables. Existing compatible app identities are loaded from the database.
 
 For a new app database, import proxy addresses through `PROXY_FILE`, or set `PROXY_INCLUDE_HOST=true` to use the host directly. Saved database proxies do not require a proxy file. With Docker Compose, use `compose.proxies.yml` alongside `docker-compose.yml` to mount `proxies.txt`. The base Compose file requires only `.env` and a reachable database for app mode.
+
+App startup prepares all ten identities per proxy before opening the HTTP listener, including refreshing expired signing seeds. Allow roughly 90 seconds plus upstream time for a fresh pool with healthy proxies; proxy workers run in parallel. Retries can extend this. Startup exits if any slot remains unprepared after three attempts, retaining saved progress for the next start. Configure deployment startup deadlines accordingly; the Docker image allows a five-minute initial health-check grace period.
 
 ## Replace the running process
 

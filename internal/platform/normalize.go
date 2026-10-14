@@ -12,6 +12,9 @@ import (
 func token() string { return core.NewID() }
 
 func (t *TikTok) normalize(ctx context.Context, data object, base core.AssetContext, resolved core.TikTokResolution, app bool) (core.TikTokExtraction, error) {
+	if err := ctx.Err(); err != nil {
+		return core.TikTokExtraction{}, err
+	}
 	id := resolved.SourceID
 	extraction := token()
 	expiresAt := time.Now().UTC().Add(t.cfg.CacheTTL)
@@ -61,16 +64,6 @@ func (t *TikTok) normalize(ctx context.Context, data object, base core.AssetCont
 		return core.TikTokExtraction{}, core.NewError("content_too_long", "TikTok video exceeds MAX_VIDEO_DURATION", 413)
 	}
 	selected := selectVideo(video, app)
-	if app {
-		var err error
-		selected, err = t.selectApp(ctx, video, base)
-		if err != nil {
-			return core.TikTokExtraction{}, err
-		}
-		if err := ctx.Err(); err != nil {
-			return core.TikTokExtraction{}, err
-		}
-	}
 	if selected == nil {
 		return core.TikTokExtraction{}, core.Upstream("TikTok response has no video asset")
 	}
@@ -86,10 +79,6 @@ func (t *TikTok) normalize(ctx context.Context, data object, base core.AssetCont
 	asset.AlternateURLs = selected.URLs[1:]
 	asset.ContentType = "video/mp4"
 	asset.DurationSeconds = duration
-	if app && selected.measured {
-		asset.ExpectedWidth = selected.Width
-		asset.ExpectedHeight = selected.Height
-	}
 	if len(selected.AudioURLs) > 0 {
 		asset.Audio = &core.AuxiliaryAsset{UpstreamURL: selected.AudioURLs[0], AlternateURLs: selected.AudioURLs[1:], ContentType: "audio/mp4", Cookies: base.Cookies}
 	}

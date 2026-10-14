@@ -224,7 +224,7 @@ func TestRequestBodyLimit(t *testing.T) {
 	}
 }
 
-func TestAPIUsesOriginalOpenAPIContract(t *testing.T) {
+func TestAPIServesOpenAPIWithIdentityPreparation(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "openapi.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -241,8 +241,8 @@ func TestAPIUsesOriginalOpenAPIContract(t *testing.T) {
 	if err = json.Unmarshal(data, &schema); err != nil {
 		t.Fatal(err)
 	}
-	if len(schema.Paths) != 9 {
-		t.Fatalf("want 9 paths, got %d", len(schema.Paths))
+	if len(schema.Paths) != 10 {
+		t.Fatalf("want 10 paths, got %d", len(schema.Paths))
 	}
 }
 

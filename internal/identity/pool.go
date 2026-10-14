@@ -32,6 +32,7 @@ type proxyState struct {
 	healthVersion, savedHealthVersion uint64
 	transport                         *http.Transport
 	client                            *http.Client
+	preparationPace                   preparationPacer
 }
 type entry struct {
 	id                    string
@@ -42,6 +43,7 @@ type entry struct {
 	assignments, revision int64
 	selected              uint64
 	busy, registered      bool
+	signedAt              time.Time
 	health                health
 }
 type Stats struct {
@@ -73,6 +75,9 @@ type Pool struct {
 	clientFactory                 func(*tiktokapp.Session, *http.Client) *tiktokapp.Client
 	closeOnce                     sync.Once
 	closeErr                      error
+	preparation                   *preparationRun
+	preparationDelay              time.Duration
+	preparationTimeout            time.Duration
 }
 
 func Open(ctx context.Context, cfg core.Config, addresses []string) (*Pool, error) {
@@ -81,6 +86,7 @@ func Open(ctx context.Context, cfg core.Config, addresses []string) (*Pool, erro
 	}
 	lifetime, stop := context.WithCancel(context.Background())
 	p := &Pool{entries: map[string]*entry{}, notify: make(chan struct{}), lifetime: lifetime, stop: stop, queueLimit: cfg.MaxQueuedRequests,
+		preparationDelay: preparationInterval, preparationTimeout: cfg.UpstreamTimeout,
 		proxiesTable: fmt.Sprintf(`"%s".scrap_proxies`, cfg.DBSchema), identitiesTable: fmt.Sprintf(`"%s".scrap_identities`, cfg.DBSchema),
 		clientFactory: func(s *tiktokapp.Session, c *http.Client) *tiktokapp.Client { return tiktokapp.NewClient(s, c) }}
 	if p.queueLimit < 1 {
@@ -236,6 +242,9 @@ func (p *Pool) initialize(ctx context.Context, cfg core.Config, addresses []stri
 			return errors.New("stored identity health is invalid")
 		}
 		state.registered = state.session.Identity.Kind == "registered"
+		if state.session.SDK != nil {
+			state.signedAt = state.session.SDK.FetchedAt
+		}
 		state.proxy.slots[state.ordinal] = state
 		p.entries[state.id] = state
 	}

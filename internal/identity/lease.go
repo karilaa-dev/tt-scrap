@@ -161,6 +161,10 @@ func (l *lease) finish(operationErr error) error {
 			l.cancel()
 			p.mu.Lock()
 			e.registered = e.session.Identity.Kind == "registered"
+			e.signedAt = time.Time{}
+			if e.session.SDK != nil {
+				e.signedAt = e.session.SDK.FetchedAt
+			}
 			e.busy = false
 			p.wakeLocked()
 			p.mu.Unlock()
@@ -308,8 +312,10 @@ func (l *lease) recover(err error) bool {
 	if session != nil {
 		e.session = session
 		e.client = nil
+		e.registered = false
 	} else {
 		e.session.SDK = nil
 	}
+	e.signedAt = time.Time{}
 	return true
 }

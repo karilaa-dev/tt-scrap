@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +38,7 @@ type Dependencies struct {
 	OpenAPI    []byte
 	HTTPClient core.HTTPDoer
 	OnRequest  func(RequestEvent)
+	Identities core.IdentityPreparer
 }
 type handler struct {
 	dependencies Dependencies
@@ -140,7 +142,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-var routes = map[string]string{"/health/live": "GET", "/health/ready": "GET", "/v1/tiktok/resolutions": "POST", "/v1/tiktok/extractions": "POST", "/v1/tiktok/music": "POST", "/v1/tiktok/telegram-deliveries": "POST", "/v1/instagram/extractions": "POST", "/v1/instagram/telegram-deliveries": "POST"}
+const preparationPath = "/v1/tiktok/identities/preparations"
+
+var routes = map[string]string{"/health/live": "GET", "/health/ready": "GET", "/v1/tiktok/resolutions": "POST", "/v1/tiktok/extractions": "POST", "/v1/tiktok/music": "POST", "/v1/tiktok/telegram-deliveries": "POST", "/v1/instagram/extractions": "POST", "/v1/instagram/telegram-deliveries": "POST", preparationPath: "GET, POST"}
 
 func assetToken(path string) (string, bool) {
 	token, ok := strings.CutPrefix(path, "/v1/assets/")
@@ -183,7 +187,7 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) (response, error
 		}
 		return jsonResponse(404, fields{"detail": "Not Found"})
 	}
-	if r.Method != method {
+	if !slices.Contains(strings.Split(method, ", "), r.Method) {
 		result, err := jsonResponse(405, fields{"detail": "Method Not Allowed"})
 		result.headers.Set("Allow", method)
 		return result, err
@@ -202,7 +206,7 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) (response, error
 	}
 	var body fields
 	var err error
-	if method == "POST" {
+	if r.Method == "POST" && (path != preparationPath || r.ContentLength != 0) {
 		body, err = readBody(w, r)
 		if err != nil {
 			return response{}, err
@@ -235,6 +239,25 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) (response, error
 		return response{status: 200, file: file, cleanup: asset.Cleanup, headers: http.Header{"Content-Type": []string{asset.ContentType}, "Content-Length": []string{strconv.FormatInt(asset.Size, 10)}, "Content-Disposition": []string{`attachment; filename="` + filename + `"`}, "Etag": []string{`"` + asset.SHA256 + `"`}, "X-Content-Sha256": []string{asset.SHA256}, "Cache-Control": []string{"private, no-store"}}}, nil
 	}
 	switch path {
+	case preparationPath:
+		if len(body) != 0 {
+			return response{}, invalidRequest()
+		}
+		if d.Identities == nil {
+			return response{}, core.NewError("service_not_configured", "Identity preparation requires TikTok app mode", 503)
+		}
+		if r.Method == "GET" {
+			return jsonResponse(200, d.Identities.PreparationStatus())
+		}
+		status, err := d.Identities.StartPreparation()
+		if err != nil {
+			return response{}, err
+		}
+		code := http.StatusAccepted
+		if status.State == "completed" {
+			code = http.StatusOK
+		}
+		return jsonResponse(code, status)
 	case "/v1/tiktok/resolutions":
 		value, err := httpURL(body["url"])
 		if err != nil {

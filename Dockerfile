@@ -19,6 +19,6 @@ WORKDIR /app
 COPY --from=build /out/tt-scrap /usr/local/bin/tt-scrap
 USER scrap
 EXPOSE 8000
-HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5m --retries=3 \
     CMD ["tt-scrap", "healthcheck"]
 ENTRYPOINT ["tt-scrap"]

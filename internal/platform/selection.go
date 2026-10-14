@@ -15,7 +15,6 @@ type videoSource struct {
 	known            bool
 	quality, bitrate int
 	fps              float64
-	measured         bool
 }
 
 func selectVideo(video object, app bool) *videoSource {

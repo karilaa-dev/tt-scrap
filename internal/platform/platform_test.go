@@ -206,7 +206,7 @@ func (f *fakeApp) OpenMedia(ctx context.Context, id, source string, headers http
 	req.Header = headers
 	return http.DefaultClient.Do(req)
 }
-func TestAppRefreshCoalescingMeasuredQualityAndStickyAssets(t *testing.T) {
+func TestAppMetadataQualityWithoutMediaRequestsAndStickyAssets(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		width, height := 540, 960
 		if r.URL.Path == "/high" {
@@ -245,11 +245,11 @@ func TestAppRefreshCoalescingMeasuredQualityAndStickyAssets(t *testing.T) {
 				t.Error("duplicate extraction")
 			}
 			id = post.ExtractionID
-			if post.Width == nil || *post.Width != 1080 || post.Height == nil || *post.Height != 1920 {
-				t.Error("unverified resolution", post)
+			if post.Width == nil || *post.Width != 2160 || post.Height == nil || *post.Height != 3840 {
+				t.Error("API resolution was not selected", post)
 			}
 			asset, e := assets.GetAsset(post.Media[0].AssetID)
-			if e != nil || asset.IdentityID != "sticky" || !strings.HasSuffix(asset.UpstreamURL, "/high") {
+			if e != nil || asset.IdentityID != "sticky" || !strings.HasSuffix(asset.UpstreamURL, "/low") {
 				t.Error(asset, e)
 			}
 		}
@@ -262,8 +262,8 @@ func TestAppRefreshCoalescingMeasuredQualityAndStickyAssets(t *testing.T) {
 	if backend.calls.Load() != 2 {
 		t.Fatal(backend.calls.Load())
 	}
-	if backend.mediaCalls.Load() != 2 {
-		t.Fatal("media probe cache missed", backend.mediaCalls.Load())
+	if backend.mediaCalls.Load() != 0 {
+		t.Fatal("extraction contacted CDN instead of using API metadata", backend.mediaCalls.Load())
 	}
 }
 func TestAppSlidesAndMusicReuseExtraction(t *testing.T) {
@@ -435,7 +435,7 @@ func (f *closeFailureBackend) OpenMedia(context.Context, string, string, http.He
 	data := testVideo(1080, 1920)
 	return &http.Response{StatusCode: 200, ContentLength: int64(len(data)), Header: make(http.Header), Body: closeFailureBody{bytes.NewReader(data)}}, nil
 }
-func TestIdentitySaveFailureRejectsDownloadedMediaAndProbe(t *testing.T) {
+func TestIdentitySaveFailureRejectsDownloadedMedia(t *testing.T) {
 	backend := &closeFailureBackend{fakeApp: fakeApp{server: "https://unused.example"}}
 	cfg := testConfig()
 	cfg.TempDir = t.TempDir()
@@ -445,12 +445,6 @@ func TestIdentitySaveFailureRejectsDownloadedMediaAndProbe(t *testing.T) {
 	var api *core.Error
 	if !errors.As(e, &api) || api.Code != "service_not_configured" {
 		t.Fatal("download swallowed save failure", e)
-	}
-	service := NewTikTok(cfg, core.NewAssets(time.Minute, 100), backend, nil)
-	defer service.Close()
-	_, e = service.ExtractURL(context.Background(), "https://www.tiktok.com/@creator/video/123", false)
-	if !errors.As(e, &api) || api.Code != "service_not_configured" {
-		t.Fatal("metadata probe swallowed save failure", e)
 	}
 	files, _ := os.ReadDir(cfg.TempDir)
 	if len(files) != 0 {
@@ -481,7 +475,7 @@ func TestOpenMediaOwnershipFailureIsPreservedWithoutRetries(t *testing.T) {
 		t.Fatal(err, backend.mediaCalls.Load())
 	}
 }
-func TestOverlongVideoRejectedBeforeQualityProbes(t *testing.T) {
+func TestOverlongVideoRejectedWithoutMediaRequests(t *testing.T) {
 	backend := &fakeApp{server: "https://unused.example"}
 	cfg := testConfig()
 	cfg.MaxVideoDuration = 1

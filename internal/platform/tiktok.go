@@ -26,7 +26,6 @@ type TikTok struct {
 	music        *memo[core.TikTokMusic]
 	gate         *core.Limiter
 	resolveGate  *core.Limiter
-	probes       *memo[dimensions]
 }
 
 func NewTikTok(cfg core.Config, assets *core.Assets, backend core.AppBackend, proxies []string) *TikTok {
@@ -37,7 +36,7 @@ func NewTikTok(cfg core.Config, assets *core.Assets, backend core.AppBackend, pr
 	if concurrency < 1 {
 		concurrency = 32
 	}
-	return &TikTok{cfg: cfg, assets: assets, app: backend, proxies: proxies, transports: newTransports(cfg.HTTPMaxConnections), resolveCache: newMemo[core.TikTokResolution](cfg.ResolutionTTL, cfg.CacheMaxEntries), posts: newMemo[core.TikTokExtraction](cfg.MetadataTTL, cfg.CacheMaxEntries), extractions: newMemo[core.TikTokExtraction](cfg.MetadataTTL, cfg.CacheMaxEntries), music: newMemo[core.TikTokMusic](cfg.MetadataTTL, cfg.CacheMaxEntries), probes: newMemo[dimensions](cfg.CacheTTL, cfg.CacheMaxEntries), gate: core.NewLimiter(concurrency, cfg.MaxQueuedRequests), resolveGate: core.NewLimiter(cfg.HTTPMaxConnections, cfg.MaxQueuedRequests)}
+	return &TikTok{cfg: cfg, assets: assets, app: backend, proxies: proxies, transports: newTransports(cfg.HTTPMaxConnections), resolveCache: newMemo[core.TikTokResolution](cfg.ResolutionTTL, cfg.CacheMaxEntries), posts: newMemo[core.TikTokExtraction](cfg.MetadataTTL, cfg.CacheMaxEntries), extractions: newMemo[core.TikTokExtraction](cfg.MetadataTTL, cfg.CacheMaxEntries), music: newMemo[core.TikTokMusic](cfg.MetadataTTL, cfg.CacheMaxEntries), gate: core.NewLimiter(concurrency, cfg.MaxQueuedRequests), resolveGate: core.NewLimiter(cfg.HTTPMaxConnections, cfg.MaxQueuedRequests)}
 }
 func (t *TikTok) Close()        { t.transports.close() }
 func (t *TikTok) proxy() string { return t.proxies[(t.next.Add(1)-1)%uint64(len(t.proxies))] }

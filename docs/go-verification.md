@@ -1,5 +1,18 @@
 # Go project verification
 
+
+## Startup preparation and API-based video selection (2026-10-14)
+
+App extraction now selects video quality from API metadata without CDN probes. The focused extraction test failed before the change because it made two media requests and selected the probed rendition; it now passes with zero media requests and the API-ranked rendition. Local downloaded-file validation remains in place.
+
+`make check` passed against an isolated PostgreSQL 18 container, including race tests, vet, module consistency, formatting, and the release build. New tests cover parallel per-proxy preparation, ten-second pacing, shared jobs, restart reuse, seed-only refresh, bounded retry (including waiting before rechecking cooldown), shutdown cancellation, endpoint authentication, and web-mode rejection. The extraction benchmark harness also passed a one-iteration correctness smoke after updating its expected zero-probe behavior; this is not a performance comparison.
+
+A production Docker image built from a clean Git-index export and passed readiness, served OpenAPI, preparation authentication/web-mode rejection, and graceful shutdown checks. All pre-existing OpenAPI paths and component schemas were compared against the previous commit and remain unchanged; GET/POST `/v1/tiktok/identities/preparations` is additive.
+
+On the live development server, port 8000 stayed closed during startup preparation. Ten parallel proxy workers prepared and persisted all 100 identities (10 per proxy), then the API opened. Authenticated GET reported `completed`, `ready=100`, `target=100`, `failed=0`; three simultaneous POSTs returned the same completed job without recreating identities. LAN readiness passed. A public test video also extracted and downloaded successfully through the live app API; the 1,549,289-byte response matched its declared size and SHA-256 header. No Telegram messages were sent.
+
+## Earlier migration verification (2026-10-13)
+
 Verified on 2026-10-13 with Go 1.27.2, CGO, libheif, and FFmpeg. The final repository checks ran from an export of the Git index into a clean directory, without local Python or Node tooling.
 
 | Check | Result |
