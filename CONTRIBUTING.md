@@ -9,9 +9,10 @@ Run the same checks as CI:
 ```sh
 make fmt
 make check
+make lint
 ```
 
-`make check` checks formatting and module files, runs `go vet` and race-enabled tests, and builds `bin/tt-scrap`. `make run` builds and starts the service with your local `.env`. Formatting does not change the embedded `openapi.json`; API changes require an explicit contract update.
+`make check` checks formatting and module files, runs `go vet` and race-enabled tests, and builds `bin/tt-scrap`. `make lint` runs staticcheck and govulncheck at the versions pinned in the `Makefile`; the first run downloads them. `make run` builds and starts the service with your local `.env`. Formatting does not change the embedded `openapi.json`; API changes require an explicit contract update.
 
 Database tests create and remove isolated schemas. Without a database URL, these tests skip. To run the full suite against a disposable PostgreSQL instance:
 
@@ -51,6 +52,6 @@ HTTP tests use local fixtures. Live tests require explicit `TT_SCRAP_LIVE_APP=1`
 make bench
 ```
 
-Signing benchmarks run locally. Extraction benchmarks require the test database URL and use local HTTP fixtures with isolated database schemas. They exercise concurrency 1, 4, and 16. `BenchmarkAppDelivery` also exercises the complete Telegram delivery handler at concurrency 1, 16, and 64, with cached metadata, real PostgreSQL checkpoints, a controlled CDN delay, and local multipart uploads whose bytes are verified. It excludes identity generation and signing. These measurements describe local work and simulated upstream waits, not TikTok capacity. Use repeated trials before reporting changes. Keep registration and seed renewal outside upstream-API measurements.
+Signing, request-routing, and image-orientation benchmarks run locally. Extraction benchmarks require the test database URL and use local HTTP fixtures with isolated database schemas. They exercise concurrency 1, 4, and 16. `BenchmarkAppDelivery` also exercises the complete Telegram delivery handler at concurrency 1, 16, and 64, with cached metadata, real PostgreSQL checkpoints, a controlled CDN delay, and local multipart uploads whose bytes are verified. It excludes identity generation and signing. These measurements describe local work and simulated upstream waits, not TikTok capacity. Use repeated trials before reporting changes. Keep registration and seed renewal outside upstream-API measurements.
 
 Write benchmark output outside the repository, for example `/tmp/tt-scrap-bench.txt`.
