@@ -100,6 +100,8 @@ For Dokploy with Railpack 0.15.4, `buildAptPackages` must contain only package n
 
 The build uses structured `cmd` entries because Railpack 0.15.4 wraps string commands in single quotes without escaping embedded quotes. That breaks the linker flags and can report a successful build without producing `out`. The final build command checks that `out` is executable before creating the runtime image.
 
+Railpack's build inputs explicitly include the Go sources and embedded OpenAPI files. Railpack 0.15.4 splits `.dockerignore` negations from exclusions, so the Docker allowlist's `**` exclusion otherwise removes nested sources such as `cmd/tt-scrap`. CI builds the Railpack image and checks its startup command as well as the Dockerfile image.
+
 ## Migrate from the Python release
 
 Read the [migration notes](docs/migration.md) before replacing an existing deployment. They cover the app default, PostgreSQL ownership, retained configuration names, and rollback.

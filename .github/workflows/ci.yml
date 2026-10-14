@@ -46,3 +46,31 @@ jobs:
           context: .
           push: false
           tags: tt-scrap:test
+  railpack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: docker/setup-buildx-action@v4.4.1
+      - name: Install Railpack 0.15.4
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/railwayapp/railpack/releases/download/v0.15.4/railpack-v0.15.4-x86_64-unknown-linux-musl.tar.gz \
+            --output railpack.tar.gz
+          echo '459d86f5a9d8698bee8c7be4f224a305f51158fe5f44eb528255dfd568e4eaf1  railpack.tar.gz' | sha256sum --check
+          tar -xzf railpack.tar.gz railpack
+      - name: Build with the Dokploy Railpack frontend
+        run: |
+          "$RUNNER_TEMP/railpack" prepare . --plan-out "$RUNNER_TEMP/railpack-plan.json"
+          docker buildx build --progress=plain \
+            --build-arg BUILDKIT_SYNTAX=ghcr.io/railwayapp/railpack-frontend:v0.15.4 \
+            --file "$RUNNER_TEMP/railpack-plan.json" \
+            --load --tag tt-scrap:railpack .
+      - name: Verify the image startup reaches application validation
+        run: |
+          status=0
+          output=$(docker run --rm --network none --env TT_SCRAP_API_KEY= tt-scrap:railpack 2>&1) || status=$?
+          printf '%s\n' "$output"
+          test "$status" -eq 1
+          [[ "$output" == *'"error":"invalid configuration: TT_SCRAP_API_KEY"'* ]]
