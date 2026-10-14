@@ -27,7 +27,7 @@ TikTok reads saved proxies from PostgreSQL. `PROXY_FILE` optionally bootstraps a
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| POST | `/v1/tiktok/resolutions` | Resolve a TikTok share URL |
+| POST | `/v1/tiktok/resolutions` | Resolve a TikTok or `tt.site` share URL |
 | POST | `/v1/tiktok/extractions` | Extract TikTok video or slideshow metadata |
 | POST | `/v1/tiktok/music` | Extract music using a numeric video ID |
 | POST | `/v1/tiktok/telegram-deliveries` | Prepare and send TikTok media to Telegram |

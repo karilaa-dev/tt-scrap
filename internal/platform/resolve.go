@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -14,13 +15,33 @@ import (
 
 var postIDPattern = regexp.MustCompile(`/(?:video|photo)/(\d+)`)
 
+func normalizedHost(u *url.URL) string {
+	return strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+}
+
+// tt.site is TikTok's share-link domain; its links redirect to tiktok.com.
+func shareHost(host string) bool { return host == "tt.site" || host == "www.tt.site" }
+
 func validTikTokURL(raw string) bool {
 	u, e := url.Parse(raw)
 	if e != nil {
 		return false
 	}
-	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
-	return u.Scheme == "https" && (host == "tiktok.com" || strings.HasSuffix(host, ".tiktok.com")) && u.User == nil
+	host := normalizedHost(u)
+	return u.Scheme == "https" && (host == "tiktok.com" || strings.HasSuffix(host, ".tiktok.com") || shareHost(host)) && u.User == nil
+}
+
+// Share links are served from www.tt.site; the apex host fails TLS handshakes.
+func shareRequestURL(raw string) string {
+	u, e := url.Parse(raw)
+	if e != nil || normalizedHost(u) != "tt.site" {
+		return raw
+	}
+	u.Host = "www.tt.site"
+	if port := u.Port(); port != "" {
+		u.Host = net.JoinHostPort(u.Host, port)
+	}
+	return u.String()
 }
 func videoID(raw string) string {
 	u, err := url.Parse(raw)
@@ -73,7 +94,7 @@ func (t *TikTok) resolve(ctx context.Context, raw string, refresh bool) (core.Ti
 				}
 				return nil
 			}}
-			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, shareRequestURL(raw), nil)
 			req.Header.Set("User-Agent", browserAgent)
 			res, e := client.Do(req)
 			if e != nil {

@@ -51,6 +51,46 @@ func TestAppShortLinkValidatesRedirectBeforeAcceptingID(t *testing.T) {
 	}
 }
 
+func TestTTSiteShareLinkResolvesThroughWWWHost(t *testing.T) {
+	canonical := "https://www.tiktok.com/@user192675581/photo/7685286340551855380?_r=1&_t=ZS-9AWEUykgZfB"
+	for _, raw := range []string{"https://www.tt.site/t/ZSboJ1v8D/", "https://tt.site/t/ZSboJ1v8D/"} {
+		t.Run(raw, func(t *testing.T) {
+			var calls atomic.Int32
+			service := resolutionFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.Host != "www.tt.site" || r.URL.Path != "/t/ZSboJ1v8D/" {
+					t.Errorf("requested %s%s", r.Host, r.URL.Path)
+				}
+				http.Redirect(w, r, canonical, http.StatusMovedPermanently)
+			})
+			result, err := service.ResolveURL(context.Background(), raw)
+			if err != nil || result.SourceID != "7685286340551855380" || result.SourceURL != raw || result.ResolvedURL != canonical || calls.Load() != 1 {
+				t.Fatalf("resolution = %+v, error = %v, requests = %d", result, err, calls.Load())
+			}
+		})
+	}
+}
+
+func TestShareHostRejectsLookalikesWithoutRequests(t *testing.T) {
+	for _, raw := range []string{
+		"https://www.tt.site.example.com/t/ZSboJ1v8D/",
+		"https://xtt.site/t/ZSboJ1v8D/",
+		"https://m.tt.site/t/ZSboJ1v8D/",
+		"http://www.tt.site/t/ZSboJ1v8D/",
+		"https://user@www.tt.site/t/ZSboJ1v8D/",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			var calls atomic.Int32
+			service := resolutionFixture(t, func(http.ResponseWriter, *http.Request) { calls.Add(1) })
+			_, err := service.ResolveURL(context.Background(), raw)
+			var failure *core.Error
+			if !errors.As(err, &failure) || failure.Code != "invalid_link" || calls.Load() != 0 {
+				t.Fatalf("error = %v, requests = %d", err, calls.Load())
+			}
+		})
+	}
+}
+
 func TestAppShortLinkFollowsQueryOnlyIDAndRelativeRedirect(t *testing.T) {
 	var calls atomic.Int32
 	service := resolutionFixture(t, func(w http.ResponseWriter, r *http.Request) {
