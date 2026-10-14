@@ -12,7 +12,7 @@ RUN CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o /out/tt-scrap ./cmd/tt-
 
 FROM debian:trixie-slim AS runtime
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates ffmpeg libheif1 libheif-plugin-libde265 libheif-plugin-dav1d \
+    && apt-get install --yes --no-install-recommends ca-certificates libheif1 libheif-plugin-libde265 libheif-plugin-dav1d \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --create-home --shell /usr/sbin/nologin scrap
 WORKDIR /app

@@ -77,7 +77,6 @@ func (p *Pool) Detail(ctx context.Context, id string) (result core.AppDetail, er
 		client.SyncCookies()
 		if err == nil {
 			result.IdentityID = l.entry.id
-			result.ProxyURL = l.entry.proxy.address
 			result.UserAgent = tiktokapp.UserAgent(l.entry.session.Profile)
 			return result, nil
 		}

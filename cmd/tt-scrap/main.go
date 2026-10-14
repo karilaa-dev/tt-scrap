@@ -95,38 +95,29 @@ func run(logger *slog.Logger) error {
 	defer stopSignal()
 	lifetime, cancelLifetime := context.WithCancel(context.Background())
 	defer cancelLifetime()
-	var pool *identity.Pool
-	var backend core.AppBackend
-	var identities core.IdentityPreparer
-	ready := func() bool { return true }
-	if config.TikTokMethod == "app" {
-		pool, err = identity.Open(lifetime, config, proxies)
-		if err != nil {
-			return err
-		}
-		defer pool.Close()
-		logger.Info("preparing identities before API startup", "status", pool.PreparationStatus())
-		if err = pool.Prepare(shutdownSignal); err != nil {
-			if shutdownSignal.Err() != nil {
-				return nil
-			}
-			logger.Error("identity preparation incomplete", "status", pool.PreparationStatus())
-			return err
-		}
-		logger.Info("identities prepared", "status", pool.PreparationStatus())
-		backend = pool
-		identities = pool
-		ready = pool.Ready
-		proxies = pool.ProxyAddresses()
+	pool, err := identity.Open(lifetime, config, proxies)
+	if err != nil {
+		return err
 	}
+	defer pool.Close()
+	logger.Info("preparing identities before API startup", "status", pool.PreparationStatus())
+	if err = pool.Prepare(shutdownSignal); err != nil {
+		if shutdownSignal.Err() != nil {
+			return nil
+		}
+		logger.Error("identity preparation incomplete", "status", pool.PreparationStatus())
+		return err
+	}
+	logger.Info("identities prepared", "status", pool.PreparationStatus())
+	proxies = pool.ProxyAddresses()
 	assets := core.NewAssets(config.CacheTTL, config.CacheMaxEntries)
-	tiktok := platform.NewTikTok(config, assets, backend, proxies)
+	tiktok := platform.NewTikTok(config, assets, pool, proxies)
 	defer tiktok.Close()
 	instagram := platform.NewInstagram(config, assets)
 	defer instagram.Close()
-	downloader := platform.NewDownloader(config, backend, proxies)
+	downloader := platform.NewDownloader(config, pool)
 	defer downloader.Close()
-	handler := httpapi.NewHandler(httpapi.Dependencies{Config: config, Assets: assets, TikTok: tiktok, Instagram: instagram, Downloader: downloader, Identities: identities, IsReady: ready, OpenAPI: ttscrap.OpenAPI, OnRequest: func(event httpapi.RequestEvent) {
+	handler := httpapi.NewHandler(httpapi.Dependencies{Config: config, Assets: assets, TikTok: tiktok, Instagram: instagram, Downloader: downloader, Identities: pool, IsReady: pool.Ready, OpenAPI: ttscrap.OpenAPI, OnRequest: func(event httpapi.RequestEvent) {
 		logRequest(logger, event)
 	}})
 	server := &http.Server{Addr: net.JoinHostPort(config.Host, strconv.Itoa(config.Port)), Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 32 * 1024, BaseContext: func(net.Listener) context.Context { return lifetime }}
@@ -136,10 +127,8 @@ func run(logger *slog.Logger) error {
 	}
 	failures := make(chan error, 1)
 	go func() { failures <- server.Serve(listener) }()
-	logger.Info("service started", "address", listener.Addr().String(), "tiktok_method", config.TikTokMethod, "proxies", len(proxies))
-	if pool != nil {
-		logger.Info("identity pool loaded", "stats", pool.Stats())
-	}
+	logger.Info("service started", "address", listener.Addr().String(), "proxies", len(proxies))
+	logger.Info("identity pool loaded", "stats", pool.Stats())
 	select {
 	case err = <-failures:
 		if !errors.Is(err, http.ErrServerClosed) {

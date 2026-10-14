@@ -9,9 +9,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"os"
-	"os/exec"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/karilaa-dev/tt-scrap/internal/core"
@@ -19,18 +17,17 @@ import (
 )
 
 type Downloader struct {
-	cfg        core.Config
-	app        core.AppBackend
-	proxies    []string
-	transports *transports
-	gate       *core.Limiter
-	buffers    sync.Pool
+	cfg     core.Config
+	app     core.AppBackend
+	client  *http.Client
+	gate    *core.Limiter
+	buffers sync.Pool
 }
 
-func NewDownloader(cfg core.Config, backend core.AppBackend, proxies []string) *Downloader {
-	return &Downloader{cfg: cfg, app: backend, proxies: append([]string(nil), proxies...), transports: newTransports(cfg.HTTPMaxConnections), gate: core.NewLimiter(cfg.DownloadConcurrency, cfg.MaxQueuedRequests), buffers: sync.Pool{New: func() any { return make([]byte, 128<<10) }}}
+func NewDownloader(cfg core.Config, backend core.AppBackend) *Downloader {
+	return &Downloader{cfg: cfg, app: backend, client: &http.Client{Transport: newTransport(cfg.HTTPMaxConnections)}, gate: core.NewLimiter(cfg.DownloadConcurrency, cfg.MaxQueuedRequests), buffers: sync.Pool{New: func() any { return make([]byte, 128<<10) }}}
 }
-func (d *Downloader) Close() { d.transports.close() }
+func (d *Downloader) Close() { d.client.CloseIdleConnections() }
 func (d *Downloader) WithIdentity(ctx context.Context, id string, run func(core.DownloadFunc) error) error {
 	if id == "" {
 		return run(d.Download)
@@ -60,171 +57,48 @@ func (d *Downloader) downloadAsset(ctx context.Context, asset core.AssetContext,
 	if d.cfg.MaxAssetBytes > 0 && (maxBytes <= 0 || d.cfg.MaxAssetBytes < maxBytes) {
 		maxBytes = d.cfg.MaxAssetBytes
 	}
-	var video, audio *core.Downloaded
+	var downloaded *core.Downloaded
 	transfer := func(open core.OpenAppMedia) error {
-		// Acquire the identity first so its waiters cannot exhaust transfer capacity.
+		// Identity waits must not occupy transfer slots or the download budget.
 		release, err := d.gate.Acquire(ctx)
 		if err != nil {
 			return err
 		}
-		// Queue time is outside the transfer budget; caller cancellation still applies.
+		defer release()
 		if cancel == nil {
 			ctx, cancel = context.WithTimeout(ctx, d.cfg.DownloadTimeout)
 		}
-		video.Cleanup()
-		audio.Cleanup()
-		video, audio = nil, nil
-		var budget *downloadBudget
-		if maxBytes > 0 {
-			budget = &downloadBudget{}
-			budget.remaining.Store(maxBytes)
-		}
-		if asset.Audio == nil {
-			defer release()
-			var err error
-			video, err = d.download(ctx, asset, maxBytes, budget, open)
-			return err
-		}
-		audioAsset := asset
-		audioAsset.Kind = "audio"
-		audioAsset.Filename = "audio.m4a"
-		audioAsset.ContentType = asset.Audio.ContentType
-		audioAsset.UpstreamURL = asset.Audio.UpstreamURL
-		audioAsset.AlternateURLs = asset.Audio.AlternateURLs
-		audioAsset.Cookies = asset.Audio.Cookies
-		audioAsset.Audio = nil
-		audioAsset.ExpectedWidth = 0
-		audioAsset.ExpectedHeight = 0
-		tracks, cancelTracks := context.WithCancel(ctx)
-		defer cancelTracks()
-		type result struct {
-			index int
-			file  *core.Downloaded
-			err   error
-		}
-		results := make(chan result, 2)
-		for i, track := range []core.AssetContext{asset, audioAsset} {
-			go func() {
-				// The first permit belongs to the video worker, never the parent.
-				// Audio queues independently, so a limit of one cannot deadlock.
-				trackRelease := release
-				if i != 0 {
-					var err error
-					trackRelease, err = d.gate.Acquire(tracks)
-					if err != nil {
-						results <- result{index: i, err: err}
-						cancelTracks()
-						return
-					}
-				}
-				file, err := d.download(tracks, track, maxBytes, budget, open)
-				trackRelease()
-				results <- result{i, file, err}
-				if err != nil {
-					cancelTracks()
-				}
-			}()
-		}
-		var failure error
-		for range 2 {
-			r := <-results
-			if r.index == 0 {
-				video = r.file
-			} else {
-				audio = r.file
-			}
-			if failure == nil {
-				failure = r.err
-			}
-		}
-		return failure
+		// Identity recovery can rerun the transfer before returning to the caller.
+		downloaded.Cleanup()
+		downloaded, err = d.download(ctx, asset, maxBytes, open)
+		return err
 	}
-	var e error
+	var err error
 	if open != nil {
-		e = transfer(open)
+		err = transfer(open)
 	} else if asset.IdentityID != "" {
 		if d.app == nil {
 			return nil, core.Upstream("TikTok app backend is unavailable")
 		}
-		e = d.app.WithMedia(ctx, asset.IdentityID, transfer)
+		err = d.app.WithMedia(ctx, asset.IdentityID, transfer)
 	} else {
-		e = transfer(nil)
+		err = transfer(nil)
 	}
-	if e != nil {
-		video.Cleanup()
-		audio.Cleanup()
-		return nil, e
+	if err != nil {
+		downloaded.Cleanup()
+		return nil, err
 	}
-	if asset.Audio == nil {
-		return video, nil
-	}
-	defer video.Cleanup()
-	defer audio.Cleanup()
-	release, e := d.gate.Acquire(ctx)
-	if e != nil {
-		return nil, e
-	}
-	defer release()
-	output, e := os.CreateTemp(d.cfg.TempDir, "tt-scrap-mux-*.mp4")
-	if e != nil {
-		return nil, e
-	}
-	path := output.Name()
-	output.Close()
-	ok := false
-	defer func() {
-		if !ok {
-			os.Remove(path)
-		}
-	}()
-	args := []string{"-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", video.Path, "-i", audio.Path, "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-shortest", "-movflags", "+faststart"}
-	args = append(args, path)
-	command := exec.CommandContext(ctx, "ffmpeg", args...)
-	if e = command.Run(); e != nil {
-		return nil, core.NewError("upstream_network_error", "Video and audio could not be combined", 502)
-	}
-	file, e := os.Open(path)
-	if e != nil {
-		return nil, e
-	}
-	defer file.Close()
-	info, e := file.Stat()
-	if e != nil {
-		return nil, e
-	}
-	if maxBytes > 0 && info.Size() > maxBytes {
-		return nil, tooLarge()
-	}
-	digest := sha256.New()
-	if _, e = io.Copy(digest, file); e != nil {
-		return nil, e
-	}
-	w, h, e := mediaDimensions(file)
-	if e != nil {
-		return nil, e
-	}
-	ok = true
-	return &core.Downloaded{Path: path, Filename: asset.Filename, ContentType: "video/mp4", Size: info.Size(), SHA256: hex.EncodeToString(digest.Sum(nil)), Width: w, Height: h, Remove: func() { os.Remove(path) }}, nil
+	return downloaded, nil
 }
-func (d *Downloader) download(ctx context.Context, asset core.AssetContext, maximum int64, budget *downloadBudget, open core.OpenAppMedia) (*core.Downloaded, error) {
+
+func (d *Downloader) download(ctx context.Context, asset core.AssetContext, maximum int64, open core.OpenAppMedia) (*core.Downloaded, error) {
 	sources := append([]string{asset.UpstreamURL}, asset.AlternateURLs...)
 	var last error
 	for attempt := 0; attempt < max(len(sources), d.cfg.DownloadRetries); attempt++ {
 		if e := ctx.Err(); e != nil {
 			return nil, networkError(ctx, e)
 		}
-		current := asset
-		if asset.Platform == "tiktok" && asset.IdentityID == "" && !d.cfg.ProxyDataOnly && attempt > 0 && len(d.proxies) > 0 {
-			start := -1
-			for i, proxy := range d.proxies {
-				if proxy == asset.ProxyURL {
-					start = i
-					break
-				}
-			}
-			current.ProxyURL = d.proxies[(start+attempt)%len(d.proxies)]
-		}
-		result, e := d.downloadOnce(ctx, current, sources[attempt%len(sources)], maximum, budget, open)
+		result, e := d.downloadOnce(ctx, asset, sources[attempt%len(sources)], maximum, open)
 		if e == nil {
 			return result, nil
 		}
@@ -261,26 +135,14 @@ func (d *Downloader) open(ctx context.Context, asset core.AssetContext, source s
 	if asset.IdentityID != "" {
 		return appOpen(ctx, source, headers)
 	}
-	proxy := asset.ProxyURL
-	if asset.Platform == "tiktok" && d.cfg.ProxyDataOnly {
-		proxy = ""
-	}
-	transport, e := d.transports.get(proxy)
-	if e != nil {
-		return nil, e
-	}
-	client := &http.Client{Transport: transport, Jar: asset.CookieJar}
 	req, e := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
 	if e != nil {
 		return nil, core.NewError("upstream_network_error", "Media URL is invalid", 502)
 	}
 	req.Header = headers
-	for name, value := range asset.Cookies {
-		req.AddCookie(&http.Cookie{Name: name, Value: value})
-	}
-	return client.Do(req)
+	return d.client.Do(req)
 }
-func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, source string, maximum int64, budget *downloadBudget, open core.OpenAppMedia) (*core.Downloaded, error) {
+func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, source string, maximum int64, open core.OpenAppMedia) (*core.Downloaded, error) {
 	res, e := d.open(ctx, asset, source, open)
 	if e != nil {
 		return nil, networkError(ctx, e)
@@ -298,12 +160,10 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 	}
 	path := file.Name()
 	good := false
-	var reserved int64
 	defer func() {
 		file.Close()
 		if !good {
 			os.Remove(path)
-			budget.refund(reserved)
 		}
 	}()
 	digest := sha256.New()
@@ -314,10 +174,9 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 	for {
 		n, readErr := res.Body.Read(buffer)
 		if n > 0 {
-			if !budget.take(int64(n)) {
+			if maximum > 0 && int64(n) > maximum-received {
 				return nil, tooLarge()
 			}
-			reserved += int64(n)
 			if len(prefix) < 512 {
 				prefix = append(prefix, buffer[:min(n, 512-len(prefix))]...)
 			}
@@ -385,24 +244,4 @@ func detectedFilename(name, mime string) string { return media.FilenameForType(n
 
 func tooLarge() error {
 	return core.NewError("asset_too_large", "Media exceeds the configured download limit", 413)
-}
-
-// Tracks share a byte budget. Failed attempts return their reservation after cleanup.
-type downloadBudget struct{ remaining atomic.Int64 }
-
-func (b *downloadBudget) take(n int64) bool {
-	if b == nil {
-		return true
-	}
-	for left := b.remaining.Load(); left >= n; left = b.remaining.Load() {
-		if b.remaining.CompareAndSwap(left, left-n) {
-			return true
-		}
-	}
-	return false
-}
-func (b *downloadBudget) refund(n int64) {
-	if b != nil {
-		b.remaining.Add(n)
-	}
 }

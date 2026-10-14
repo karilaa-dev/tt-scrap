@@ -23,7 +23,7 @@ func (p *fakePreparer) StartPreparation() (core.IdentityPreparation, error) {
 }
 func (p *fakePreparer) PreparationStatus() core.IdentityPreparation { return p.status }
 
-func TestIdentityPreparationAPIAuthenticationProgressAndModes(t *testing.T) {
+func TestIdentityPreparationAPIAuthenticationProgressAndAvailability(t *testing.T) {
 	dependencies, _, _, _ := fixture(t)
 	identities := &fakePreparer{status: core.IdentityPreparation{State: "running", Proxies: 10, Target: 100, Ready: 24}}
 	dependencies.Identities = identities
@@ -71,7 +71,7 @@ func TestIdentityPreparationAPIAuthenticationProgressAndModes(t *testing.T) {
 	handler = NewHandler(dependencies)
 	for _, method := range []string{"GET", "POST"} {
 		if r := request(handler, method, preparationPath, "", true); r.Code != 503 {
-			t.Fatal("web mode accepted identity control", r.Code)
+			t.Fatal("unavailable pool accepted identity control", r.Code)
 		}
 	}
 }

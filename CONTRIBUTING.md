@@ -1,6 +1,6 @@
 # Contributing
 
-Use the Go version in `go.mod`. Builds and tests require CGO, a C compiler, `pkg-config`, libheif with HEIC and AVIF codecs, and FFmpeg. See the [README](README.md) for package installation.
+Use the Go version in `go.mod`. Builds and tests require CGO, a C compiler, `pkg-config`, and libheif with HEIC and AVIF codecs. See the [README](README.md) for package installation.
 
 ## Check a change
 
@@ -29,7 +29,7 @@ docker rm --force tt-scrap-test-db
 
 Wait for `pg_isready` to report that PostgreSQL accepts connections before running the tests. The test role needs permission to create schemas. `TIKTOK_APP_TEST_DB_URL` takes precedence over `DB_URL` and the root `.env`.
 
-HTTP tests use local fixtures. Live tests require explicit `TT_SCRAP_LIVE_APP=1` or `TT_SCRAP_LIVE_WEB=1`; see [app method verification](docs/tiktok-app.md). Instagram and Telegram tests use fixtures and send no real messages.
+HTTP tests use local fixtures. Live tests require explicit `TT_SCRAP_LIVE_APP=1`; see [app method verification](docs/tiktok-app.md). Instagram and Telegram tests use fixtures and send no real messages.
 
 ## Find the implementation
 

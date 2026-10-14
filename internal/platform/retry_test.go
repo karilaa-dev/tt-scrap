@@ -33,7 +33,7 @@ func TestMediaRetriesUseExponentialJitterAndHonorDeadline(t *testing.T) {
 		firstDelays := map[time.Duration]bool{}
 		for range 8 {
 			backend := &retryBackend{}
-			d := NewDownloader(cfg, backend, nil)
+			d := NewDownloader(cfg, backend)
 			file, err := d.Download(context.Background(), asset, 0)
 			file.Cleanup()
 			d.Close()
@@ -53,7 +53,7 @@ func TestMediaRetriesUseExponentialJitterAndHonorDeadline(t *testing.T) {
 		}
 		cfg.DownloadTimeout = 25 * time.Millisecond
 		backend := &retryBackend{}
-		d := NewDownloader(cfg, backend, nil)
+		d := NewDownloader(cfg, backend)
 		defer d.Close()
 		start := time.Now()
 		file, err := d.Download(context.Background(), asset, 0)
