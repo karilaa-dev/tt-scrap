@@ -3,6 +3,7 @@ package identity
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -190,5 +191,74 @@ func TestRestrictedAppMediaFallbackIsIsolatedAcrossBatch(t *testing.T) {
 	})
 	if err != nil || attempts["restricted"] != 2 || attempts["public"] != 1 {
 		t.Fatal("incorrect media fallback attempts", err, attempts)
+	}
+}
+
+func TestAccountFallbackDistinguishesRejectionFromUpstreamFailure(t *testing.T) {
+	for _, operation := range []string{"detail", "media", "batch"} {
+		for _, tc := range []struct {
+			status, publicStatus, failures int
+			code                           string
+		}{
+			{401, 403, 0, "content_private"},
+			{403, 403, 0, "content_private"},
+			{429, 429, 1, "upstream_rate_limited"},
+			{503, 502, 1, "upstream_extraction_error"},
+		} {
+			t.Run(fmt.Sprintf("%s/%d", operation, tc.status), func(t *testing.T) {
+				cfg, db := testDatabase(t)
+				cfg.TikTokSessionID = "stale-login"
+				p := openTestPool(t, cfg, "")
+				fixture := newProtocolFixture(t, "", 200)
+				anonymous, authenticated := 0, 0
+				p.clientFactory = func(s *tiktokapp.Session, _ *http.Client) *tiktokapp.Client {
+					return tiktokapp.NewClient(s, fixtureDoer(func(r *http.Request) (*http.Response, error) {
+						if r.URL.Path == "/aweme/v1/play/" || (operation == "detail" && r.URL.Path == "/aweme/v1/aweme/detail/") {
+							if _, err := r.Cookie("sid_tt"); err != nil {
+								anonymous++
+								return fixtureResponse(403, []byte(`{"status_code":10216}`)), nil
+							}
+							authenticated++
+							return fixtureResponse(tc.status, []byte("Unavailable")), nil
+						}
+						return fixture.do(r)
+					}))
+				}
+				var err error
+				if operation == "detail" {
+					_, err = p.Detail(context.Background(), "7695962883523464478")
+				} else {
+					result, e := p.Detail(context.Background(), "7695962883523464478")
+					if e != nil {
+						t.Fatal(e)
+					}
+					address := "https://api19-va.tiktokv.com/aweme/v1/play/"
+					if operation == "media" {
+						_, err = p.OpenMedia(context.Background(), result.IdentityID, address, nil)
+					} else {
+						err = p.WithMedia(context.Background(), result.IdentityID, func(open core.OpenAppMedia) error {
+							_, e := open(context.Background(), address, nil)
+							return e
+						})
+					}
+				}
+				var failure *core.Error
+				if !errors.As(err, &failure) || failure.Code != tc.code || failure.Status != tc.publicStatus {
+					t.Error("incorrect account fallback error", err)
+				}
+				if anonymous != 1 || authenticated != 1 {
+					t.Fatal("account rejection retried unexpectedly", anonymous, authenticated)
+				}
+				for _, entry := range p.entries {
+					if entry.health.Failures != tc.failures || (entry.health.CooldownUntil == 0) != (tc.failures == 0) || entry.proxy.health.Failures != 0 {
+						t.Error("account fallback updated identity health incorrectly")
+					}
+					var failures int
+					if err := db.QueryRow(context.Background(), "SELECT (health->>'failures')::int FROM "+p.identitiesTable+" WHERE id=$1", entry.id).Scan(&failures); err != nil || failures != tc.failures {
+						t.Error("account fallback persisted incorrect health", err)
+					}
+				}
+			})
+		}
 	}
 }

@@ -64,13 +64,16 @@ func (p *Pool) Detail(ctx context.Context, id string) (result core.AppDetail, er
 		err = publicError(err)
 	}()
 	account := tiktokapp.Account{}
+	var restriction error
 	for attempt := 0; attempt < 2; attempt++ {
 		client := l.client()
 		result.Response, err = client.DetailWithAccount(l.ctx, id, account)
 		if tiktokapp.IsContentRestricted(err) && !account.Valid() && p.account.Valid() {
+			restriction = err
 			account = p.account
 			result.Response, err = client.DetailWithAccount(l.ctx, id, account)
 		}
+		err = accountFallbackError(restriction, err)
 		client.SyncCookies()
 		if err == nil {
 			result.IdentityID = l.entry.id

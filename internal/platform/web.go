@@ -23,6 +23,7 @@ import (
 var postIDPattern = regexp.MustCompile(`/(?:video|photo)/(\d+)`)
 var scriptPattern = regexp.MustCompile(`(?is)<script\b[^>]*\bid\s*=\s*["'](__UNIVERSAL_DATA_FOR_REHYDRATION__|SIGI_STATE|sigi-persisted-data)["'][^>]*>`)
 var challengeElementPattern = regexp.MustCompile(`(?is)<[^/!][^>]*\bid\s*=\s*["'](cs|wci|rci|rs)["'][^>]*>`)
+var webBotChallengePattern = regexp.MustCompile(`(?i)\b(?:captcha|challenge)\b`)
 var classPattern = regexp.MustCompile(`(?is)\bclass\s*=\s*["']([^"']*)["']`)
 
 func validTikTokURL(raw string) bool {

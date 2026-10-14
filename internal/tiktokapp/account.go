@@ -22,11 +22,21 @@ func isAccountCookie(name string) bool {
 	return false
 }
 
-func (a Account) cookies(u *url.URL) []*http.Cookie {
+func (a Account) cookies(u *url.URL, updates http.CookieJar) []*http.Cookie {
 	if !a.Valid() || !IsAppHost(u) || !strings.HasPrefix(u.Path, "/aweme/") {
 		return nil
 	}
-	return []*http.Cookie{{Name: "sid_tt", Value: a.SessionID}, {Name: "sessionid", Value: a.SessionID}, {Name: "sessionid_ss", Value: a.SessionID}}
+	cookies := []*http.Cookie{{Name: "sid_tt", Value: a.SessionID}, {Name: "sessionid", Value: a.SessionID}, {Name: "sessionid_ss", Value: a.SessionID}}
+	updatedCookies := updates.Cookies(u)
+	for i, cookie := range cookies {
+		for _, updated := range updatedCookies {
+			if updated.Name == cookie.Name {
+				cookies[i] = updated
+				break
+			}
+		}
+	}
+	return cookies
 }
 
 func IsContentRestricted(err error) bool {

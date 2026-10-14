@@ -129,3 +129,43 @@ func TestContentRestrictionClassification(t *testing.T) {
 		})
 	}
 }
+
+func TestAuthenticatedRedirectUsesRotatedCookies(t *testing.T) {
+	for _, name := range []string{"sid_tt", "sessionid", "sessionid_ss"} {
+		t.Run(name, func(t *testing.T) {
+			session := registeredTestSession(t)
+			calls := 0
+			client := NewClient(session, doerFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				switch calls {
+				case 1:
+					cookie, err := r.Cookie(name)
+					if err != nil || cookie.Value != "initial-login" {
+						t.Error("initial request missing configured account")
+					}
+					return testResponse(302, nil, http.Header{"Location": {"/aweme/v1/aweme/detail/?redirect=1"}, "Set-Cookie": {name + "=rotated-login; Path=/; Secure; HttpOnly"}}), nil
+				case 2:
+					cookie, err := r.Cookie(name)
+					if err != nil || cookie.Value != "rotated-login" {
+						t.Error("redirect reused original token instead of rotated cookie")
+					}
+				case 3:
+					if r.Header.Get("Cookie") != "" {
+						t.Error("account cookies escaped the authenticated request")
+					}
+				}
+				return testResponse(200, []byte(`{"aweme_detail":{"aweme_id":"1234567890123456789"}}`), nil), nil
+			}))
+			if _, err := client.DetailWithAccount(context.Background(), "1234567890123456789", Account{SessionID: "initial-login"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.Detail(context.Background(), "1234567890123456789"); err != nil {
+				t.Fatal(err)
+			}
+			client.SyncCookies()
+			if calls != 3 || strings.Contains(session.Cookies, "login") {
+				t.Fatal("rotation changed anonymous session state")
+			}
+		})
+	}
+}

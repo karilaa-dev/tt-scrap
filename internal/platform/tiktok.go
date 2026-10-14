@@ -264,6 +264,9 @@ func (t *TikTok) fetchWebWithClient(ctx context.Context, client *http.Client, pr
 			return nil, core.AssetContext{}, core.Upstream("TikTok page could not be read")
 		}
 		if res.StatusCode >= 400 {
+			if res.StatusCode == http.StatusUnauthorized && res.Header.Get("tt_block") == "" && !webBotChallengePattern.Match(body) && !challengeElementPattern.Match(body) {
+				return nil, core.AssetContext{}, core.NewError("content_restricted", "TikTok requires login for this content", 403)
+			}
 			return nil, core.AssetContext{}, statusError(res.StatusCode, "TikTok webpage")
 		}
 		if res.Request.URL.Path == "/login" {
@@ -281,12 +284,7 @@ func (t *TikTok) fetchWebWithClient(ctx context.Context, client *http.Client, pr
 			if str(detail["id"]) != "" && str(detail["id"]) != id {
 				return nil, core.AssetContext{}, core.Upstream("TikTok returned a different post")
 			}
-			cookies := map[string]string{}
-			u, _ := url.Parse("https://www.tiktok.com/")
-			for _, c := range client.Jar.Cookies(u) {
-				cookies[c.Name] = c.Value
-			}
-			return detail, core.AssetContext{Platform: "tiktok", Referer: raw, ProxyURL: proxy, Cookies: cookies, Headers: http.Header{"User-Agent": []string{browserAgent}}}, nil
+			return detail, core.AssetContext{Platform: "tiktok", Referer: raw, ProxyURL: proxy, CookieJar: client.Jar, Headers: http.Header{"User-Agent": []string{browserAgent}}}, nil
 		}
 		if attempt == 0 {
 			solved, e := solveWebChallenge(ctx, body, client.Jar)
