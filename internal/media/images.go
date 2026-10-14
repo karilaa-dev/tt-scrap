@@ -1,6 +1,7 @@
 package media
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -15,6 +16,7 @@ import (
 	"math"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 
 	"github.com/karilaa-dev/tt-scrap/internal/spool"
@@ -223,17 +225,24 @@ func (p *Processor) Prepare(ctx context.Context, source *spool.Buffer, filename 
 			return Prepared{}, err
 		}
 	} else if kind == "image/heic" || kind == "image/heif" || kind == "image/avif" {
-		data := source.Bytes()
-		if data == nil {
-			if data, err = io.ReadAll(io.NewSectionReader(source, 0, size)); err != nil {
-				return Prepared{}, err
-			}
+		// Reserve from the metadata before the encoded file is copied, so the
+		// copy and the decoded pixels are both admitted.
+		if width, height, err = heifSize(source, size); err != nil {
+			return Prepared{}, err
 		}
-		img, err = decodeHEIF(data, func(w, h int) (err error) {
-			// libheif's decoded planes of up to 16-bit samples, its RGBA output,
-			// the Go copy of that output, and two copies of the encoded file.
-			release, err = p.reserve(ctx, w, h, func(pixels int64) int64 { return 16*pixels + 2*int64(len(data)) + convertedBytes(w, h, thumbnail, 1) })
-			return err
+		// libheif's decoded planes of up to 16-bit samples, its RGBA output, the
+		// Go copy of that output, the C copy of the encoded file, and libheif's
+		// copy of the coded image.
+		cost := func(w, h int) int64 { return 16*int64(w)*int64(h) + 2*size + convertedBytes(w, h, thumbnail, 1) }
+		reserved := cost(width, height)
+		if release, err = p.reserve(ctx, width, height, func(int64) int64 { return reserved }); err != nil {
+			return Prepared{}, err
+		}
+		img, err = decodeHEIF(source, size, func(w, h int) error {
+			if cost(w, h) > reserved {
+				return fmt.Errorf("HEIF image exceeds its declared dimensions")
+			}
+			return nil
 		})
 		if err != nil {
 			return Prepared{}, err
@@ -320,6 +329,150 @@ func (p *Processor) Prepare(ctx context.Context, source *spool.Buffer, filename 
 		return Prepared{}, fmt.Errorf("converted image exceeds size limit")
 	}
 	return Prepared{Data: spool.Bytes(output.Bytes()), Filename: FilenameForType(filename, "image/jpeg"), ContentType: "image/jpeg", Size: int64(output.Len()), Owned: true}, nil
+}
+
+// heifSize reads the coded dimensions of the primary item from its ispe
+// property without reading the encoded image. Rotation and cropping applied
+// on decode do not increase the pixel count.
+func heifSize(r io.ReaderAt, size int64) (width, height int, err error) {
+	missing := fmt.Errorf("HEIF dimensions missing")
+	meta, metaEnd, ok := findBox(r, 0, size, "meta")
+	if !ok {
+		return 0, 0, missing
+	}
+	var primary uint32
+	var iprp, iprpEnd int64
+	for start, end := meta+4, metaEnd; start < end; {
+		kind, body, next, ok := boxAt(r, start, end)
+		if !ok {
+			return 0, 0, missing
+		}
+		switch kind {
+		case "pitm":
+			// Version 0 has a 16-bit item ID; later versions, 32-bit.
+			var b [8]byte
+			if _, err = r.ReadAt(b[:6], body); err != nil {
+				return 0, 0, missing
+			}
+			primary = uint32(binary.BigEndian.Uint16(b[4:]))
+			if b[0] != 0 {
+				if _, err = r.ReadAt(b[6:], body+6); err != nil {
+					return 0, 0, missing
+				}
+				primary = binary.BigEndian.Uint32(b[4:])
+			}
+		case "iprp":
+			iprp, iprpEnd = body, next
+		}
+		start = next
+	}
+	ipco, ipcoEnd, ok := findBox(r, iprp, iprpEnd, "ipco")
+	if !ok {
+		return 0, 0, missing
+	}
+	indexes, err := associations(r, iprp, iprpEnd, primary)
+	if err != nil {
+		return 0, 0, err
+	}
+	for i, start := 1, ipco; start < ipcoEnd; i++ {
+		kind, body, next, ok := boxAt(r, start, ipcoEnd)
+		if !ok {
+			break
+		}
+		if kind == "ispe" && slices.Contains(indexes, i) {
+			var b [12]byte
+			if _, err = r.ReadAt(b[:], body); err != nil {
+				return 0, 0, missing
+			}
+			return int(binary.BigEndian.Uint32(b[4:])), int(binary.BigEndian.Uint32(b[8:])), nil
+		}
+		start = next
+	}
+	return 0, 0, missing
+}
+
+// associations returns the 1-based ipco indexes of the item's properties.
+func associations(r io.ReaderAt, start, end int64, item uint32) ([]int, error) {
+	ipma, ipmaEnd, ok := findBox(r, start, end, "ipma")
+	if !ok {
+		return nil, fmt.Errorf("HEIF properties missing")
+	}
+	in := bufio.NewReader(io.NewSectionReader(r, ipma, ipmaEnd-ipma))
+	var header [8]byte
+	if _, err := io.ReadFull(in, header[:]); err != nil {
+		return nil, err
+	}
+	version, wide := header[0], header[3]&1 != 0
+	for range binary.BigEndian.Uint32(header[4:]) {
+		var b [5]byte
+		idSize := 2 + 2*int(min(version, 1))
+		if _, err := io.ReadFull(in, b[:idSize+1]); err != nil {
+			return nil, err
+		}
+		id := uint32(binary.BigEndian.Uint16(b[:]))
+		if idSize == 4 {
+			id = binary.BigEndian.Uint32(b[:])
+		}
+		count := int(b[idSize])
+		entry := make([]byte, count*(1+int(header[3]&1)))
+		if _, err := io.ReadFull(in, entry); err != nil {
+			return nil, err
+		}
+		if id != item {
+			continue
+		}
+		indexes := make([]int, count)
+		for i := range indexes {
+			if wide {
+				indexes[i] = int(binary.BigEndian.Uint16(entry[2*i:]) & 0x7fff)
+			} else {
+				indexes[i] = int(entry[i] & 0x7f)
+			}
+		}
+		return indexes, nil
+	}
+	return nil, fmt.Errorf("HEIF primary image properties missing")
+}
+
+// findBox returns the body of the first box of a kind within [start, end).
+func findBox(r io.ReaderAt, start, end int64, want string) (body, bodyEnd int64, ok bool) {
+	for start < end {
+		kind, body, next, ok := boxAt(r, start, end)
+		if !ok {
+			return 0, 0, false
+		}
+		if kind == want {
+			return body, next, true
+		}
+		start = next
+	}
+	return 0, 0, false
+}
+
+// boxAt reads an ISOBMFF box header and returns its type, body offset, and the
+// offset after it.
+func boxAt(r io.ReaderAt, start, end int64) (kind string, body, next int64, ok bool) {
+	var b [16]byte
+	if end-start < 8 {
+		return "", 0, 0, false
+	}
+	if _, err := r.ReadAt(b[:8], start); err != nil {
+		return "", 0, 0, false
+	}
+	length, body := int64(binary.BigEndian.Uint32(b[:])), start+8
+	switch length {
+	case 0:
+		length = end - start
+	case 1:
+		if _, err := r.ReadAt(b[8:], body); err != nil {
+			return "", 0, 0, false
+		}
+		length, body = int64(binary.BigEndian.Uint64(b[8:])), body+8
+	}
+	if length < body-start || length > end-start {
+		return "", 0, 0, false
+	}
+	return string(b[4:8]), body, start + length, true
 }
 
 // validated forwards the source after decoding its pixels, so a nominally valid

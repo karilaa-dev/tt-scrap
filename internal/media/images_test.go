@@ -346,3 +346,125 @@ func TestImageMemoryAdmitsSmallImagesTogetherAndOversizedAlone(t *testing.T) {
 		t.Fatal("image memory leaked")
 	}
 }
+
+// heifSource returns a RAM or disk buffer holding the first n bytes of data,
+// and the writer for the rest.
+func heifSource(t *testing.T, data []byte, n int, disk bool) (*spool.Buffer, *spool.Writer) {
+	t.Helper()
+	limit := int64(1 << 20)
+	if disk {
+		limit = 0
+	}
+	source, err := spool.NewStore(t.TempDir(), limit, limit).New(int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(source.Close)
+	writer := source.Writer(0, int64(len(data)))
+	if _, err = writer.Write(data[:n]); err != nil || source.InMemory() == disk {
+		t.Fatal("HEIC fixture not stored as requested", err)
+	}
+	return source, writer
+}
+
+func TestHEIFReservesMemoryBeforeReadingPayload(t *testing.T) {
+	data, err := os.ReadFile("testdata/sample.heic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Index(data, []byte("mdat")) - 4
+	for _, disk := range []bool{false, true} {
+		t.Run(map[bool]string{false: "RAM", true: "disk"}[disk], func(t *testing.T) {
+			// Only the metadata has arrived, so reading the encoded image fails.
+			source, writer := heifSource(t, data, payload, disk)
+			p := NewProcessor(32, 64<<20)
+			if !p.memory.TryAcquire(p.budget) {
+				t.Fatal("budget unavailable")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			_, err := p.Prepare(ctx, source, "sample.heic", false)
+			cancel()
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("read encoded image before reserving memory: %v", err)
+			}
+			p.memory.Release(p.budget)
+			if _, err = p.Prepare(context.Background(), source, "sample.heic", false); !errors.Is(err, spool.ErrIncomplete) {
+				t.Fatalf("missing payload: %v", err)
+			}
+			if _, err = writer.Write(data[payload:]); err != nil || source.Complete() != nil {
+				t.Fatal(err)
+			}
+			prepared, err := p.Prepare(context.Background(), source, "sample.heic", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			prepared.Cleanup()
+			if !p.memory.TryAcquire(p.budget) {
+				t.Fatal("image memory leaked")
+			}
+		})
+	}
+}
+
+func TestHEIFDimensionsComeFromMetadata(t *testing.T) {
+	data, err := os.ReadFile("testdata/sample.heic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The coded image is 64x64; its clean aperture crops it to 32x24.
+	if w, h, err := heifSize(bytes.NewReader(data), int64(len(data))); err != nil || w != 64 || h != 64 {
+		t.Fatal(w, h, err)
+	}
+	payload := bytes.Index(data, []byte("mdat")) - 4
+	for name, input := range map[string][]byte{
+		"truncated metadata": data[:payload-40],
+		"corrupt payload":    append(bytes.Clone(data[:payload+8]), make([]byte, len(data)-payload-8)...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := NewProcessor(32, 64<<20)
+			if _, err := p.Prepare(context.Background(), spool.Bytes(input), "bad.heic", false); err == nil {
+				t.Fatal("accepted invalid HEIF")
+			}
+			if !p.memory.TryAcquire(p.budget) {
+				t.Fatal("image memory leaked")
+			}
+		})
+	}
+}
+
+func TestConcurrentHEIFAdmissionCompletes(t *testing.T) {
+	data, err := os.ReadFile("testdata/sample.heic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// About two images fit in the first budget; each image needs more than
+	// the second, so those run one at a time.
+	for _, budget := range []int64{300_000, 100_000} {
+		p := NewProcessor(32, budget)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		var group sync.WaitGroup
+		errs := make(chan error, 64)
+		for i := range 64 {
+			source, _ := heifSource(t, data, len(data), i%2 == 0)
+			if err := source.Complete(); err != nil {
+				t.Fatal(err)
+			}
+			group.Go(func() {
+				prepared, err := p.Prepare(ctx, source, "sample.heic", i%4 < 2)
+				prepared.Cleanup()
+				errs <- err
+			})
+		}
+		group.Wait()
+		cancel()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatal(budget, err)
+			}
+		}
+		if !p.memory.TryAcquire(p.budget) {
+			t.Fatal("image memory leaked")
+		}
+	}
+}

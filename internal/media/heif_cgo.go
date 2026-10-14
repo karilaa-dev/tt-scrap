@@ -20,17 +20,23 @@ import "C"
 import (
 	"fmt"
 	"image"
+	"io"
 	"unsafe"
 )
 
-// decodeHEIF calls admit with the primary image dimensions before decoding it.
-func decodeHEIF(data []byte, admit func(width, height int) error) (image.Image, error) {
-	if len(data) == 0 {
+// decodeHEIF reads size bytes of r into C memory and calls check with the
+// primary image dimensions before decoding it.
+func decodeHEIF(r io.ReaderAt, size int64, check func(width, height int) error) (image.Image, error) {
+	if size <= 0 {
 		return nil, fmt.Errorf("empty HEIF image")
 	}
-	// The context references this C copy until it is freed.
-	encoded := C.CBytes(data)
+	// The context references this C copy until it is freed. Reading into it
+	// directly avoids a second, Go copy of the file.
+	encoded := C.malloc(C.size_t(size))
 	defer C.free(encoded)
+	if n, err := r.ReadAt(unsafe.Slice((*byte)(encoded), size), 0); int64(n) != size {
+		return nil, err
+	}
 	ctx := C.heif_context_alloc()
 	if ctx == nil {
 		return nil, fmt.Errorf("cannot allocate HEIF decoder")
@@ -38,7 +44,7 @@ func decodeHEIF(data []byte, admit func(width, height int) error) (image.Image, 
 	defer C.heif_context_free(ctx)
 	C.heif_context_set_maximum_image_size_limit(ctx, 10000)
 	C.heif_context_set_max_decoding_threads(ctx, 1)
-	if result := C.heif_context_read_from_memory_without_copy(ctx, encoded, C.size_t(len(data)), nil); result.code != C.heif_error_Ok {
+	if result := C.heif_context_read_from_memory_without_copy(ctx, encoded, C.size_t(size), nil); result.code != C.heif_error_Ok {
 		return nil, fmt.Errorf("cannot read HEIF image (%d)", result.code)
 	}
 	var handle *C.struct_heif_image_handle
@@ -47,7 +53,7 @@ func decodeHEIF(data []byte, admit func(width, height int) error) (image.Image, 
 	}
 	defer C.heif_image_handle_release(handle)
 	w, h := int(C.heif_image_handle_get_width(handle)), int(C.heif_image_handle_get_height(handle))
-	if err := admit(w, h); err != nil {
+	if err := check(w, h); err != nil {
 		return nil, err
 	}
 	var decoded *C.struct_heif_image
