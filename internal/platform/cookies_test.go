@@ -26,6 +26,14 @@ func TestWebSessionIsOnlyUsedAfterContentRestriction(t *testing.T) {
 		{"private", `"statusCode":10216`, 200, 2, false},
 		{"HTTP login required", `"statusCode":1,"statusMsg":"Login required"`, 401, 2, false},
 		{"region", `"statusCode":10204`, 200, 2, false},
+		{"HTTP 403 private post", `"statusCode":10216`, 403, 2, false},
+		{"HTTP 403 private account", `"statusCode":10222`, 403, 2, false},
+		{"HTTP 403 region", `"statusCode":10204`, 403, 2, false},
+		{"HTTP 403 age", `"statusCode":1,"statusMsg":"Age restricted"`, 403, 2, false},
+		{"HTTP 403 login", `"statusCode":1,"statusMsg":"Login required"`, 403, 2, false},
+		{"HTTP 403 public payload", `"itemInfo":{"itemStruct":{"id":"1234567890123456789"}}`, 403, 1, true},
+		{"rate limited restriction", `"statusCode":10216`, 429, 1, true},
+		{"server error restriction", `"statusCode":10204`, 503, 1, true},
 		{"rate limit", `"statusCode":1`, 429, 1, true},
 		{"challenge", `"statusCode":1`, 403, 1, true},
 		{"deleted", `"statusCode":10202`, 200, 1, true},
@@ -64,30 +72,37 @@ func TestWebSessionIsOnlyUsedAfterContentRestriction(t *testing.T) {
 	}
 }
 
-func TestWebHTTP401DoesNotAuthenticateChallenges(t *testing.T) {
-	for _, tc := range []struct{ name, body, blocked string }{
-		{"block header", "Unauthorized", "1"},
-		{"captcha", "Complete the CAPTCHA", ""},
-		{"challenge text", "Challenge required", ""},
-		{"challenge markup", `<div id="cs" class="encoded"></div>`, ""},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			calls := 0
-			service := resolutionFixture(t, "web", func(w http.ResponseWriter, r *http.Request) {
-				calls++
-				if r.Header.Get("Cookie") != "" {
-					t.Error("bot challenge received account credentials")
+func TestWebHTTPDenialsDoNotAuthenticateChallenges(t *testing.T) {
+	const restricted = `<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__">{"__DEFAULT_SCOPE__":{"webapp.video-detail":{"statusCode":10216}}}</script>`
+	for _, status := range []int{401, 403} {
+		for _, tc := range []struct{ name, body, blocked string }{
+			{"block header", "Unauthorized", "1"},
+			{"captcha", "Complete the CAPTCHA", ""},
+			{"challenge text", "Challenge required", ""},
+			{"challenge markup", `<div id="cs" class="encoded"></div>`, ""},
+			{"blocked restriction", restricted, "1"},
+			{"restriction and captcha", "Complete the CAPTCHA" + restricted, ""},
+			{"restriction and challenge", "Challenge required" + restricted, ""},
+			{"restriction and challenge markup", `<div id="cs" class="encoded"></div>` + restricted, ""},
+		} {
+			t.Run(fmt.Sprintf("%d/%s", status, tc.name), func(t *testing.T) {
+				calls := 0
+				service := resolutionFixture(t, "web", func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					if r.Header.Get("Cookie") != "" {
+						t.Error("bot challenge received account credentials")
+					}
+					w.Header().Set("tt_block", tc.blocked)
+					w.WriteHeader(status)
+					fmt.Fprint(w, tc.body)
+				})
+				service.cfg.TikTokSessionID = "web-login"
+				_, _, err := service.fetchWeb(context.Background(), "https://www.tiktok.com/@creator/video/1234567890123456789", "1234567890123456789")
+				if err == nil || calls != 1 {
+					t.Fatal("bot challenge triggered account fallback", err, calls)
 				}
-				w.Header().Set("tt_block", tc.blocked)
-				w.WriteHeader(http.StatusUnauthorized)
-				fmt.Fprint(w, tc.body)
 			})
-			service.cfg.TikTokSessionID = "web-login"
-			_, _, err := service.fetchWeb(context.Background(), "https://www.tiktok.com/@creator/video/1234567890123456789", "1234567890123456789")
-			if err == nil || calls != 1 {
-				t.Fatal("bot challenge triggered account fallback", err, calls)
-			}
-		})
+		}
 	}
 }
 

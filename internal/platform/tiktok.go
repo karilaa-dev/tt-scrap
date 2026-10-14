@@ -264,11 +264,23 @@ func (t *TikTok) fetchWebWithClient(ctx context.Context, client *http.Client, pr
 			return nil, core.AssetContext{}, core.Upstream("TikTok page could not be read")
 		}
 		if res.StatusCode >= 400 {
-			if restriction != nil && (res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden) {
+			accessDenied := res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden
+			if restriction != nil && accessDenied {
 				return nil, core.AssetContext{}, restriction
 			}
-			if res.StatusCode == http.StatusUnauthorized && res.Header.Get("tt_block") == "" && !webBotChallengePattern.Match(body) && !challengeElementPattern.Match(body) {
-				return nil, core.AssetContext{}, core.NewError("content_restricted", "TikTok requires login for this content", 403)
+			if accessDenied && res.Header.Get("tt_block") == "" && !webBotChallengePattern.Match(body) && !challengeElementPattern.Match(body) {
+				_, status, parseErr := ParseWebDetail(body, id)
+				var failure *core.Error
+				if errors.As(parseErr, &failure) {
+					return nil, core.AssetContext{}, failure
+				}
+				switch status {
+				case 10216, 10222, 10204:
+					return nil, core.AssetContext{}, webStatus(status)
+				}
+				if res.StatusCode == http.StatusUnauthorized {
+					return nil, core.AssetContext{}, core.NewError("content_restricted", "TikTok requires login for this content", 403)
+				}
 			}
 			return nil, core.AssetContext{}, statusError(res.StatusCode, "TikTok webpage")
 		}
