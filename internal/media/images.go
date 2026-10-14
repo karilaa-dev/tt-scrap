@@ -328,7 +328,12 @@ func (p *Processor) Prepare(ctx context.Context, source *spool.Buffer, filename 
 	if int64(output.Len()) > limit {
 		return Prepared{}, fmt.Errorf("converted image exceeds size limit")
 	}
-	return Prepared{Data: spool.Bytes(output.Bytes()), Filename: FilenameForType(filename, "image/jpeg"), ContentType: "image/jpeg", Size: int64(output.Len()), Owned: true}, nil
+	// Retries reuse the buffer, so it can hold the largest attempt's capacity.
+	// Copy the final encoding while the reservation is still held so retained
+	// results own only their bytes.
+	data := make([]byte, output.Len())
+	copy(data, output.Bytes())
+	return Prepared{Data: spool.Bytes(data), Filename: FilenameForType(filename, "image/jpeg"), ContentType: "image/jpeg", Size: int64(len(data)), Owned: true}, nil
 }
 
 // heifSize reads the coded dimensions of the primary item from its ispe

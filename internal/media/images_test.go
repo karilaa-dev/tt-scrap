@@ -90,6 +90,7 @@ func TestThumbnailPNGBecomesBoundedJPEG(t *testing.T) {
 	if !bytes.HasPrefix(data, []byte{0xff, 0xd8, 0xff}) {
 		t.Fatal("not JPEG")
 	}
+	assertOwnsOnlyJPEG(t, prepared, 320, 240)
 }
 
 func TestPhotoPadsExtremeAspectRatio(t *testing.T) {
@@ -102,6 +103,24 @@ func TestPhotoPadsExtremeAspectRatio(t *testing.T) {
 	config := configOf(t, prepared)
 	if config.Width != 1000 || config.Height != 50 || prepared.ContentType != "image/jpeg" {
 		t.Fatalf("%#v %#v", prepared, config)
+	}
+	assertOwnsOnlyJPEG(t, prepared, 1000, 50)
+}
+
+// assertOwnsOnlyJPEG checks that a converted image keeps no encoder capacity
+// beyond its final bytes, since prepared albums hold every result until upload.
+func assertOwnsOnlyJPEG(t *testing.T, prepared Prepared, width, height int) {
+	t.Helper()
+	data := prepared.Data.Bytes()
+	if int64(len(data)) != prepared.Size || cap(data) != len(data) {
+		t.Fatalf("converted JPEG len %d cap %d size %d", len(data), cap(data), prepared.Size)
+	}
+	img, err := jpeg.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if img.Bounds().Dx() != width || img.Bounds().Dy() != height {
+		t.Fatalf("decoded %v", img.Bounds())
 	}
 }
 
