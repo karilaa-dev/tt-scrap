@@ -24,6 +24,8 @@ type Config struct {
 	ExtractionConcurrency, DownloadConcurrency, HTTPMaxConnections, MaxQueuedRequests int
 	MaxVideoDuration                                                                  int
 	MaxAssetBytes                                                                     int64
+	MediaMemoryFileBytes, MediaMemoryBudgetBytes                                      int64
+	DownloadParts                                                                     int
 	UpstreamTimeout, ResolveTimeout, DownloadTimeout                                  time.Duration
 	VideoInfoMaxRetries, ResolveRetries, DownloadRetries                              int
 	RetryDelay                                                                        time.Duration
@@ -44,15 +46,16 @@ func DefaultConfig() Config {
 		Host: "0.0.0.0", Port: 8000, DBSchema: "public",
 		CacheTTL: 600 * time.Second, MetadataTTL: 60 * time.Second, ResolutionTTL: 600 * time.Second, CacheMaxEntries: 10000,
 		ExtractionConcurrency: 32, DownloadConcurrency: 64, HTTPMaxConnections: 128, MaxQueuedRequests: 1024,
-		MaxVideoDuration: 0, UpstreamTimeout: 180 * time.Second, ResolveTimeout: 12 * time.Second, DownloadTimeout: 60 * time.Second,
+		MaxVideoDuration: 0, MediaMemoryFileBytes: 250 << 20, MediaMemoryBudgetBytes: 1 << 30, DownloadParts: 4,
+		UpstreamTimeout: 180 * time.Second, ResolveTimeout: 12 * time.Second, DownloadTimeout: 60 * time.Second,
 		VideoInfoMaxRetries: 3, ResolveRetries: 3, DownloadRetries: 3, RetryDelay: time.Second,
 		RapidAPIHost:         "instagram-downloader-download-instagram-stories-videos4.p.rapidapi.com",
 		RapidAPIBaseURL:      "https://instagram-downloader-download-instagram-stories-videos4.p.rapidapi.com",
 		InstagramConcurrency: 4, InstagramMaxAttempts: 3, InstagramTimeout: 3 * time.Second, InstagramRetryDelay: 100 * time.Millisecond,
-		TelegramAPIBaseURL: "https://api.telegram.org", TelegramPipelineConcurrency: 32, TelegramUploadConcurrency: 20,
-		TelegramPreparationConcurrency: 4,
+		TelegramAPIBaseURL: "https://api.telegram.org", TelegramPipelineConcurrency: 32, TelegramUploadConcurrency: 32,
+		TelegramPreparationConcurrency: 32,
 		TelegramTimeout:                600 * time.Second, ThumbnailWait: 1500 * time.Millisecond, TelegramMaxBytes: 50 * 1024 * 1024,
-		ImageConcurrency: 4, LogLevel: "INFO",
+		ImageConcurrency: 32, LogLevel: "INFO",
 	}
 }
 
@@ -124,6 +127,7 @@ func ParseConfig(env map[string]string) (Config, error) {
 	number("VIDEO_INFO_MAX_RETRIES", &c.VideoInfoMaxRetries, 1, 10)
 	number("URL_RESOLVE_MAX_RETRIES", &c.ResolveRetries, 1, 10)
 	number("DOWNLOAD_MAX_RETRIES", &c.DownloadRetries, 1, 10)
+	number("DOWNLOAD_PARALLEL_PARTS", &c.DownloadParts, 1, 16)
 	number("INSTAGRAM_CONCURRENCY", &c.InstagramConcurrency, 1, 64)
 	number("INSTAGRAM_MAX_ATTEMPTS", &c.InstagramMaxAttempts, 1, 10)
 	number("TELEGRAM_PIPELINE_CONCURRENCY", &c.TelegramPipelineConcurrency, 1, 1024)
@@ -131,7 +135,7 @@ func ParseConfig(env map[string]string) (Config, error) {
 	number("TELEGRAM_PREPARATION_CONCURRENCY", &c.TelegramPreparationConcurrency, 1, 64)
 	number("IMAGE_CONVERSION_WORKERS", &c.ImageConcurrency, 0, 64)
 	if c.ImageConcurrency == 0 {
-		c.ImageConcurrency = 4
+		c.ImageConcurrency = DefaultConfig().ImageConcurrency
 	}
 	duration("CACHE_TTL_SECONDS", &c.CacheTTL, 30, 86400)
 	duration("TIKTOK_INFO_CACHE_TTL_SECONDS", &c.MetadataTTL, 1, 3600)
@@ -144,12 +148,12 @@ func ParseConfig(env map[string]string) (Config, error) {
 	duration("INSTAGRAM_RETRY_DELAY_SECONDS", &c.InstagramRetryDelay, 0, 30)
 	duration("TELEGRAM_UPLOAD_TIMEOUT_SECONDS", &c.TelegramTimeout, .001, 3600)
 	duration("TELEGRAM_THUMBNAIL_WAIT_SECONDS", &c.ThumbnailWait, 0, 30)
-	for key, dst := range map[string]*int64{"MAX_ASSET_BYTES": &c.MaxAssetBytes, "TELEGRAM_UPLOAD_MAX_MB": &c.TelegramMaxBytes} {
+	for key, dst := range map[string]*int64{"MAX_ASSET_BYTES": &c.MaxAssetBytes, "TELEGRAM_UPLOAD_MAX_MB": &c.TelegramMaxBytes, "MEDIA_MEMORY_MAX_MB": &c.MediaMemoryFileBytes, "MEDIA_MEMORY_BUDGET_MB": &c.MediaMemoryBudgetBytes} {
 		if v, ok := env[key]; ok {
 			n, e := strconv.ParseInt(v, 10, 64)
 			if e != nil || n < 0 || n > 1<<40 {
 				invalid = key
-			} else if key == "TELEGRAM_UPLOAD_MAX_MB" {
+			} else if strings.HasSuffix(key, "_MB") {
 				*dst = n * 1024 * 1024
 			} else {
 				*dst = n

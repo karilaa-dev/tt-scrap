@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"sync"
+
+	"github.com/karilaa-dev/tt-scrap/internal/spool"
 )
 
 type AssetDescriptor struct {
@@ -89,25 +91,22 @@ type AssetContext struct {
 	DurationSeconds int
 	ExtractionID    string
 }
+
+// Downloaded media stays in RAM unless it is large or the RAM budget is spent.
 type Downloaded struct {
-	Path        string
+	Data        *spool.Buffer
 	Filename    string
 	ContentType string
 	Size        int64
 	SHA256      string
 	Width       int
 	Height      int
-	Remove      func()
 	once        sync.Once
 }
 
 func (d *Downloaded) Cleanup() {
 	if d != nil {
-		d.once.Do(func() {
-			if d.Remove != nil {
-				d.Remove()
-			}
-		})
+		d.once.Do(func() { d.Data.Close() })
 	}
 }
 
@@ -130,7 +129,11 @@ type Downloader interface {
 	// be retried after identity recovery; it must join its workers before returning.
 	WithIdentity(context.Context, string, func(DownloadFunc) error) error
 }
-type DownloadFunc func(context.Context, AssetContext, int64) (*Downloaded, error)
+
+// DownloadFunc fetches a complete, validated asset. When started is set, it
+// receives each transfer attempt once the length and media type are known,
+// while bytes are still arriving; a failed attempt fails its buffer.
+type DownloadFunc func(ctx context.Context, asset AssetContext, maxBytes int64, started func(*Downloaded)) (*Downloaded, error)
 type HTTPDoer interface {
 	Do(*http.Request) (*http.Response, error)
 }

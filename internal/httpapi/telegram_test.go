@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -22,6 +21,7 @@ import (
 
 	"github.com/karilaa-dev/tt-scrap/internal/core"
 	"github.com/karilaa-dev/tt-scrap/internal/media"
+	"github.com/karilaa-dev/tt-scrap/internal/spool"
 )
 
 func jpegFixture(t *testing.T) []byte {
@@ -102,9 +102,8 @@ func TestTelegramSingleVideoMultipartAndRawResponse(t *testing.T) {
 	if response.Code != 429 || response.Body.String() != `{"ok":false,"error_code":429,"parameters":{"retry_after":3}}` || !received.Load() {
 		t.Fatalf("%d %s", response.Code, response.Body.String())
 	}
-	entries, _ := os.ReadDir(downloader.directory)
-	if len(entries) != 0 {
-		t.Fatal("temporary files leaked")
+	if downloader.leaked() != 0 {
+		t.Fatal("download buffers leaked")
 	}
 }
 
@@ -120,7 +119,7 @@ func TestTelegramAlbumPreflightBatchesAndPartial207(t *testing.T) {
 	var mu sync.Mutex
 	telegram := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		downloader.mu.Lock()
-		completed := len(downloader.files)
+		completed := len(downloader.buffers)
 		downloader.mu.Unlock()
 		if completed != 11 {
 			t.Errorf("sent before preflight: %d downloaded", completed)
@@ -178,9 +177,8 @@ func TestTelegramAlbumPreflightBatchesAndPartial207(t *testing.T) {
 	if response.Code != 207 || !strings.Contains(response.Body.String(), `"partial":true`) || !reflect.DeepEqual(sizes, []int{9, 2}) {
 		t.Fatalf("got %d %s sizes %v", response.Code, response.Body.String(), sizes)
 	}
-	entries, _ := os.ReadDir(downloader.directory)
-	if len(entries) != 0 {
-		t.Fatal("temporary files leaked")
+	if downloader.leaked() != 0 {
+		t.Fatal("download buffers leaked")
 	}
 }
 
@@ -216,9 +214,8 @@ func TestTelegramPreflightFailureNeverUploads(t *testing.T) {
 			if failure == "caption" && downloader.calls != 0 {
 				t.Fatal("invalid fields performed download")
 			}
-			entries, _ := os.ReadDir(downloader.directory)
-			if len(entries) != 0 {
-				t.Fatal("temporary files leaked")
+			if downloader.leaked() != 0 {
+				t.Fatal("download buffers leaked")
 			}
 		})
 	}
@@ -268,11 +265,8 @@ func TestMultipartClientCancellationAndNoAutomaticRetry(t *testing.T) {
 	config.TelegramAPIBaseURL = server.URL
 	config.TelegramTimeout = 30 * time.Millisecond
 	client := newTelegramClient(config, nil)
-	path := t.TempDir() + "/video"
-	if err := os.WriteFile(path, bytes.Repeat([]byte{42}, 1<<20), 0600); err != nil {
-		t.Fatal(err)
-	}
-	_, err := client.call(context.Background(), "sendVideo", fields{"chat_id": 1}, []upload{{Prepared: media.Prepared{Path: path, Filename: "video.mp4", ContentType: "video/mp4", Size: 1 << 20}, Field: "video_file"}})
+	video := spool.Bytes(bytes.Repeat([]byte{42}, 1<<20))
+	_, err := client.call(context.Background(), "sendVideo", fields{"chat_id": 1}, []upload{{Prepared: media.Prepared{Data: video, Filename: "video.mp4", ContentType: "video/mp4", Size: 1 << 20}, Field: "video_file"}})
 	if failure, ok := err.(*core.Error); !ok || failure.Code != "telegram_timeout" || calls.Load() != 1 {
 		t.Fatalf("calls %d error %v", calls.Load(), err)
 	}

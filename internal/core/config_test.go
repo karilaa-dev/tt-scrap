@@ -94,3 +94,22 @@ func TestLogLevelValidationAndNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestMediaMemoryAndParallelPartSettings(t *testing.T) {
+	base := map[string]string{"TT_SCRAP_API_KEY": "test-key-sixteen-characters", "DB_URL": "postgresql://localhost/test"}
+	cfg, err := ParseConfig(base)
+	if err != nil || cfg.MediaMemoryFileBytes != 250<<20 || cfg.MediaMemoryBudgetBytes != 1<<30 || cfg.DownloadParts != 4 {
+		t.Fatalf("defaults: %+v %v", cfg, err)
+	}
+	base["MEDIA_MEMORY_MAX_MB"], base["MEDIA_MEMORY_BUDGET_MB"], base["DOWNLOAD_PARALLEL_PARTS"] = "0", "64", "1"
+	cfg, err = ParseConfig(base)
+	if err != nil || cfg.MediaMemoryFileBytes != 0 || cfg.MediaMemoryBudgetBytes != 64<<20 || cfg.DownloadParts != 1 {
+		t.Fatalf("overrides: %+v %v", cfg, err)
+	}
+	for key, value := range map[string]string{"MEDIA_MEMORY_MAX_MB": "-1", "MEDIA_MEMORY_BUDGET_MB": "lots", "DOWNLOAD_PARALLEL_PARTS": "0"} {
+		env := map[string]string{"TT_SCRAP_API_KEY": "test-key-sixteen-characters", "DB_URL": "postgresql://localhost/test", key: value}
+		if _, err := ParseConfig(env); err == nil || !strings.Contains(err.Error(), key) {
+			t.Errorf("%s=%s accepted: %v", key, value, err)
+		}
+	}
+}

@@ -1,7 +1,6 @@
 package media
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -14,11 +13,11 @@ import (
 	_ "image/png"
 	"io"
 	"math"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 
+	"github.com/karilaa-dev/tt-scrap/internal/spool"
 	_ "golang.org/x/image/bmp"
 	"golang.org/x/image/draw"
 	_ "golang.org/x/image/tiff"
@@ -28,9 +27,9 @@ import (
 const maxPixels = 100_000_000
 const photoMaxBytes = 10 * 1024 * 1024
 
-// Prepared refers to a file, so concurrent Telegram uploads need not buffer media.
+// Prepared refers to buffered bytes; Owned buffers are released by Cleanup.
 type Prepared struct {
-	Path        string
+	Data        *spool.Buffer
 	Filename    string
 	ContentType string
 	Size        int64
@@ -39,21 +38,20 @@ type Prepared struct {
 
 func (p Prepared) Cleanup() {
 	if p.Owned {
-		_ = os.Remove(p.Path)
+		p.Data.Close()
 	}
 }
 
 // Processor bounds decoded image memory independently of HTTP download concurrency.
 type Processor struct {
-	slots     chan struct{}
-	directory string
+	slots chan struct{}
 }
 
-func NewProcessor(concurrency int, directory string) *Processor {
+func NewProcessor(concurrency int) *Processor {
 	if concurrency < 1 {
 		concurrency = min(runtime.GOMAXPROCS(0), 4)
 	}
-	return &Processor{slots: make(chan struct{}, concurrency), directory: directory}
+	return &Processor{slots: make(chan struct{}, concurrency)}
 }
 
 var extensions = map[string]string{"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif", "image/heic": ".heic", "image/heif": ".heif", "image/avif": ".avif", "image/bmp": ".bmp", "image/tiff": ".tiff", "video/mp4": ".mp4", "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/ogg": ".ogg"}
@@ -94,22 +92,19 @@ func DetectImageType(prefix []byte) string {
 	return ""
 }
 
-func (p *Processor) Prepare(ctx context.Context, path, filename string, thumbnail bool) (Prepared, error) {
+func (p *Processor) Prepare(ctx context.Context, source *spool.Buffer, filename string, thumbnail bool) (Prepared, error) {
 	select {
 	case p.slots <- struct{}{}:
 		defer func() { <-p.slots }()
 	case <-ctx.Done():
 		return Prepared{}, ctx.Err()
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return Prepared{}, err
+	size := source.Size()
+	if size < 0 {
+		return Prepared{}, spool.ErrIncomplete
 	}
-	defer f.Close()
-	stat, err := f.Stat()
-	if err != nil {
-		return Prepared{}, err
-	}
+	f := io.NewSectionReader(source, 0, size)
+	var err error
 	var prefix [32]byte
 	n, _ := io.ReadFull(f, prefix[:])
 	kind := DetectImageType(prefix[:n])
@@ -130,7 +125,13 @@ func (p *Processor) Prepare(ctx context.Context, path, filename string, thumbnai
 		}
 		width, height = img.Bounds().Dx(), img.Bounds().Dy()
 	} else if kind == "image/heic" || kind == "image/heif" || kind == "image/avif" {
-		img, err = decodeHEIF(path)
+		data := source.Bytes()
+		if data == nil {
+			if data, err = io.ReadAll(f); err != nil {
+				return Prepared{}, err
+			}
+		}
+		img, err = decodeHEIF(data)
 		if err != nil {
 			return Prepared{}, err
 		}
@@ -148,8 +149,8 @@ func (p *Processor) Prepare(ctx context.Context, path, filename string, thumbnai
 	if width <= 0 || height <= 0 || int64(width)*int64(height) > maxPixels {
 		return Prepared{}, fmt.Errorf("image dimensions exceed limits")
 	}
-	thumbnailFits := thumbnail && kind == "image/jpeg" && width <= 320 && height <= 320 && stat.Size() < 200000
-	photoFits := !thumbnail && native && stat.Size() <= photoMaxBytes && width+height <= 10000 && max(float64(width)/float64(height), float64(height)/float64(width)) <= 20
+	thumbnailFits := thumbnail && kind == "image/jpeg" && width <= 320 && height <= 320 && size < 200000
+	photoFits := !thumbnail && native && size <= photoMaxBytes && width+height <= 10000 && max(float64(width)/float64(height), float64(height)/float64(width)) <= 20
 	if thumbnailFits || photoFits {
 		// Validate the pixel stream before forwarding a nominally valid image.
 		if _, err = f.Seek(0, 0); err != nil {
@@ -158,7 +159,7 @@ func (p *Processor) Prepare(ctx context.Context, path, filename string, thumbnai
 		if _, _, err = image.Decode(f); err != nil {
 			return Prepared{}, err
 		}
-		return Prepared{Path: path, Filename: FilenameForType(filename, kind), ContentType: kind, Size: stat.Size()}, nil
+		return Prepared{Data: source, Filename: FilenameForType(filename, kind), ContentType: kind, Size: size}, nil
 	}
 	if img == nil {
 		if _, err = f.Seek(0, 0); err != nil {
@@ -205,46 +206,21 @@ func (p *Processor) Prepare(ctx context.Context, path, filename string, thumbnai
 		limit = 199999
 		quality = 80
 	}
-	output, err := os.CreateTemp(p.directory, "tt-scrap-image-*.jpg")
-	if err != nil {
-		return Prepared{}, err
-	}
-	name := output.Name()
-	succeeded := false
-	defer func() {
-		_ = output.Close()
-		if !succeeded {
-			_ = os.Remove(name)
-		}
-	}()
-	var size int64
+	var output bytes.Buffer
 	for attempt := 0; attempt < 4; attempt++ {
 		if err = ctx.Err(); err != nil {
 			return Prepared{}, err
 		}
-		if err = output.Truncate(0); err != nil {
+		output.Reset()
+		if err = jpeg.Encode(&output, dst, &jpeg.Options{Quality: quality}); err != nil {
 			return Prepared{}, err
 		}
-		if _, err = output.Seek(0, 0); err != nil {
-			return Prepared{}, err
-		}
-		writer := bufio.NewWriterSize(output, 64*1024)
-		if err = jpeg.Encode(writer, dst, &jpeg.Options{Quality: quality}); err != nil {
-			return Prepared{}, err
-		}
-		if err = writer.Flush(); err != nil {
-			return Prepared{}, err
-		}
-		size, err = output.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return Prepared{}, err
-		}
-		if size <= limit {
+		if int64(output.Len()) <= limit {
 			break
 		}
 		quality = 75
 		if attempt >= 1 {
-			scale := math.Sqrt(float64(limit)/float64(size)) * 0.95
+			scale := math.Sqrt(float64(limit)/float64(output.Len())) * 0.95
 			width = max(1, int(float64(width)*scale))
 			height = max(1, int(float64(height)*scale))
 			resized := image.NewRGBA(image.Rect(0, 0, width, height))
@@ -252,17 +228,13 @@ func (p *Processor) Prepare(ctx context.Context, path, filename string, thumbnai
 			dst = resized
 		}
 	}
-	if size > limit {
+	if int64(output.Len()) > limit {
 		return Prepared{}, fmt.Errorf("converted image exceeds size limit")
 	}
-	if err = output.Close(); err != nil {
-		return Prepared{}, err
-	}
-	succeeded = true
-	return Prepared{Path: name, Filename: FilenameForType(filename, "image/jpeg"), ContentType: "image/jpeg", Size: size, Owned: true}, nil
+	return Prepared{Data: spool.Bytes(output.Bytes()), Filename: FilenameForType(filename, "image/jpeg"), ContentType: "image/jpeg", Size: int64(output.Len()), Owned: true}, nil
 }
 
-func readOrientation(f *os.File, kind string) int {
+func readOrientation(f io.ReadSeeker, kind string) int {
 	if kind != "image/jpeg" {
 		return 1
 	}

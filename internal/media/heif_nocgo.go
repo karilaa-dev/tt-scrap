@@ -7,6 +7,6 @@ import (
 	"image"
 )
 
-func decodeHEIF(string) (image.Image, error) {
+func decodeHEIF([]byte) (image.Image, error) {
 	return nil, fmt.Errorf("HEIF and AVIF require a build with CGO and libheif")
 }

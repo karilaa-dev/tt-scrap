@@ -193,6 +193,16 @@ func (l *Limiter) Acquire(ctx context.Context) (func(), error) {
 		return nil, ctx.Err()
 	}
 }
+
+// TryAcquire takes a free slot without waiting.
+func (l *Limiter) TryAcquire() (func(), bool) {
+	select {
+	case l.slots <- struct{}{}:
+		return l.release(), true
+	default:
+		return nil, false
+	}
+}
 func (l *Limiter) release() func() {
 	var once sync.Once
 	return func() { once.Do(func() { <-l.slots }) }

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/karilaa-dev/tt-scrap/internal/core"
+	"github.com/karilaa-dev/tt-scrap/internal/spool"
 )
 
 type fakeTikTok struct {
@@ -55,17 +56,24 @@ func (f *fakeInstagram) GetExtraction(context.Context, string) (core.InstagramEx
 }
 
 type fakeDownloader struct {
-	directory string
-	data      []byte
-	mime      string
-	fail      string
-	mu        sync.Mutex
-	files     []string
-	calls     int
+	data    []byte
+	mime    string
+	fail    string
+	mu      sync.Mutex
+	buffers []*spool.Buffer
+	calls   int
 }
 
+// WithIdentity announces each download as started, so single deliveries take
+// the streamed upload path.
 func (d *fakeDownloader) WithIdentity(_ context.Context, _ string, run func(core.DownloadFunc) error) error {
-	return run(d.Download)
+	return run(func(ctx context.Context, asset core.AssetContext, maxBytes int64, started func(*core.Downloaded)) (*core.Downloaded, error) {
+		downloaded, err := d.Download(ctx, asset, maxBytes)
+		if err == nil && started != nil {
+			started(&core.Downloaded{Data: downloaded.Data, Filename: downloaded.Filename, ContentType: downloaded.ContentType, Size: downloaded.Size})
+		}
+		return downloaded, err
+	})
 }
 func (d *fakeDownloader) Download(ctx context.Context, asset core.AssetContext, _ int64) (*core.Downloaded, error) {
 	d.mu.Lock()
@@ -77,20 +85,25 @@ func (d *fakeDownloader) Download(ctx context.Context, asset core.AssetContext, 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	f, err := os.CreateTemp(d.directory, "download-")
-	if err != nil {
-		return nil, err
-	}
-	_, err = f.Write(d.data)
-	_ = f.Close()
-	if err != nil {
-		return nil, err
-	}
+	data := spool.Bytes(bytes.Clone(d.data))
 	d.mu.Lock()
-	d.files = append(d.files, f.Name())
+	d.buffers = append(d.buffers, data)
 	d.mu.Unlock()
 	hash := sha256.Sum256(d.data)
-	return &core.Downloaded{Path: f.Name(), Filename: asset.Filename, ContentType: d.mime, Size: int64(len(d.data)), SHA256: hex.EncodeToString(hash[:]), Remove: func() { _ = os.Remove(f.Name()) }}, nil
+	return &core.Downloaded{Data: data, Filename: asset.Filename, ContentType: d.mime, Size: int64(len(d.data)), SHA256: hex.EncodeToString(hash[:])}, nil
+}
+
+// leaked counts downloads whose buffers were never released.
+func (d *fakeDownloader) leaked() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	count := 0
+	for _, data := range d.buffers {
+		if data.Err() == nil {
+			count++
+		}
+	}
+	return count
 }
 func fixture(t *testing.T) (Dependencies, *fakeTikTok, *fakeDownloader, *core.Assets) {
 	t.Helper()
@@ -100,7 +113,7 @@ func fixture(t *testing.T) (Dependencies, *fakeTikTok, *fakeDownloader, *core.As
 	c.ThumbnailWait = 0
 	assets := core.NewAssets(time.Minute, 100)
 	tt := &fakeTikTok{extraction: core.TikTokExtraction{Platform: "tiktok", SourceID: "7695962883523464478", ContentType: "video", Media: []core.AssetDescriptor{}}}
-	downloader := &fakeDownloader{directory: t.TempDir(), data: []byte("media"), mime: "video/mp4"}
+	downloader := &fakeDownloader{data: []byte("media"), mime: "video/mp4"}
 	return Dependencies{Config: c, TikTok: tt, Instagram: &fakeInstagram{}, Downloader: downloader, Assets: assets, OpenAPI: []byte(`{"openapi":"3.1.0","paths":{}}`)}, tt, downloader, assets
 }
 func request(handler http.Handler, method, path, body string, auth bool) *httptest.ResponseRecorder {
@@ -200,9 +213,8 @@ func TestAssetHTTPStreamsExactBytesAndCleansTemporaryFile(t *testing.T) {
 		t.Fatalf("headers %v", response.Header)
 	}
 	server.Close()
-	entries, err := os.ReadDir(downloader.directory)
-	if err != nil || len(entries) != 0 {
-		t.Fatalf("download not removed: %v %v", entries, err)
+	if downloader.leaked() != 0 {
+		t.Fatal("download not released")
 	}
 }
 

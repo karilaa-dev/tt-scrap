@@ -44,6 +44,7 @@ HTTP tests use local fixtures. Live tests require explicit `TT_SCRAP_LIVE_APP=1`
 | `internal/tiktokapp` | Native registration, signing, app requests, and device catalog |
 | `internal/nettransport` | Shared HTTP transports and explicit proxies |
 | `internal/media` | Images, animation, and native HEIF decoding |
+| `internal/spool` | RAM or temporary-file media buffers that stream while they fill |
 | `openapi.json` | Embedded public API contract |
 
 ## Measure performance
@@ -53,5 +54,11 @@ make bench
 ```
 
 Signing, request-routing, and image-orientation benchmarks run locally. Extraction benchmarks require the test database URL and use local HTTP fixtures with isolated database schemas. They exercise concurrency 1, 4, and 16. `BenchmarkAppDelivery` also exercises the complete Telegram delivery handler at concurrency 1, 16, and 64, with cached metadata, real PostgreSQL checkpoints, a controlled CDN delay, and local multipart uploads whose bytes are verified. It excludes identity generation and signing. These measurements describe local work and simulated upstream waits, not TikTok capacity. Use repeated trials before reporting changes. Keep registration and seed renewal outside upstream-API measurements.
+
+`BenchmarkThrottledVideoDelivery` needs no database. It delivers an 8 MiB video from a CDN fixture limited to 10 MiB/s per connection to a Telegram fixture that accepts 20 MiB/s, which shows the effect of parallel byte ranges and streamed uploads:
+
+```sh
+go test ./internal/httpapi -run '^$' -bench ThrottledVideoDelivery -benchtime 10x
+```
 
 Write benchmark output outside the repository, for example `/tmp/tt-scrap-bench.txt`.

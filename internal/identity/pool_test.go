@@ -405,3 +405,95 @@ func TestDatabaseProbeTimeoutExcludesCheckpointQueue(t *testing.T) {
 		t.Fatal("closed database connection passed its health probe")
 	}
 }
+
+func TestPinnedWaiterRunsBeforeNewWorkAndReleasesReservation(t *testing.T) {
+	cfg, _ := testDatabase(t)
+	p := openTestPool(t, cfg, "")
+	var mu sync.Mutex
+	var leases []*lease
+	var waiters sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+	// Pool shutdown waits for leases, so a failed assertion must release them.
+	t.Cleanup(func() {
+		cancel()
+		waiters.Wait()
+		for _, l := range leases {
+			l.finish(nil)
+		}
+	})
+	track := func(l *lease) *lease {
+		mu.Lock()
+		defer mu.Unlock()
+		leases = append(leases, l)
+		return l
+	}
+	held := make([]*lease, 10)
+	for i := range held {
+		held[i] = track(mustAcquire(t, p, ""))
+	}
+	pinned := held[0].entry.id
+	acquire := func(ctx context.Context, id string) chan *lease {
+		result := make(chan *lease, 1)
+		waiters.Go(func() {
+			l, err := p.acquire(ctx, id)
+			if err != nil {
+				result <- nil
+				return
+			}
+			result <- track(l)
+		})
+		return result
+	}
+	media := acquire(ctx, pinned)
+	waitStats(t, p, func(s Stats) bool { return s.Queued == 1 })
+	// Model the moment after release, before the waiter runs: new work must
+	// not take the identity its queued media is waiting for.
+	p.mu.Lock()
+	held[0].entry.busy = false
+	p.mu.Unlock()
+	short, stop := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	if l, err := p.acquire(short, ""); err == nil {
+		l.finish(nil)
+		t.Fatal("new work took an identity reserved for queued media")
+	}
+	stop()
+	p.mu.Lock()
+	held[0].entry.busy = true
+	p.mu.Unlock()
+	unpinned := acquire(ctx, "")
+	waitStats(t, p, func(s Stats) bool { return s.Queued == 2 })
+	finishLease(t, held[0], nil)
+	var l *lease
+	select {
+	case l = <-media:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pinned waiter did not receive its identity")
+	}
+	if l == nil || l.entry.id != pinned {
+		t.Fatal("pinned waiter lost its identity to new work")
+	}
+	// A cancelled pinned waiter releases its reservation for queued work.
+	abandon, cancelWaiter := context.WithCancel(ctx)
+	abandoned := acquire(abandon, pinned)
+	waitStats(t, p, func(s Stats) bool { return s.Queued == 2 })
+	cancelWaiter()
+	if <-abandoned != nil {
+		t.Fatal("cancelled waiter acquired an identity")
+	}
+	finishLease(t, l, nil)
+	select {
+	case l = <-unpinned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled reservation kept blocking new work")
+	}
+	if l == nil || l.entry.id != pinned {
+		t.Fatal("queued work did not take the released identity")
+	}
+	finishLease(t, l, nil)
+	for _, l := range held[1:] {
+		finishLease(t, l, nil)
+	}
+	if stats := p.Stats(); stats.Busy != 0 || stats.Queued != 0 {
+		t.Fatalf("leases leaked: %+v", stats)
+	}
+}

@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/karilaa-dev/tt-scrap/internal/spool"
 )
 
 func writeImage(t *testing.T, width, height int, format string) string {
@@ -39,14 +41,17 @@ func writeImage(t *testing.T, width, height int, format string) string {
 	}
 	return path
 }
-func configOf(t *testing.T, path string) image.Config {
+func load(t *testing.T, path string) *spool.Buffer {
 	t.Helper()
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	c, _, err := image.DecodeConfig(f)
+	return spool.Bytes(data)
+}
+func configOf(t *testing.T, prepared Prepared) image.Config {
+	t.Helper()
+	c, _, err := image.DecodeConfig(bytes.NewReader(prepared.Data.Bytes()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,12 +61,12 @@ func configOf(t *testing.T, path string) image.Config {
 func TestPhotoPreservesNativeJPEGBytes(t *testing.T) {
 	path := writeImage(t, 600, 400, "jpg")
 	input, _ := os.ReadFile(path)
-	prepared, err := NewProcessor(2, "").Prepare(context.Background(), path, "photo.bin", false)
+	prepared, err := NewProcessor(2).Prepare(context.Background(), load(t, path), "photo.bin", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer prepared.Cleanup()
-	output, _ := os.ReadFile(prepared.Path)
+	output := prepared.Data.Bytes()
 	if prepared.Owned || prepared.ContentType != "image/jpeg" || prepared.Filename != "photo.jpg" || !bytes.Equal(input, output) {
 		t.Fatal("native photo changed")
 	}
@@ -69,17 +74,16 @@ func TestPhotoPreservesNativeJPEGBytes(t *testing.T) {
 
 func TestThumbnailPNGBecomesBoundedJPEG(t *testing.T) {
 	path := writeImage(t, 800, 600, "png")
-	directory := t.TempDir()
-	prepared, err := NewProcessor(1, directory).Prepare(context.Background(), path, "cover.png", true)
+	prepared, err := NewProcessor(1).Prepare(context.Background(), load(t, path), "cover.png", true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer prepared.Cleanup()
-	config := configOf(t, prepared.Path)
-	if prepared.ContentType != "image/jpeg" || prepared.Filename != "cover.jpg" || config.Width != 320 || config.Height != 240 || prepared.Size >= 200000 || !prepared.Owned || filepath.Dir(prepared.Path) != directory {
+	config := configOf(t, prepared)
+	if prepared.ContentType != "image/jpeg" || prepared.Filename != "cover.jpg" || config.Width != 320 || config.Height != 240 || prepared.Size >= 200000 || !prepared.Owned {
 		t.Fatalf("%#v %#v", prepared, config)
 	}
-	data, _ := os.ReadFile(prepared.Path)
+	data := prepared.Data.Bytes()
 	if !bytes.HasPrefix(data, []byte{0xff, 0xd8, 0xff}) {
 		t.Fatal("not JPEG")
 	}
@@ -87,42 +91,42 @@ func TestThumbnailPNGBecomesBoundedJPEG(t *testing.T) {
 
 func TestPhotoPadsExtremeAspectRatio(t *testing.T) {
 	path := writeImage(t, 1000, 10, "png")
-	prepared, err := NewProcessor(1, "").Prepare(context.Background(), path, "wide.png", false)
+	prepared, err := NewProcessor(1).Prepare(context.Background(), load(t, path), "wide.png", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer prepared.Cleanup()
-	config := configOf(t, prepared.Path)
+	config := configOf(t, prepared)
 	if config.Width != 1000 || config.Height != 50 || prepared.ContentType != "image/jpeg" {
 		t.Fatalf("%#v %#v", prepared, config)
 	}
 }
 
 func TestHEICUsesNativeDecoder(t *testing.T) {
-	prepared, err := NewProcessor(1, "").Prepare(context.Background(), "testdata/sample.heic", "sample.heic", false)
+	prepared, err := NewProcessor(1).Prepare(context.Background(), load(t, "testdata/sample.heic"), "sample.heic", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer prepared.Cleanup()
-	config := configOf(t, prepared.Path)
+	config := configOf(t, prepared)
 	if prepared.ContentType != "image/jpeg" || config.Width <= 0 || config.Height <= 0 {
 		t.Fatalf("%#v %#v", prepared, config)
 	}
 }
 
 func TestCorruptImagesFailAndCancelledQueueStops(t *testing.T) {
-	processor := NewProcessor(1, "")
+	processor := NewProcessor(1)
 	path := filepath.Join(t.TempDir(), "bad.jpg")
 	if err := os.WriteFile(path, []byte{0xff, 0xd8, 0xff, 0, 0}, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := processor.Prepare(context.Background(), path, "bad.jpg", false); err == nil {
+	if _, err := processor.Prepare(context.Background(), load(t, path), "bad.jpg", false); err == nil {
 		t.Fatal("accepted corrupt JPEG")
 	}
 	processor.slots <- struct{}{}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := processor.Prepare(ctx, path, "x.jpg", false); err != context.Canceled {
+	if _, err := processor.Prepare(ctx, load(t, path), "x.jpg", false); err != context.Canceled {
 		t.Fatal(err)
 	}
 	<-processor.slots
@@ -142,12 +146,12 @@ func TestJPEGOrientationAppliedToThumbnail(t *testing.T) {
 	if err := os.WriteFile(path, append(withExif, make([]byte, 200000)...), 0600); err != nil {
 		t.Fatal(err)
 	}
-	prepared, err := NewProcessor(1, "").Prepare(context.Background(), path, "rotated.jpg", true)
+	prepared, err := NewProcessor(1).Prepare(context.Background(), load(t, path), "rotated.jpg", true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer prepared.Cleanup()
-	config := configOf(t, prepared.Path)
+	config := configOf(t, prepared)
 	if config.Width != 40 || config.Height != 80 {
 		t.Fatalf("orientation not applied: %#v", config)
 	}
@@ -156,7 +160,7 @@ func TestJPEGOrientationAppliedToThumbnail(t *testing.T) {
 func TestAnimatedImagesBecomeSingleJPEGFrames(t *testing.T) {
 	for _, name := range []string{"animated.webp", "animated.png"} {
 		t.Run(name, func(t *testing.T) {
-			prepared, err := NewProcessor(1, "").Prepare(context.Background(), filepath.Join("testdata", name), name, false)
+			prepared, err := NewProcessor(1).Prepare(context.Background(), load(t, filepath.Join("testdata", name)), name, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -164,12 +168,7 @@ func TestAnimatedImagesBecomeSingleJPEGFrames(t *testing.T) {
 			if !prepared.Owned || prepared.ContentType != "image/jpeg" {
 				t.Fatalf("animation forwarded: %#v", prepared)
 			}
-			f, err := os.Open(prepared.Path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer f.Close()
-			img, err := jpeg.Decode(f)
+			img, err := jpeg.Decode(bytes.NewReader(prepared.Data.Bytes()))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -205,19 +204,20 @@ func TestSmallJPEGThumbnailValidatesPixelStream(t *testing.T) {
 	if err = os.WriteFile(path, broken, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if result, err := NewProcessor(1, t.TempDir()).Prepare(context.Background(), path, "cover.jpg", true); err == nil {
+	if result, err := NewProcessor(1).Prepare(context.Background(), load(t, path), "cover.jpg", true); err == nil {
 		result.Cleanup()
 		t.Fatal("truncated JPEG accepted as a thumbnail")
 	}
 	if err = os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	result, err := NewProcessor(1, t.TempDir()).Prepare(context.Background(), path, "cover.jpg", true)
+	source := load(t, path)
+	result, err := NewProcessor(1).Prepare(context.Background(), source, "cover.jpg", true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer result.Cleanup()
-	if result.Owned || result.Path != path {
+	if result.Owned || result.Data != source {
 		t.Fatal("valid thumbnail was unnecessarily re-encoded")
 	}
 }

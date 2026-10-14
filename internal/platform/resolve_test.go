@@ -208,3 +208,32 @@ func TestAppShortLinkStopsBeforePostPage(t *testing.T) {
 		})
 	}
 }
+
+func TestShareLinkStopsAtPagesThatCannotNameAPost(t *testing.T) {
+	for target, id := range map[string]string{
+		"https://www.tiktok.com/?_r=1":                        "",
+		"https://www.tiktok.com/@creator?_t=share":            "",
+		"https://m.tiktok.com/v/1234567890123456789.html?u=1": "1234567890123456789",
+	} {
+		t.Run(target, func(t *testing.T) {
+			var shares, pages atomic.Int32
+			service := resolutionFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/short" {
+					pages.Add(1)
+					w.Write([]byte("large TikTok page"))
+					return
+				}
+				shares.Add(1)
+				http.Redirect(w, r, target, http.StatusFound)
+			})
+			result, err := service.ResolveURL(context.Background(), "https://vm.tiktok.com/short")
+			var failure *core.Error
+			if id == "" && (!errors.As(err, &failure) || failure.Code != "invalid_link") || id != "" && (err != nil || result.SourceID != id || result.ResolvedURL != target) {
+				t.Fatalf("resolution = %+v, error = %v", result, err)
+			}
+			if shares.Load() != 1 || pages.Load() != 0 {
+				t.Fatalf("share requests = %d, page requests = %d", shares.Load(), pages.Load())
+			}
+		})
+	}
+}

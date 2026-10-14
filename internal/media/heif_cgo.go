@@ -23,7 +23,13 @@ import (
 	"unsafe"
 )
 
-func decodeHEIF(path string) (image.Image, error) {
+func decodeHEIF(data []byte) (image.Image, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty HEIF image")
+	}
+	// The context references this C copy until it is freed.
+	encoded := C.CBytes(data)
+	defer C.free(encoded)
 	ctx := C.heif_context_alloc()
 	if ctx == nil {
 		return nil, fmt.Errorf("cannot allocate HEIF decoder")
@@ -31,9 +37,7 @@ func decodeHEIF(path string) (image.Image, error) {
 	defer C.heif_context_free(ctx)
 	C.heif_context_set_maximum_image_size_limit(ctx, 10000)
 	C.heif_context_set_max_decoding_threads(ctx, 1)
-	filename := C.CString(path)
-	defer C.free(unsafe.Pointer(filename))
-	if result := C.heif_context_read_from_file(ctx, filename, nil); result.code != C.heif_error_Ok {
+	if result := C.heif_context_read_from_memory_without_copy(ctx, encoded, C.size_t(len(data)), nil); result.code != C.heif_error_Ok {
 		return nil, fmt.Errorf("cannot read HEIF image (%d)", result.code)
 	}
 	var handle *C.struct_heif_image_handle
@@ -55,10 +59,10 @@ func decodeHEIF(path string) (image.Image, error) {
 	if plane == nil || int(stride) < w*4 {
 		return nil, fmt.Errorf("HEIF pixel plane missing")
 	}
-	data := unsafe.Slice((*byte)(unsafe.Pointer(plane)), int(stride)*h)
+	pixels := unsafe.Slice((*byte)(unsafe.Pointer(plane)), int(stride)*h)
 	img := image.NewNRGBA(image.Rect(0, 0, w, h))
 	for y := 0; y < h; y++ {
-		copy(img.Pix[y*img.Stride:y*img.Stride+w*4], data[y*int(stride):y*int(stride)+w*4])
+		copy(img.Pix[y*img.Stride:y*img.Stride+w*4], pixels[y*int(stride):y*int(stride)+w*4])
 	}
 	return img, nil
 }

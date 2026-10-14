@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -47,7 +46,7 @@ type response struct {
 	status   int
 	headers  http.Header
 	data     []byte
-	file     *os.File
+	body     io.Reader
 	cleanup  func()
 	delivery *DeliveryEvent
 }
@@ -105,24 +104,21 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if result.cleanup != nil {
 		defer result.cleanup()
 	}
-	if result.file != nil {
-		defer result.file.Close()
-	}
 	elapsed := time.Since(started)
 	for key, values := range result.headers {
 		w.Header()[key] = values
 	}
 	w.Header().Set("X-Request-ID", id)
 	w.Header().Set("Server-Timing", fmt.Sprintf("app;dur=%.3f", float64(elapsed)/float64(time.Millisecond)))
-	if result.file == nil {
+	if result.body == nil {
 		w.Header().Set("Content-Length", strconv.Itoa(len(result.data)))
 	}
 	written = true
 	w.WriteHeader(result.status)
 	var size int64
 	if r.Method != "HEAD" {
-		if result.file != nil {
-			size, _ = io.Copy(w, result.file)
+		if result.body != nil {
+			size, _ = io.Copy(w, result.body)
 		} else {
 			n, _ := w.Write(result.data)
 			size = int64(n)
@@ -227,13 +223,8 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) (response, error
 		if err != nil {
 			return response{}, err
 		}
-		file, err := os.Open(asset.Path)
-		if err != nil {
-			asset.Cleanup()
-			return response{}, err
-		}
 		filename := attachmentFilename.Replace(media.FilenameForType(assetContext.Filename, asset.ContentType))
-		return response{status: 200, file: file, cleanup: asset.Cleanup, headers: http.Header{"Content-Type": []string{asset.ContentType}, "Content-Length": []string{strconv.FormatInt(asset.Size, 10)}, "Content-Disposition": []string{`attachment; filename="` + filename + `"`}, "Etag": []string{`"` + asset.SHA256 + `"`}, "X-Content-Sha256": []string{asset.SHA256}, "Cache-Control": []string{"private, no-store"}}}, nil
+		return response{status: 200, body: asset.Data.Reader(r.Context(), 0, asset.Size), cleanup: asset.Cleanup, headers: http.Header{"Content-Type": []string{asset.ContentType}, "Content-Length": []string{strconv.FormatInt(asset.Size, 10)}, "Content-Disposition": []string{`attachment; filename="` + filename + `"`}, "Etag": []string{`"` + asset.SHA256 + `"`}, "X-Content-Sha256": []string{asset.SHA256}, "Cache-Control": []string{"private, no-store"}}}, nil
 	}
 	switch path {
 	case preparationPath:
