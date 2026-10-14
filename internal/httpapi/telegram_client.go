@@ -128,6 +128,8 @@ func (c *telegramClient) call(ctx context.Context, method string, parameters fie
 	return telegramCall{Method: method, Status: response.StatusCode, Body: data, ContentType: resultType, Value: value, OK: response.StatusCode >= 200 && response.StatusCode < 300 && ok}, nil
 }
 
+var multipartQuote = strings.NewReplacer("\\", "\\\\", "\"", "\\\"", "\r", "_", "\n", "_")
+
 // Multipart headers are tiny; file readers stream directly from disk with exact length.
 func multipartBody(parameters fields, uploads []upload) (io.Reader, string, int64, func(), error) {
 	var buffer bytes.Buffer
@@ -192,8 +194,7 @@ func multipartBody(parameters fields, uploads []upload) (io.Reader, string, int6
 			return nil, "", 0, func() {}, fmt.Errorf("prepared upload size changed")
 		}
 		header := make(textproto.MIMEHeader)
-		quote := strings.NewReplacer("\\", "\\\\", "\"", "\\\"", "\r", "_", "\n", "_")
-		header.Set("Content-Disposition", `form-data; name="`+quote.Replace(item.Field)+`"; filename="`+quote.Replace(item.Filename)+`"`)
+		header.Set("Content-Disposition", `form-data; name="`+multipartQuote.Replace(item.Field)+`"; filename="`+multipartQuote.Replace(item.Filename)+`"`)
 		header.Set("Content-Type", item.ContentType)
 		if _, err = writer.CreatePart(header); err != nil {
 			cleanup()

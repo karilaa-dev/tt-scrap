@@ -56,8 +56,11 @@ func NewProcessor(concurrency int, directory string) *Processor {
 	return &Processor{slots: make(chan struct{}, concurrency), directory: directory}
 }
 
+var extensions = map[string]string{"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif", "image/heic": ".heic", "image/heif": ".heif", "image/avif": ".avif", "image/bmp": ".bmp", "image/tiff": ".tiff", "video/mp4": ".mp4", "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/ogg": ".ogg"}
+
 func FilenameForType(name, contentType string) string {
-	ext := map[string]string{"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif", "image/heic": ".heic", "image/heif": ".heif", "image/avif": ".avif", "image/bmp": ".bmp", "image/tiff": ".tiff", "video/mp4": ".mp4", "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/ogg": ".ogg"}[strings.Split(contentType, ";")[0]]
+	kind, _, _ := strings.Cut(contentType, ";")
+	ext := extensions[kind]
 	if ext == "" {
 		return name
 	}
@@ -327,8 +330,8 @@ func orient(img image.Image, orientation int) image.Image {
 		ow, oh = h, w
 	}
 	out := image.NewRGBA(image.Rect(0, 0, ow, oh))
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
+	for y := range h {
+		for x := range w {
 			dx, dy := x, y
 			switch orientation {
 			case 2:
@@ -346,8 +349,28 @@ func orient(img image.Image, orientation int) image.Image {
 			case 8:
 				dx, dy = y, w-1-x
 			}
-			out.Set(dx, dy, img.At(b.Min.X+x, b.Min.Y+y))
+			i := out.PixOffset(dx, dy)
+			out.Pix[i], out.Pix[i+1], out.Pix[i+2], out.Pix[i+3] = rgbaAt(img, b.Min.X+x, b.Min.Y+y)
 		}
 	}
 	return out
+}
+
+// rgbaAt reads decoder pixel types directly; boxing every pixel as a color.Color
+// costs two allocations per pixel.
+func rgbaAt(img image.Image, x, y int) (r, g, b, a uint8) {
+	switch src := img.(type) {
+	case *image.YCbCr:
+		c := src.COffset(x, y)
+		cr, cg, cb, _ := color.YCbCr{Y: src.Y[src.YOffset(x, y)], Cb: src.Cb[c], Cr: src.Cr[c]}.RGBA()
+		return uint8(cr >> 8), uint8(cg >> 8), uint8(cb >> 8), 0xff
+	case *image.Gray:
+		v := src.Pix[src.PixOffset(x, y)]
+		return v, v, v, 0xff
+	case *image.RGBA:
+		i := src.PixOffset(x, y)
+		return src.Pix[i], src.Pix[i+1], src.Pix[i+2], src.Pix[i+3]
+	}
+	c := color.RGBAModel.Convert(img.At(x, y)).(color.RGBA)
+	return c.R, c.G, c.B, c.A
 }

@@ -81,8 +81,10 @@ type Pool struct {
 	preparationTimeout            time.Duration
 }
 
+var schemaPattern = regexp.MustCompile(`^[a-z_][a-z_0-9]{0,62}$`)
+
 func Open(ctx context.Context, cfg core.Config, addresses []string) (*Pool, error) {
-	if !regexp.MustCompile(`^[a-z_][a-z_0-9]{0,62}$`).MatchString(cfg.DBSchema) {
+	if !schemaPattern.MatchString(cfg.DBSchema) {
 		return nil, core.ConfigError("DB_SCHEMA")
 	}
 	lifetime, stop := context.WithCancel(context.Background())

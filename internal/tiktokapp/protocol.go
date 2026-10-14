@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -67,40 +69,65 @@ type RoutingRule struct {
 var appHostPattern = regexp.MustCompile(`(?:^|\.)tiktok(?:v|w)?\.(com|us|eu)$`)
 var routeHostPattern = regexp.MustCompile(`^[a-z0-9.-]+\.tiktok(?:v|w)?\.(com|us|eu)$`)
 
+// Routing patterns arrive with registrations and repeat across identities, so
+// each is compiled once. The bound caps memory if upstream varies them.
+const maxRoutePatterns = 1024
+
+var routePatterns sync.Map
+var routePatternCount atomic.Int32
+
+func routePattern(pattern string) *regexp.Regexp {
+	if cached, ok := routePatterns.Load(pattern); ok {
+		return cached.(*regexp.Regexp)
+	}
+	re, _ := regexp.Compile(pattern)
+	if routePatternCount.Load() < maxRoutePatterns {
+		if _, loaded := routePatterns.LoadOrStore(pattern, re); !loaded {
+			routePatternCount.Add(1)
+		}
+	}
+	return re
+}
+
 func IsAppHost(u *url.URL) bool {
 	return u.Scheme == "https" && appHostPattern.MatchString(u.Hostname())
+}
+func routeHostMatches(hosts []string, hostname string) bool {
+	for _, host := range hosts {
+		if host == "*" || host == hostname || (strings.HasPrefix(host, "*.") && strings.HasSuffix(hostname, host[1:])) {
+			return true
+		}
+	}
+	return false
+}
+func routePathMatches(p RoutingSelectors, path string) bool {
+	for _, part := range p.ContainGroup {
+		if strings.Contains(path, part) {
+			return true
+		}
+	}
+	for _, part := range p.EqualGroup {
+		if path == part {
+			return true
+		}
+	}
+	for _, part := range p.PrefixesGroup {
+		if strings.HasPrefix(path, part) {
+			return true
+		}
+	}
+	for _, part := range p.PatternGroup {
+		if re := routePattern(part); re != nil && re.MatchString(path) {
+			return true
+		}
+	}
+	return false
 }
 func routeURL(original *url.URL, rules []RoutingRule) *url.URL {
 	u := *original
 	for _, rule := range rules {
 		p := rule.Param
-		hostMatch := false
-		for _, host := range p.HostGroup {
-			if host == "*" || host == u.Hostname() || (strings.HasPrefix(host, "*.") && strings.HasSuffix(u.Hostname(), host[1:])) {
-				hostMatch = true
-				break
-			}
-		}
-		if !hostMatch {
-			continue
-		}
-		pathMatch := false
-		for _, part := range p.ContainGroup {
-			pathMatch = pathMatch || strings.Contains(u.Path, part)
-		}
-		for _, part := range p.EqualGroup {
-			pathMatch = pathMatch || u.Path == part
-		}
-		for _, part := range p.PrefixesGroup {
-			pathMatch = pathMatch || strings.HasPrefix(u.Path, part)
-		}
-		for _, part := range p.PatternGroup {
-			re, e := regexp.Compile(part)
-			if e == nil {
-				pathMatch = pathMatch || re.MatchString(u.Path)
-			}
-		}
-		if !pathMatch {
+		if !routeHostMatches(p.HostGroup, u.Hostname()) || !routePathMatches(p, u.Path) {
 			continue
 		}
 		target := ""

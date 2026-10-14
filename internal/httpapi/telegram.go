@@ -36,6 +36,10 @@ var documentFields = union(commonFields, "disable_content_type_detection")
 var audioFields = union(commonFields, "duration", "performer", "title")
 var photoFields = union(commonFields, "has_spoiler", "show_caption_above_media")
 var groupFields = set(strings.Fields("allow_paid_broadcast business_connection_id chat_id direct_messages_topic_id disable_notification message_effect_id message_thread_id protect_content reply_parameters")...)
+var carouselFields = union(groupFields, "caption", "caption_entities", "parse_mode")
+var carouselDocumentFields = union(carouselFields, "disable_content_type_detection")
+var carouselMediaFields = union(carouselFields, "show_caption_above_media", "has_spoiler", "start_timestamp", "supports_streaming")
+var sendMethods = map[string]string{"document": "sendDocument", "photo": "sendPhoto", "audio": "sendAudio", "video": "sendVideo"}
 var knownFields = func() stringSet {
 	result := set("chat_id", "caption_entities")
 	for _, list := range [][]string{telegramStringFields, telegramIntegerFields, telegramBoolFields, telegramObjectFields} {
@@ -241,11 +245,9 @@ func (s *telegramService) deliverInstagram(ctx context.Context, request telegram
 	document, multiple := request.Delivery == "document", len(extraction.Media) > 1
 	allowed := photoFields
 	if multiple {
-		allowed = union(groupFields, "caption", "caption_entities", "parse_mode")
+		allowed = carouselMediaFields
 		if document {
-			allowed = union(allowed, "disable_content_type_detection")
-		} else {
-			allowed = union(allowed, "show_caption_above_media", "has_spoiler", "start_timestamp", "supports_streaming")
+			allowed = carouselDocumentFields
 		}
 	} else if document {
 		allowed = documentFields
@@ -424,7 +426,7 @@ func (s *telegramService) send(ctx context.Context, items []deliveryItem, parame
 		} else if field == "image" {
 			field = "photo"
 		}
-		method := map[string]string{"document": "sendDocument", "photo": "sendPhoto", "audio": "sendAudio", "video": "sendVideo"}[field]
+		method := sendMethods[field]
 		uploads := []upload{{Prepared: first.Media, Field: field + "_file"}}
 		parameters[field] = "attach://" + field + "_file"
 		if first.Thumbnail != nil {

@@ -25,7 +25,7 @@ type Downloader struct {
 }
 
 func NewDownloader(cfg core.Config, backend core.AppBackend) *Downloader {
-	return &Downloader{cfg: cfg, app: backend, client: &http.Client{Transport: newTransport(cfg.HTTPMaxConnections)}, gate: core.NewLimiter(cfg.DownloadConcurrency, cfg.MaxQueuedRequests), buffers: sync.Pool{New: func() any { return make([]byte, 128<<10) }}}
+	return &Downloader{cfg: cfg, app: backend, client: &http.Client{Transport: newTransport(cfg.HTTPMaxConnections)}, gate: core.NewLimiter(cfg.DownloadConcurrency, cfg.MaxQueuedRequests), buffers: sync.Pool{New: func() any { buffer := make([]byte, 128<<10); return &buffer }}}
 }
 func (d *Downloader) Close() { d.client.CloseIdleConnections() }
 func (d *Downloader) WithIdentity(ctx context.Context, id string, run func(core.DownloadFunc) error) error {
@@ -167,8 +167,9 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 		}
 	}()
 	digest := sha256.New()
-	buffer := d.buffers.Get().([]byte)
-	defer d.buffers.Put(buffer)
+	pooled := d.buffers.Get().(*[]byte)
+	defer d.buffers.Put(pooled)
+	buffer := *pooled
 	prefix := make([]byte, 0, 512)
 	var received int64
 	for {
