@@ -98,6 +98,7 @@ type deliveryItem struct {
 	Descriptor core.AssetDescriptor
 	Kind       string
 	Cover      *core.AssetDescriptor
+	Asset      core.AssetContext
 }
 type preparedItem struct {
 	Media     media.Prepared
@@ -260,56 +261,56 @@ func (s *telegramService) deliverInstagram(ctx context.Context, request telegram
 	return s.send(ctx, items, parameters, document, true)
 }
 
-func (s *telegramService) prepare(ctx context.Context, item deliveryItem, document bool) (result preparedItem, err error) {
+func (s *telegramService) prepare(ctx context.Context, item deliveryItem, document bool, download core.DownloadFunc) (result preparedItem, err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	result.Kind = item.Kind
-	type thumbnailResult struct {
-		image *media.Prepared
-		asset *core.Downloaded
-	}
-	thumbnail := make(chan thumbnailResult, 1)
-	go func() {
-		reply := thumbnailResult{}
-		defer func() { thumbnail <- reply }()
-		if item.Cover == nil || document || item.Kind == "image" || s.settings.ThumbnailWait <= 0 {
-			return
+	if item.Cover != nil && !document && item.Kind != "image" && s.settings.ThumbnailWait > 0 {
+		type thumbnailResult struct {
+			image *media.Prepared
+			asset *core.Downloaded
 		}
-		thumbnailContext, cancel := context.WithTimeout(ctx, s.settings.ThumbnailWait)
-		defer cancel()
-		assetContext, err := s.assets.GetAsset(item.Cover.AssetID)
-		if err != nil {
-			return
-		}
-		asset, err := s.downloader.Download(thumbnailContext, assetContext, 0)
-		if err != nil {
-			return
-		}
-		reply.asset = asset
-		converted, err := s.images.Prepare(thumbnailContext, asset.Path, item.Descriptor.AssetID+"_thumbnail.jpg", true)
-		if err != nil {
-			return
-		}
-		if thumbnailContext.Err() != nil {
-			converted.Cleanup()
-			return
-		}
-		reply.image = &converted
-	}()
-	defer func() {
-		reply := <-thumbnail
-		result.Thumbnail = reply.image
-		if reply.asset != nil {
-			result.Owned = append(result.Owned, reply.asset)
-		}
-	}()
-	assetContext, err := s.assets.GetAsset(item.Descriptor.AssetID)
-	if err != nil {
-		return result, err
+		thumbnail := make(chan thumbnailResult, 1)
+		go func() {
+			reply := thumbnailResult{}
+			defer func() { thumbnail <- reply }()
+			thumbnailContext, cancel := context.WithTimeout(ctx, s.settings.ThumbnailWait)
+			defer cancel()
+			assetContext, err := s.assets.GetAsset(item.Cover.AssetID)
+			if err != nil {
+				return
+			}
+			asset, err := download(thumbnailContext, assetContext, 0)
+			if err != nil {
+				return
+			}
+			reply.asset = asset
+			converted, err := s.images.Prepare(thumbnailContext, asset.Path, item.Descriptor.AssetID+"_thumbnail.jpg", true)
+			if err != nil {
+				return
+			}
+			if thumbnailContext.Err() != nil {
+				converted.Cleanup()
+				return
+			}
+			reply.image = &converted
+		}()
+		defer func() {
+			if err != nil {
+				cancel()
+			}
+			reply := <-thumbnail
+			result.Thumbnail = reply.image
+			if reply.asset != nil {
+				result.Owned = append(result.Owned, reply.asset)
+			}
+		}()
 	}
 	limit := s.settings.TelegramMaxBytes
 	if item.Kind == "image" {
 		limit = 0
 	}
-	asset, err := s.downloader.Download(ctx, assetContext, limit)
+	asset, err := download(ctx, item.Asset, limit)
 	if err != nil {
 		return result, err
 	}
@@ -328,32 +329,71 @@ func (s *telegramService) prepare(ctx context.Context, item deliveryItem, docume
 	return result, nil
 }
 
-func (s *telegramService) send(ctx context.Context, items []deliveryItem, parameters fields, document, instagram bool) (deliveryResult, error) {
-	workContext, cancel := context.WithCancel(ctx)
+func (s *telegramService) prepareItems(ctx context.Context, items []deliveryItem, indices []int, prepared []preparedItem, document bool, download core.DownloadFunc) error {
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	workers := min(len(indices), max(1, s.settings.TelegramPreparationConcurrency))
+	var group sync.WaitGroup
+	var once sync.Once
+	var failure error
+	for worker := range workers {
+		group.Go(func() {
+			for offset := worker; offset < len(indices); offset += workers {
+				if ctx.Err() != nil {
+					return
+				}
+				i := indices[offset]
+				value, err := s.prepare(ctx, items[i], document, download)
+				prepared[i] = value
+				if err != nil {
+					once.Do(func() { failure = err; cancel() })
+					return
+				}
+			}
+		})
+	}
+	group.Wait()
+	if failure != nil {
+		return failure
+	}
+	return ctx.Err()
+}
+
+func (s *telegramService) send(ctx context.Context, items []deliveryItem, parameters fields, document, instagram bool) (deliveryResult, error) {
 	prepared := make([]preparedItem, len(items))
 	defer func() {
 		for i := range prepared {
 			prepared[i].cleanup()
 		}
 	}()
-	var group sync.WaitGroup
-	var once sync.Once
-	var failure error
-	for i, item := range items {
-		group.Add(1)
-		go func() {
-			defer group.Done()
-			value, err := s.prepare(workContext, item, document)
-			prepared[i] = value
-			if err != nil {
-				once.Do(func() { failure = err; cancel() })
-			}
-		}()
+	groups := make(map[string][]int)
+	var identities []string
+	for i := range items {
+		asset, err := s.assets.GetAsset(items[i].Descriptor.AssetID)
+		if err != nil {
+			return deliveryResult{}, err
+		}
+		items[i].Asset = asset
+		if _, ok := groups[asset.IdentityID]; !ok {
+			identities = append(identities, asset.IdentityID)
+		}
+		groups[asset.IdentityID] = append(groups[asset.IdentityID], i)
 	}
-	group.Wait()
-	if failure != nil {
-		return deliveryResult{}, failure
+	// An extraction normally has one identity. Never hold multiple identity
+	// leases at once, even if cached assets originate from different extractions.
+	for _, id := range identities {
+		err := s.downloader.WithIdentity(ctx, id, func(download core.DownloadFunc) error {
+			indices := groups[id]
+			// Recovery reruns preparation only; uploads happen after the lease closes.
+			for _, i := range indices {
+				prepared[i].cleanup()
+				prepared[i] = preparedItem{}
+			}
+			return s.prepareItems(ctx, items, indices, prepared, document, download)
+		})
+		if err != nil {
+			return deliveryResult{}, err
+		}
 	}
 	for _, item := range prepared {
 		if s.settings.TelegramMaxBytes > 0 && item.Media.Size > s.settings.TelegramMaxBytes {

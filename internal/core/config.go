@@ -31,6 +31,7 @@ type Config struct {
 	InstagramTimeout, InstagramRetryDelay                                             time.Duration
 	TelegramBotToken, TelegramAPIBaseURL                                              string
 	TelegramPipelineConcurrency, TelegramUploadConcurrency                            int
+	TelegramPreparationConcurrency                                                    int
 	TelegramTimeout, ThumbnailWait                                                    time.Duration
 	TelegramMaxBytes                                                                  int64
 	ImageConcurrency                                                                  int
@@ -48,7 +49,8 @@ func DefaultConfig() Config {
 		RapidAPIBaseURL:      "https://instagram-downloader-download-instagram-stories-videos4.p.rapidapi.com",
 		InstagramConcurrency: 4, InstagramMaxAttempts: 3, InstagramTimeout: 3 * time.Second, InstagramRetryDelay: 100 * time.Millisecond,
 		TelegramAPIBaseURL: "https://api.telegram.org", TelegramPipelineConcurrency: 32, TelegramUploadConcurrency: 20,
-		TelegramTimeout: 600 * time.Second, ThumbnailWait: 1500 * time.Millisecond, TelegramMaxBytes: 50 * 1024 * 1024,
+		TelegramPreparationConcurrency: 4,
+		TelegramTimeout:                600 * time.Second, ThumbnailWait: 1500 * time.Millisecond, TelegramMaxBytes: 50 * 1024 * 1024,
 		ImageConcurrency: 4, LogLevel: "INFO",
 	}
 }
@@ -125,6 +127,7 @@ func ParseConfig(env map[string]string) (Config, error) {
 	number("INSTAGRAM_MAX_ATTEMPTS", &c.InstagramMaxAttempts, 1, 10)
 	number("TELEGRAM_PIPELINE_CONCURRENCY", &c.TelegramPipelineConcurrency, 1, 1024)
 	number("TELEGRAM_UPLOAD_CONCURRENCY", &c.TelegramUploadConcurrency, 1, 256)
+	number("TELEGRAM_PREPARATION_CONCURRENCY", &c.TelegramPreparationConcurrency, 1, 64)
 	number("IMAGE_CONVERSION_WORKERS", &c.ImageConcurrency, 0, 64)
 	if c.ImageConcurrency == 0 {
 		c.ImageConcurrency = 4

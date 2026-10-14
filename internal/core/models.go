@@ -135,7 +135,11 @@ type AssetReader interface {
 }
 type Downloader interface {
 	Download(context.Context, AssetContext, int64) (*Downloaded, error)
+	// WithIdentity shares one lease across concurrent downloads. The callback may
+	// be retried after identity recovery; it must join its workers before returning.
+	WithIdentity(context.Context, string, func(DownloadFunc) error) error
 }
+type DownloadFunc func(context.Context, AssetContext, int64) (*Downloaded, error)
 type HTTPDoer interface {
 	Do(*http.Request) (*http.Response, error)
 }

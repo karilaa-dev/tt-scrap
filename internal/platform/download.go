@@ -29,16 +29,34 @@ func NewDownloader(cfg core.Config, backend core.AppBackend, proxies []string) *
 	return &Downloader{cfg: cfg, app: backend, proxies: append([]string(nil), proxies...), transports: newTransports(cfg.HTTPMaxConnections), gate: core.NewLimiter(cfg.DownloadConcurrency, cfg.MaxQueuedRequests), buffers: sync.Pool{New: func() any { return make([]byte, 128<<10) }}}
 }
 func (d *Downloader) Close() { d.transports.close() }
-func (d *Downloader) Download(ctx context.Context, asset core.AssetContext, maxBytes int64) (*core.Downloaded, error) {
-	release, e := d.gate.Acquire(ctx)
-	if e != nil {
-		return nil, e
+func (d *Downloader) WithIdentity(ctx context.Context, id string, run func(core.DownloadFunc) error) error {
+	if id == "" {
+		return run(d.Download)
 	}
-	defer release()
+	if d.app == nil {
+		return core.Upstream("TikTok app backend is unavailable")
+	}
+	return d.app.WithMedia(ctx, id, func(open core.OpenAppMedia) error {
+		return run(func(ctx context.Context, asset core.AssetContext, maxBytes int64) (*core.Downloaded, error) {
+			if asset.IdentityID != id {
+				return nil, core.Upstream("Media does not belong to the leased identity")
+			}
+			return d.downloadAsset(ctx, asset, maxBytes, open)
+		})
+	})
+}
+func (d *Downloader) Download(ctx context.Context, asset core.AssetContext, maxBytes int64) (*core.Downloaded, error) {
+	return d.downloadAsset(ctx, asset, maxBytes, nil)
+}
+func (d *Downloader) downloadAsset(ctx context.Context, asset core.AssetContext, maxBytes int64, open core.OpenAppMedia) (*core.Downloaded, error) {
+	var release func()
 	var cancel context.CancelFunc
 	defer func() {
 		if cancel != nil {
 			cancel()
+		}
+		if release != nil {
+			release()
 		}
 	}()
 	if d.cfg.MaxAssetBytes > 0 && (maxBytes <= 0 || d.cfg.MaxAssetBytes < maxBytes) {
@@ -46,7 +64,15 @@ func (d *Downloader) Download(ctx context.Context, asset core.AssetContext, maxB
 	}
 	var video, audio *core.Downloaded
 	transfer := func(open core.OpenAppMedia) error {
-		// Identity queue time is outside the transfer budget; caller cancellation still applies.
+		// Acquire the identity first so its waiters cannot exhaust transfer capacity.
+		if release == nil {
+			var err error
+			release, err = d.gate.Acquire(ctx)
+			if err != nil {
+				return err
+			}
+		}
+		// Queue time is outside the transfer budget; caller cancellation still applies.
 		if cancel == nil {
 			ctx, cancel = context.WithTimeout(ctx, d.cfg.DownloadTimeout)
 		}
@@ -104,7 +130,10 @@ func (d *Downloader) Download(ctx context.Context, asset core.AssetContext, maxB
 		}
 		return failure
 	}
-	if asset.IdentityID != "" {
+	var e error
+	if open != nil {
+		e = transfer(open)
+	} else if asset.IdentityID != "" {
 		if d.app == nil {
 			return nil, core.Upstream("TikTok app backend is unavailable")
 		}

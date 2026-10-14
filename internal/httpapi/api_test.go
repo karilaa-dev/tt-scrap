@@ -64,6 +64,9 @@ type fakeDownloader struct {
 	calls     int
 }
 
+func (d *fakeDownloader) WithIdentity(_ context.Context, _ string, run func(core.DownloadFunc) error) error {
+	return run(d.Download)
+}
 func (d *fakeDownloader) Download(ctx context.Context, asset core.AssetContext, _ int64) (*core.Downloaded, error) {
 	d.mu.Lock()
 	d.calls++

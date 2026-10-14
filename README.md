@@ -40,7 +40,7 @@ Downloads preserve `Content-Length`, MIME type, SHA-256, ETag, and attachment he
 
 ## Identity lifecycle
 
-Only `scrap_proxies` and `scrap_identities` are managed. App mode loads them once into RAM. Selection, balancing, cooldowns, and identity information reads then happen in memory; operation results are written to PostgreSQL after the operation finishes.
+Video information retained by tt-bot stays in its database; tt-scrap caches API responses and temporary asset references in RAM. Only `scrap_proxies` and `scrap_identities` are managed by tt-scrap in PostgreSQL. App mode loads them once into RAM. Selection, balancing, cooldowns, and identity information reads then happen in memory; operation results are written to PostgreSQL after the operation finishes.
 
 Each proxy address has ten identity slots. Before opening the API listener, startup registers missing slots and refreshes expired signing material. One worker per proxy runs in parallel with the other proxies; each address waits at least ten seconds after an attempt completes before starting the next one. Fresh saved identities are reused. A slot retains its proxy permanently and renews signing material on use after three hours. Explicit signing failures trigger renewal; invalid device registrations trigger recreation. Network errors and rate limits apply cooldowns rather than discarding valid identities.
 
@@ -60,11 +60,11 @@ POST returns `202` for a running job or `200` when the pool is already prepared.
 
 ## Throughput and memory
 
-Upstream connections are pooled and reused. Matching metadata requests share work. Downloads and Telegram multipart uploads stream through temporary files without buffering entire videos in RAM. Native image conversions have a separate concurrency bound. Queues are bounded, and cancellation propagates through network calls and preparation.
+Upstream connections are pooled and reused. Matching metadata requests share work. Downloads and Telegram multipart uploads stream through temporary files without buffering entire videos in RAM. App deliveries share one identity lease across video, thumbnail, and slideshow downloads, with one database checkpoint after preparation. Identity waits do not occupy download slots. Native image conversions have a separate concurrency bound. Queues are bounded, and cancellation propagates through network calls and preparation.
 
 App video selection uses only API metadata: highest pixel resolution, then frame rate, then bitrate. Extraction makes no CDN quality-probe requests. Download validation still inspects the actual downloaded file. Protocol clients and cookie jars stay in RAM across operations. The [app optimization comparison](docs/go-app-optimization.md) describes the earlier build with probes; those measurements do not measure the current selection path.
 
-Tune `EXTRACTION_CONCURRENCY`, `DOWNLOAD_CONCURRENCY`, `HTTP_MAX_CONNECTIONS`, `MAX_QUEUED_REQUESTS`, and Telegram concurrency limits for the number of proxies and available memory. `IMAGE_CONVERSION_WORKERS` controls simultaneous decoded images. `MAX_ASSET_BYTES` limits downloads; `GOMEMLIMIT` provides an optional Go heap budget. Request IDs, timings, status codes, and byte counts are logged as JSON.
+Tune `EXTRACTION_CONCURRENCY`, `DOWNLOAD_CONCURRENCY`, `HTTP_MAX_CONNECTIONS`, `MAX_QUEUED_REQUESTS`, and Telegram concurrency limits for the number of proxies and available memory. `TELEGRAM_PREPARATION_CONCURRENCY` defaults to four media items per delivery (thumbnails run alongside), so a large album cannot create a worker for every image. `TELEGRAM_PIPELINE_CONCURRENCY` bounds whole deliveries and `TELEGRAM_UPLOAD_CONCURRENCY` bounds uploads. `IMAGE_CONVERSION_WORKERS` controls simultaneous decoded images. `MAX_ASSET_BYTES` limits downloads; `GOMEMLIMIT` provides an optional Go heap budget. Request IDs, timings, status codes, and byte counts are logged as JSON.
 
 The [18-minute Go/Python comparison](docs/go-python-comparison.md) measured substantially lower Go CPU and memory use, with close, network-dependent end-to-end latency. It covers metadata, downloads, both consecutively, and isolated API requests with signing excluded, at concurrency one and four. See [verification results](docs/go-verification.md) for race tests, real downloads and container checks.
 

@@ -1,5 +1,28 @@
 # Go project verification
 
+## Shared app-media preparation (2026-10-14)
+
+App Telegram delivery now shares one identity lease across related media. Video and thumbnail download together; slideshows use four preparation workers by default. One checkpoint follows preparation, and the lease is released before Telegram upload. Identity waiters acquire no download permits. `TELEGRAM_PREPARATION_CONCURRENCY` controls per-delivery workers; existing download, conversion, pipeline, upload, and queue limits remain in force. tt-bot continues to own persisted video information; no media or video-info database cache was added.
+
+Both serialization and download-slot starvation were reproduced on `84c34f7` before the fix. `make check` passed against isolated PostgreSQL 18. Race-enabled HTTP tests additionally verified 128 simultaneous deliveries, 1,024 byte-checked images, a five-transfer cap, one checkpoint per delivery, no per-delivery database reads, cancellation, size limits, signature refresh, device recreation, no duplicate Telegram uploads, and temporary-file cleanup. Existing HEIC, adaptive-track budget, fallback, web, Instagram, and API-contract tests passed.
+
+Five alternating before/after trials used the same Go 1.27.2 benchmark, 100 identities, real PostgreSQL checkpoints, and local Telegram multipart validation. All 3,840 timed deliveries succeeded with the expected media counts and SHA-256 hashes. Identity generation and signing are outside the timer. Host load started at 0.17 across eight cores. Both sides used 128 pipeline slots, 64 download slots, 20 upload slots, and four image workers; the new per-delivery preparation limit was four.
+
+| Workload | Concurrent callers | Before ms/op, median [range] | After ms/op, median [range] |
+| --- | ---: | ---: | ---: |
+| Video + thumbnail | 1 | 57.68 [57.21–60.33] | 30.13 [29.58–32.34] |
+| Video + thumbnail | 16 | 13.54 [13.41–17.43] | 8.07 [6.65–9.07] |
+| Video + thumbnail | 64 | 13.91 [12.98–16.70] | 8.42 [6.65–10.31] |
+| Eight-image slideshow | 1 | 231.27 [231.02–234.82] | 54.78 [54.23–57.75] |
+| Eight-image slideshow | 16 | 60.25 [53.52–68.18] | 9.12 [7.50–9.59] |
+| Eight-image slideshow | 64 | 63.93 [53.54–68.00] | 9.05 [8.90–11.14] |
+
+At concurrency one, ms/op is delivery latency. At higher concurrency it is elapsed batch time divided by completed deliveries, a throughput measure, **not individual request latency**. The fixture has a 20 ms CDN wait, tiny synthetic MP4 data, and 256×256 JPEGs: these numbers isolate scheduling and checkpoint costs, not WAN bandwidth or production TikTok/Telegram latency. Checkpoints fall from two to one for video, and eight to one for slideshows. Single-delivery slideshow work becomes two waves of four downloads instead of eight serial downloads and checkpoints.
+
+A separate profiled 128-delivery slideshow run identified the remaining high-concurrency wait in `identity.Pool.save`: 29.51 of 29.54 aggregate mutex-wait seconds were attributed to the serialized checkpoint path. JPEG decoding dominated sampled CPU. These are aggregate profile measurements, not individual request latencies; profiled runs are excluded from the comparison table.
+
+Whole benchmark-process median CPU was 6.45 s before and 5.47 s after; median peak RSS was 33.50 MiB and 36.27 MiB. These include setup, calibration, and the local Telegram receiver, exclude the PostgreSQL process, and do not establish isolated service CPU or RAM savings. Parallelism can increase live memory, so all existing resource limits remain bounded. [Samples, configuration, and binary hashes](benchmarks/app-delivery-concurrency-20261014.json) retain every trial. Reproduce with `TIKTOK_APP_TEST_DB_URL=... go test ./internal/identity -run '^$' -bench BenchmarkAppDelivery -benchtime=64x -count=1`.
+
 ## App short-link resolution (2026-10-14)
 
 The running server logged one uncached resolution at 1,961 ms and another resolution at 0.193 ms. Those request-level logs cannot separate proxy connection time from TikTok response time; they are not a before/after benchmark.
