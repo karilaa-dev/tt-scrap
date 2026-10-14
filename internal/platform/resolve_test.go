@@ -54,9 +54,10 @@ func TestAppShortLinkValidatesRedirectBeforeAcceptingID(t *testing.T) {
 func TestTTSiteShareLinkResolvesThroughWWWHost(t *testing.T) {
 	canonical := "https://www.tiktok.com/@user192675581/photo/7685286340551855380?_r=1&_t=ZS-9AWEUykgZfB"
 	for raw, host := range map[string]string{
-		"https://www.tt.site/t/ZSboJ1v8D/":  "www.tt.site",
-		"https://tt.site/t/ZSboJ1v8D/":      "www.tt.site",
-		"https://tt.site:8443/t/ZSboJ1v8D/": "www.tt.site:8443",
+		"https://www.tt.site/t/ZSboJ1v8D/":    "www.tt.site",
+		"https://tt.site/t/ZSboJ1v8D/":        "www.tt.site",
+		"https://tt.site:8443/t/ZSboJ1v8D/":   "www.tt.site:8443",
+		"https://tt.site/t/ZSboJ1v8D/?_r=1#x": "www.tt.site",
 	} {
 		t.Run(raw, func(t *testing.T) {
 			var calls atomic.Int32
@@ -84,6 +85,10 @@ func TestShareHostRejectsLookalikesAndNonShareLinksWithoutRequests(t *testing.T)
 		"https://user@www.tt.site/t/ZSboJ1v8D/",
 		"https://www.tt.site/video/7685286340551855380",
 		"https://tt.site/@creator/photo/7685286340551855380",
+		"https://www.tt.site/t/ZSboJ1v8D/video/7685286340551855380",
+		"https://tt.site/t/ZSboJ1v8D/photo/7685286340551855380",
+		"https://www.tt.site/t/ZSboJ1v8D%2Fvideo%2F7685286340551855380",
+		"https://www.tt.site/t/",
 	} {
 		t.Run(raw, func(t *testing.T) {
 			var calls atomic.Int32
@@ -92,6 +97,24 @@ func TestShareHostRejectsLookalikesAndNonShareLinksWithoutRequests(t *testing.T)
 			var failure *core.Error
 			if !errors.As(err, &failure) || failure.Code != "invalid_link" || calls.Load() != 0 {
 				t.Fatalf("error = %v, requests = %d", err, calls.Load())
+			}
+		})
+	}
+}
+
+func TestShortLinkDoesNotTrustPostIDsInShareHostRedirects(t *testing.T) {
+	for _, target := range []string{
+		"https://www.tt.site/t/ZSboJ1v8D/video/7685286340551855380",
+		"https://tt.site/t/ZSboJ1v8D/photo/7685286340551855380",
+	} {
+		t.Run(target, func(t *testing.T) {
+			var calls atomic.Int32
+			service := resolutionFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				http.Redirect(w, r, target, http.StatusFound)
+			})
+			if result, err := service.ResolveURL(context.Background(), "https://vm.tiktok.com/short"); err == nil || calls.Load() != 1 {
+				t.Fatalf("resolution = %+v, error = %v, requests = %d", result, err, calls.Load())
 			}
 		})
 	}

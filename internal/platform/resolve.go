@@ -14,15 +14,17 @@ import (
 )
 
 var postIDPattern = regexp.MustCompile(`/(?:video|photo)/(\d+)|^/v/(\d+)\.html$`)
+var sharePathPattern = regexp.MustCompile(`^/t/[A-Za-z0-9_-]+/?$`)
 
 func normalizedHost(u *url.URL) string {
 	return strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
 }
 
-// tt.site is TikTok's share-link domain; its /t/ links redirect to tiktok.com.
-// Other paths there are not posts, so their embedded IDs are never trusted.
+// tt.site is TikTok's share-link domain; its /t/<code> links redirect to
+// tiktok.com. Only that single-segment form is accepted, so a tt.site URL never
+// carries a post ID that could be trusted without following the redirect.
 func shareLink(host, path string) bool {
-	return (host == "tt.site" || host == "www.tt.site") && strings.HasPrefix(path, "/t/")
+	return (host == "tt.site" || host == "www.tt.site") && sharePathPattern.MatchString(path)
 }
 
 func validTikTokURL(raw string) bool {
