@@ -1,445 +1,93 @@
 # tt-scrap
 
-An authenticated FastAPI service that extracts TikTok and Instagram metadata,
-serves media through opaque asset URLs, and delivers TikTok media directly through
-a Telegram bot.
+Native Go service for TikTok app and web extraction, Instagram extraction, authenticated media downloads, and Telegram delivery. Existing extraction and delivery contracts are preserved; the [OpenAPI document](openapi.json) also includes identity preparation.
 
-Supported content:
+Production runs one Go binary. TikTok registration and signing run in Go; image conversion uses Go decoders and native libheif. FFmpeg handles video inspection and separate audio/video remuxing.
 
-- TikTok videos, slideshows, covers, and music
-- Direct Telegram video, photo-album/carousel, document, and audio delivery
-- Instagram reels, images, and mixed carousels
-- TikTok short links, cookies, sticky proxies, rotation, and staged retries
+## Run
 
-The extraction code is derived from `karilaa-dev/tt-bot` main commit
-`9263c3dbf30240478bff7a1a861655850105d232` under CC BY-NC 4.0.
+Install Go **1.27.2**, a C compiler, `pkg-config`, `libheif-dev`, and FFmpeg. Debian/Ubuntu installations that split HEIF codecs into plugins also need `libheif-plugin-libde265` for HEIC and `libheif-plugin-dav1d` for AVIF. On Debian 13 or recent Ubuntu:
 
-## Start locally
-
-Requirements: Python 3.13, [uv](https://docs.astral.sh/uv/), and FFmpeg. FFmpeg is used
-only to stream-copy separate TikTok video and audio tracks into one MP4; it does not
-re-encode them. The Docker image installs FFmpeg automatically.
-
-```bash
+```sh
+sudo apt-get install build-essential pkg-config libheif-dev libheif-plugin-libde265 libheif-plugin-dav1d ffmpeg
 cp .env.example .env
-# Set TT_SCRAP_API_KEY and RAPIDAPI_KEY in .env.
-# Set TELEGRAM_BOT_TOKEN only when direct Telegram delivery is needed.
-uv sync --locked
-uv run tt-scrap
+# Edit .env before starting.
+go mod download
+make build
+./bin/tt-scrap
 ```
 
-The API listens on `http://127.0.0.1:8000`. Check it with:
+Configure `TT_SCRAP_API_KEY` with at least 16 characters. Set `TIKTOK_METHOD=app` for the Android app method or `TIKTOK_METHOD=web` for the web method. App mode requires `DB_URL`; web mode does not. Set `RAPIDAPI_KEY` for Instagram and readiness. Existing environment variables take precedence over `.env`.
 
-```bash
-curl http://127.0.0.1:8000/health/ready
-```
-
-To prepare `.env`, cookies, and proxies from a nearby `tt-bot` checkout:
-
-```bash
-uv run python scripts/bootstrap_local_env.py /path/to/tt-bot
-```
-
-## Configuration
-
-The complete list and defaults are in `.env.example`. The important settings
-are:
-
-| Variable | Purpose |
-| --- | --- |
-| `TT_SCRAP_API_KEY` | Bearer token required by every `/v1/` endpoint |
-| `LOG_LEVEL` | Log verbosity; `INFO` keeps request summaries and lifecycle events, `DEBUG` includes internal stages |
-| `LOG_FORMAT` | `console` by default; use `json` for structured log collectors |
-| `RAPIDAPI_KEY` | Instagram RapidAPI credential |
-| `INSTAGRAM_CONCURRENCY` | Maximum concurrent Instagram provider calls; default 4 |
-| `YTDLP_COOKIES` | Optional Netscape cookie file for restricted TikToks |
-| `PROXY_FILE` | Optional file containing one proxy URL per line |
-| `PROXY_DATA_ONLY` | Bypass proxies for media downloads when `true` |
-| `CACHE_TTL_SECONDS` | Lifetime of asset contexts and tokens; default 600 seconds |
-| `TIKTOK_INFO_CACHE_TTL_SECONDS` | Absolute lifetime of extraction metadata; default 60 seconds |
-| `TIKTOK_RESOLUTION_CACHE_TTL_SECONDS` | Lifetime of successful URL-to-post-ID mappings; default 600 seconds |
-| `URL_RESOLVE_TIMEOUT_SECONDS` | Total resolution budget, including duplicate/capacity waits, redirects, and retries; default 12 seconds |
-| `URL_RESOLVE_POOL_TIMEOUT_SECONDS` | Wait for an HTTP connection before retiring a failed resolver pool; default 1 second |
-| `CACHE_MAX_ENTRIES` | Maximum in-memory cache entries; default 10,000 |
-| `IMAGE_CONVERSION_WORKERS` | Image process cap; default 0 uses available CPU cores minus one |
-| `TELEGRAM_BOT_TOKEN` | Bot credential; an empty value disables direct delivery |
-| `TELEGRAM_API_BASE_URL` | Telegram Bot API base URL, including custom/local servers |
-| `TELEGRAM_PIPELINE_CONCURRENCY` | Maximum concurrent extraction/preparation pipelines; default 32 |
-| `TELEGRAM_UPLOAD_CONCURRENCY` | Maximum concurrent Telegram API uploads; default 20 |
-| `TELEGRAM_UPLOAD_TIMEOUT_SECONDS` | Per Telegram upload timeout; default 600 seconds |
-| `TELEGRAM_UPLOAD_MAX_MB` | Per-file Telegram upload limit in MiB; default 50, zero disables it for a local Bot API server |
-| `TELEGRAM_THUMBNAIL_WAIT_SECONDS` | Optional cover budget, overlapping media preparation; default 1.5 seconds, zero skips covers |
-| `MAX_VIDEO_DURATION` | Maximum duration in seconds; zero disables it |
-| `MAX_ASSET_BYTES` | Maximum downloaded size; zero disables it |
-
-Set `TELEGRAM_UPLOAD_MAX_MB=100` to allow files up to 100 MiB when your custom
-`TELEGRAM_API_BASE_URL` supports that size. Each MB here is 1,048,576 bytes,
-preserving the existing default of 52,428,800 bytes. Restart the service after
-changing it.
-
-`IMAGE_CONVERSION_WORKERS=0` is automatic: the service uses the logical CPUs
-available to its process minus one, with a minimum of one worker. A positive value
-sets a lower operator cap but cannot exceed that CPU-derived limit.
-
-The cache is bounded and exists only in the API process. It stores normalized
-metadata and upstream fetch context, never media bytes or request history. TikTok
-information entries use a non-sliding 60-second lifetime; resolved URL mappings use
-600 seconds and asset contexts retain the asset TTL. Concurrent requests for the
-same TikTok or Instagram post share successful or failed work. Failed results are discarded when the
-waiting group drains, so later requests can retry. All entries
-and asset tokens disappear on restart. Run exactly one Uvicorn worker; multiple
-workers would not share tokens or extraction IDs.
-
-Keep `.env`, `cookies.txt`, and `proxies.txt` private. Signed URLs, credentials,
-cookies, and proxy passwords are redacted from logs.
+App mode reads saved proxies from PostgreSQL. `PROXY_FILE` optionally bootstraps addresses, one HTTP, HTTPS, or SOCKS5 address per line. `PROXY_INCLUDE_HOST=true` explicitly adds a direct-connection slot. `PROXY_DATA_ONLY=true` sends CDN transfers directly while app registration, signing, and play API requests keep the assigned proxy. Web media retries try another configured proxy after a failure. Web mode accepts a Netscape-format cookie file through `YTDLP_COOKIES`, preserving the old environment name.
 
 ## API
 
-Every `/v1/` request needs:
+`/docs`, `/redoc`, `/openapi.json`, `/health/live`, and `/health/ready` are public. All `/v1/` routes require `Authorization: Bearer <TT_SCRAP_API_KEY>`.
 
-```http
-Authorization: Bearer <TT_SCRAP_API_KEY>
+| Method | Route | Purpose |
+| --- | --- | --- |
+| POST | `/v1/tiktok/resolutions` | Resolve a TikTok share URL |
+| POST | `/v1/tiktok/extractions` | Extract TikTok video or slideshow metadata |
+| POST | `/v1/tiktok/music` | Extract music using a numeric video ID |
+| POST | `/v1/tiktok/telegram-deliveries` | Prepare and send TikTok media to Telegram |
+| POST | `/v1/instagram/extractions` | Extract Instagram media |
+| POST | `/v1/instagram/telegram-deliveries` | Prepare and send Instagram media to Telegram |
+| GET / POST | `/v1/tiktok/identities/preparations` | Read progress / start or reuse identity preparation |
+| GET | `/v1/assets/{token}` | Download an opaque, expiring media reference |
+
+Downloads preserve `Content-Length`, MIME type, SHA-256, ETag, and attachment headers. Errors keep the existing `error.code`, `error.message`, and `error.request_id` envelope. Large TikTok IDs remain exact. Telegram albums are fully prepared before any upload, split into groups of up to ten with a final group of at least two, and return HTTP 207 for partial delivery. Ambiguous Telegram requests are not automatically retried.
+
+## Identity lifecycle
+
+Video information retained by tt-bot stays in its database; tt-scrap caches API responses and temporary asset references in RAM. Only `scrap_proxies` and `scrap_identities` are managed by tt-scrap in PostgreSQL. App mode loads them once into RAM. Selection, balancing, cooldowns, and identity information reads then happen in memory; operation results are written to PostgreSQL after the operation finishes.
+
+Each proxy address has ten identity slots. Before opening the API listener, startup registers missing slots and refreshes expired signing material. One worker per proxy runs in parallel with the other proxies; each address waits at least ten seconds after an attempt completes before starting the next one. Fresh saved identities are reused. A slot retains its proxy permanently and renews signing material on use after three hours. Explicit signing failures trigger renewal; invalid device registrations trigger recreation. Network errors and rate limits apply cooldowns rather than discarding valid identities. Preparation waits for identity and proxy cooldowns before retrying. Each attempt bounds cooldown waiting, lease acquisition, and registration/signing by `TIKTOK_APP_TIMEOUT_SECONDS`; shutdown cancels these waits.
+
+One active app-mode process owns each database schema through a PostgreSQL advisory lock. Losing that connection stops identity work until restart. This prevents two RAM pools from concurrently updating the same identities. Existing healthy saved devices continue working; new identities draw from the Pixel and Samsung catalog.
+
+To prepare identities again after startup, call the authenticated endpoint (no body required):
+
+```sh
+curl -X POST http://localhost:8000/v1/tiktok/identities/preparations \
+  -H "Authorization: Bearer $TT_SCRAP_API_KEY"
+curl http://localhost:8000/v1/tiktok/identities/preparations \
+  -H "Authorization: Bearer $TT_SCRAP_API_KEY"
 ```
 
-Health endpoints and API documentation at `/docs` are public.
+POST returns `202` for a running job or `200` when the pool is already prepared. GET returns `state`, `proxies`, `target`, `ready`, `failed`, and timestamps. Repeated POSTs share one job; polling reads RAM only. Failed slots receive up to three paced attempts per run; later calls or restarts reuse saved progress. A failed startup does not open the API port. Both operations return `503` in web mode. Ten proxy addresses mean ten workers and 100 identities, even when their gateway hostname is shared.
 
-### OpenAPI schema
+## Throughput and memory
 
-The running service generates its OpenAPI 3.1 contract directly from the current
-FastAPI routes and Pydantic models:
+Upstream connections are pooled and reused. Matching metadata requests share work. Downloads and Telegram multipart uploads stream through temporary files without buffering entire videos in RAM. App deliveries share one identity lease across video, thumbnail, and slideshow downloads, with one database checkpoint after preparation. Identity waits do not occupy download slots. Each adaptive video/audio track uses its own download slot; a limit of one serializes the tracks. Muxing takes one slot after both tracks finish. Media retries use exponential delay plus up to 10% jitter within the download deadline. Native image conversions have a separate concurrency bound. Queues are bounded, and cancellation propagates through network calls and preparation.
 
-```bash
-curl http://127.0.0.1:8000/openapi.json --output openapi.json
+App video selection uses only API metadata: highest pixel resolution, then frame rate, then bitrate. Extraction makes no CDN quality-probe requests. Download validation still inspects the actual downloaded file. Protocol clients and cookie jars stay in RAM across operations.
+
+Tune `EXTRACTION_CONCURRENCY`, `DOWNLOAD_CONCURRENCY`, `HTTP_MAX_CONNECTIONS`, `MAX_QUEUED_REQUESTS`, and Telegram concurrency limits for the number of proxies and available memory. `TELEGRAM_PREPARATION_CONCURRENCY` defaults to four media items per delivery (thumbnails run alongside), so a large album cannot create a worker for every image. `TELEGRAM_PIPELINE_CONCURRENCY` bounds whole deliveries and `TELEGRAM_UPLOAD_CONCURRENCY` bounds uploads. `IMAGE_CONVERSION_WORKERS` controls simultaneous decoded images. `MAX_ASSET_BYTES` limits downloads; `GOMEMLIMIT` provides an optional Go heap budget. Request IDs, timings, status codes, and byte counts are logged as JSON. Telegram delivery logs also include the outcome, failed stage, planned/attempted/successful batch counts, and safe error codes. HTTP 200 rejections and partial deliveries produce warnings; HTTP 5xx failures produce errors. Payloads, captions, chat IDs, and bot tokens are excluded from these delivery fields.
+
+`CACHE_MAX_ENTRIES` is the total retained-entry budget: each of six response caches receives one twelfth, and asset references receive the remainder. The default 10,000 allows 5,002 asset references and 833 entries per response cache. The independent caches keep separate locks; unused capacity in one partition is not borrowed by another. Active metadata requests retain their separate queue limit. Reused music responses expire no later than their original asset URLs.
+
+## Verify
+
+```sh
+make check
 ```
 
-The repository also contains the generated `openapi.json` for client generation
-without a running server. Regenerate it after API or model changes with:
+See [Contributing](CONTRIBUTING.md) for the package layout, a disposable test database, and benchmark commands. Database tests use `TIKTOK_APP_TEST_DB_URL` or `DB_URL` and create isolated schemas; supply one to include those tests. HTTP tests use local upstream and Telegram fixtures and send no real messages. Tests cover API compatibility, lossless IDs, streamed checksums and lengths, registration/signing, identity concurrency, HEIC conversion, multipart uploads, album batching, cancellation, and cleanup.
 
-```bash
-uv run tt-scrap-openapi openapi.json
-```
+## Docker and deployment
 
-Do not edit the generated document manually. The test suite verifies that it is
-identical to the schema produced by the current application.
-
-### Extract TikTok media
-
-Resolve a short TikTok share link without extracting metadata or downloading media:
-
-```bash
-curl http://127.0.0.1:8000/v1/tiktok/resolutions \
-  -H "Authorization: Bearer $TT_SCRAP_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"url":"https://www.tiktok.com/t/EXAMPLE/"}'
-```
-
-The response includes the numeric `source_id` and full `resolved_url`. A client can
-use `source_id` to check its database before requesting extraction or delivery.
-
-TikTok extraction responses also include nullable `creator_username`, sourced from
-the extracted `author.uniqueId`. Instagram extraction responses include the post
-`source_id` and nullable provider-supplied `creator_username`; neither service
-derives a creator name from a placeholder URL.
-
-```bash
-curl http://127.0.0.1:8000/v1/tiktok/extractions \
-  -H "Authorization: Bearer $TT_SCRAP_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"url":"https://www.tiktok.com/@creator/video/123","refresh":false}'
-```
-
-### Extract TikTok music
-
-```bash
-curl http://127.0.0.1:8000/v1/tiktok/music \
-  -H "Authorization: Bearer $TT_SCRAP_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"video_id":123}'
-```
-
-### Deliver TikTok media to Telegram
-
-```bash
-curl http://127.0.0.1:8000/v1/tiktok/telegram-deliveries \
-  -H "Authorization: Bearer $TT_SCRAP_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "source":{"url":"https://www.tiktok.com/@creator/video/123"},
-    "delivery":"media",
-    "telegram":{"chat_id":1289167515,"caption":"Optional video caption"}
-  }'
-```
-
-`source` accepts a TikTok `url`, a recent `extraction_id`, or a `video_id` for
-audio delivery. Delivery modes map to Telegram as follows:
-
-| Mode | Video | Slideshow | Music |
-| --- | --- | --- | --- |
-| `media` | `sendVideo` | `sendPhoto` or `sendMediaGroup` | — |
-| `document` | `sendDocument` | document `sendMediaGroup` | — |
-| `audio` | — | — | `sendAudio` |
-
-Media mode first selects the maximum pixel resolution TikTok exposes. Within that
-resolution it uses TikTok's precomputed original-reference `MVMAF` score, avoiding
-any media download or local quality analysis during selection. The known quality
-tag, TikTok quality tier, and bitrate are fallbacks when `MVMAF` is unavailable. If
-the selected video's audio is separate, both files are downloaded concurrently and
-FFmpeg stream-copies them into MP4 without re-encoding. This same muxing path is
-used by direct Telegram delivery and `/v1/assets` downloads. Video and audio
-thumbnails are normalized to Telegram-compliant JPEGs.
-
-Length-delimited, unmodified TikTok videos are relayed into Telegram while the
-upstream response is still arriving. This overlaps the CDN download with the
-Telegram upload and avoids an intermediate spool. Separate audio/video tracks,
-unknown-length assets, and transformed media keep the verified download/remux
-fallback. Cover preparation starts alongside CDN connection setup and media
-downloads. Optional covers have a short deadline; Telegram generates the preview
-when a cover is slower than that budget. A failed media download cancels its cover
-work immediately.
-
-Video/audio preparation enforces the destination's upload byte limit before reading
-known oversized responses. Separate tracks share a combined budget, including when
-their lengths are unknown, and the final remuxed output is checked again. Failed
-attempts release their byte reservations before retrying. Direct asset downloads
-retain their separate `MAX_ASSET_BYTES` policy. Photos can shrink during conversion,
-so their final Telegram upload-size check remains authoritative.
-
-Preparation pipelines and Telegram API uploads have independent concurrency limits,
-so a slow upload does not stop later requests from extracting and downloading. All
-upstream track transfers share `DOWNLOAD_CONCURRENCY`, including adaptive video and
-audio pairs. Spools that roll to disk are written outside the event loop, and asset
-responses use `DOWNLOAD_CHUNK_BYTES` to reduce per-chunk scheduling overhead.
-
-### Deliver Instagram media to Telegram
-
-```bash
-curl http://127.0.0.1:8000/v1/instagram/telegram-deliveries \
-  -H "Authorization: Bearer $TT_SCRAP_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "source":{"url":"https://www.instagram.com/p/SHORTCODE/"},
-    "delivery":"media",
-    "telegram":{"chat_id":1289167515,"caption":"Optional caption"}
-  }'
-```
-
-Instagram delivery accepts a URL or a cached `extraction_id`. Media mode uses
-`sendPhoto`, `sendVideo`, or mixed photo/video `sendMediaGroup` calls while retaining
-carousel order. Document mode sends original/file media and preserves source image
-bytes. HEIC/HEIF photos and usable video thumbnails use the same asynchronous
-conversion pipeline as TikTok. Carousel captions are placed on the first item of
-the first album batch.
-
-Slideshow photo mode passes Telegram-compliant static JPEG, PNG, and WebP through
-byte-for-byte. Oversized, extreme-aspect, or animated native photos are normalized;
-HEIC/HEIF and other decodable source formats such as AVIF, GIF, TIFF, and BMP are
-converted concurrently to baseline JPEG in persistent image worker processes.
-Corrupt or unknown formats fail before the first Telegram call. A gallery is prepared
-completely before its first album is sent; albums are then sent sequentially in groups
-of 2–10 while preserving order. Document mode preserves original media bytes and
-skips photo/thumbnail conversion.
-
-To compare JPEG and PNG conversion cost for a representative HEIC/HEIF input
-without putting benchmarking work in the request path:
-
-```bash
-uv run python scripts/benchmark_image_conversion.py sample.heic
-```
-
-For a single Telegram call, the endpoint returns Telegram's raw response and HTTP
-status. A multi-album delivery returns an ordered `deliveries` list. If an earlier
-album succeeds and a later one fails, delivery stops and the endpoint returns HTTP
-207. Ambiguous uploads are not retried, which prevents duplicate Telegram messages.
-
-### Extract Instagram media
-
-```bash
-curl http://127.0.0.1:8000/v1/instagram/extractions \
-  -H "Authorization: Bearer $TT_SCRAP_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"url":"https://www.instagram.com/reel/SHORTCODE/","refresh":false}'
-```
-
-Extraction responses contain normalized metadata and asset paths such as
-`/v1/assets/opaque-token`; upstream CDN URLs are never returned. A single media
-filename uses the Instagram post shortcode (for example, `DaJJCIVEn2n.mp4`), while
-carousel items add a stable one-based suffix such as `DaJJCIVEn2n_1.jpg`.
-
-### Download an asset
-
-```bash
-curl -fL http://127.0.0.1:8000/v1/assets/OPAQUE_TOKEN \
-  -H "Authorization: Bearer $TT_SCRAP_API_KEY" \
-  --output media.bin
-```
-
-The service downloads into an ephemeral spool, validates the result, and then
-responds with content length, MIME type, filename, ETag, and SHA-256 headers.
-Media bytes are discarded after the response.
-
-Errors use a stable envelope:
-
-```json
-{
-  "error": {
-    "code": "invalid_link",
-    "message": "Only HTTPS TikTok URLs are accepted",
-    "request_id": "uuid"
-  }
-}
-```
-
-## Diagnostics and timing
-
-Every HTTP response includes `X-Request-ID` and a standard `Server-Timing` header,
-for example `Server-Timing: app;dur=1842.317`. The duration measures server work up
-to response streaming; it does not measure how long the caller takes to receive a
-streamed asset.
-
-At `LOG_LEVEL=INFO`, each request writes one `http.request.completed` summary.
-Internal extraction, resolution, and delivery milestones appear at `DEBUG`, as do
-successful health checks. Startup, shutdown, and operational warnings remain visible.
-The summary includes the route, status, duration, request ID, and available platform,
-source ID, delivery mode, and error details. Client errors and partial or rejected
-Telegram deliveries use `WARNING`; server errors use `ERROR`. Telegram success is
-checked against both its HTTP status and JSON `ok` value.
-
-Failed request summaries include sanitized `failure_stage`, `failure_reason`,
-`upstream_status_code`, and `upstream_error_type` when available. Body-reading
-failures retain FastAPI's existing response and identify `http.body_parsing`.
-Queue timings use `resolver_queue_wait_ms`, `extraction_queue_wait_ms`,
-`download_queue_wait_ms`, `pipeline_queue_wait_ms`, `upload_queue_wait_ms`, and
-`image_queue_wait_ms`. Each is the longest observed wait for that stage, so parallel
-album waits are not added together. Download waits include relay setup and the
-capacity reacquisition when upload consumption starts. Telegram rejections record
-their failure stage and upstream HTTP status even when the HTTP status is 200 and
-the Bot API body contains `ok: false`. Recovered failures are omitted from successful
-request summaries; recovery counters remain.
-
-Log output runs in a background thread with a 10,000-record queue. Records capture
-their request ID before enqueueing. During overflow, warnings and errors displace
-lower-priority records; once output resumes, `logging.records_dropped` reports
-dropped counts by level. A queue containing only warnings/errors drops incoming
-records when full. Malformed messages or exception formatting failures are also
-dropped and counted; they cannot fail the request. Shutdown flushes queued output
-for up to five seconds.
-`runtime.event_loop.stalled` warns when loop lag exceeds one second, at most once
-per minute. Correlate these warnings with host CPU, memory, and storage pressure
-before raising concurrency limits.
-
-Recovery is summarized with `retry_count`, `fallback_count`, and
-`thumbnail_skipped_count`; zero counts are omitted. Retries count extra attempts
-that actually start. Fallbacks count interrupted relays retried through a verified
-spool. Thumbnail skips count failures or timeouts, not absent or disabled covers.
-Successful requests do not emit warnings for this recovery work.
-
-Set `LOG_LEVEL=DEBUG` to inspect cache lookups, individual downloads, image
-validation/conversion, remuxing, album preparation, Telegram uploads, and failed
-attempts. Durations use `elapsed_ms`; bounded pools also report `queue_wait_ms`.
-Transfer events report byte counts without logging media URLs, credentials,
-cookies, captions, chat IDs, or request bodies.
-
-`LOG_FORMAT=console` is the default and produces compact human-readable output for
-terminal and Dokploy logs. Set `LOG_FORMAT=json` when logs are consumed by `jq` or a
-structured log collector. Uvicorn startup/shutdown records use the same formatter.
-
-With `LOG_FORMAT=json` and `LOG_LEVEL=DEBUG`, use the response's request ID to
-inspect one complete operation:
-
-```bash
-docker compose logs --no-log-prefix tt-scrap \
-  | jq 'select(.request_id == "PASTE-X-REQUEST-ID")
-        | {event, elapsed_ms, queue_wait_ms, status_code, output_bytes}'
-```
-
-The largest `elapsed_ms` stage normally identifies the bottleneck. `queue_wait_ms`
-measures application semaphore waiting. HTTPX pool waiting is separate and appears
-as `PoolTimeout`. Resolver events include a credential-free `proxy_slot`; startup
-records include HTTPX/httpcore versions and effective resolution limits. Retired
-resolver pools report the number of users still draining. Metadata with no usable
-media emits `tiktok.normalization.failed` with a bounded `failure_reason`.
-Telegram failures include its safe error code, description, and `retry_after` value
-when provided, but never log the bot-token URL or Telegram success payload.
-
-## Retries and proxies
-
-TikTok URL resolution, metadata extraction, and asset download each have their
-own three-attempt retry loop. A proxy stays sticky during a request flow and
-rotates after retryable failures. Permanent deleted, private, and region-blocked
-results fail immediately.
-
-Resolution uses a 12-second total budget and a 1-second HTTP pool wait by default.
-Transport failures retire the affected client; existing users finish before it
-closes and new requests use a fresh pool. Healthy clients continue to reuse their
-connections. Retired-pool cleanup runs separately from requests and drains during
-shutdown, so socket cleanup cannot extend the resolution deadline.
-Pool exhaustion returns `service_busy` with HTTP 503, timeouts return
-`upstream_timeout` with HTTP 504, and other transport failures return
-`upstream_network_error` with HTTP 502. Invalid URLs/redirects and upstream 400/404/410
-responses fail without repeated resolution attempts. Read-only callers should bound
-their own retries across these responses; Telegram delivery retains its existing
-rules against retrying ambiguous uploads.
-
-An offline regression probe exercises the real HTTPX CONNECT/TLS path:
-
-```bash
-uv run python scripts/diagnostics/repro_tiktok_proxy_pool.py
-```
-
-It needs `openssl` for an ephemeral test certificate and only contacts a local
-proxy. `--legacy` deliberately disables application recovery and reproduces the old
-pool exhaustion failure. It exits nonzero as a diagnostic control.
-
-Instagram RapidAPI requests and CDN downloads are direct by default. Network
-errors, rate limits, and server failures are retried; definitive missing/private
-responses are not.
-
-The async HTTP clients share the event loop's DNS resolver. If a lookup takes more
-than one second, the application switches DNS lookups to four dedicated workers
-for 60 seconds. After the cooldown, one caller probes the native resolver while
-other callers continue through the fallback. A cancelled or failed probe starts
-another cooldown. This fallback uses the same system DNS configuration. It keeps
-HTTP hostnames, TLS verification, and proxy routing unchanged, and does not resend
-Telegram uploads. Request deadlines still apply. Identical in-flight lookups share
-a worker, and cancelled requests do not free occupied worker slots or queue more
-work in the executor.
-
-`runtime.dns.fallback_started` records the switch at WARNING.
-`runtime.dns.fallback_succeeded` records the first successful fallback lookup, and
-`runtime.dns.native_recovered` records a successful return to the native resolver.
-These events contain no hostnames or credentials. An unavailable system DNS server
-or an upstream TCP/TLS outage can still cause timeouts.
-
-See [the October 5 incident analysis](docs/performance-and-resilience.md#october-5-dns-recovery)
-for the evidence and reproduction limits.
-
-## Tests
-
-```bash
-uv run ruff format --check src tests scripts
-uv run ruff check src tests scripts
-uv run mypy src/tt_scrap
-uv run pytest -m "not live" --cov=tt_scrap
-```
-
-Live tests are opt-in because posts can disappear and RapidAPI calls may be
-billed. Set the `LIVE_TIKTOK_*` and `LIVE_INSTAGRAM_*` URLs documented by
-`scripts/live_smoke.py`, start the API, then run:
-
-```bash
-uv run python scripts/live_smoke.py
-```
-
-## Optional Docker image
-
-Docker is not required. If desired, the Compose file runs the same single API
-process with no additional services:
-
-```bash
+```sh
+docker build -t tt-scrap:go .
 docker compose up --build -d
 ```
 
-Published images are available at `ghcr.io/karilaa-dev/tt-scrap`.
+The container runs as an unprivileged user and includes the Go binary, FFmpeg, and native HEIF codecs. `tt-scrap healthcheck` probes readiness. Shutdown drains requests for up to 30 seconds before cancelling remaining work.
 
-For the local mixed-workload benchmark, measured results, and rollout notes, see
-[performance and resilience](docs/performance-and-resilience.md).
+`DB_URL` must be reachable from the container. A host-only `127.0.0.1` address refers to the container itself: join the database's Docker network and use its service hostname, or configure a host gateway. The base Compose file uses saved database proxies without a file mount. To import `proxies.txt`, use `docker compose -f docker-compose.yml -f compose.proxies.yml up --build -d`. For a new app database, provide that file or explicitly set `PROXY_INCLUDE_HOST=true`. Leave `PROXY_FILE` unset when using only saved database proxies. For web cookies, mount the file and point `YTDLP_COOKIES` to its container path.
+
+`railpack.json` defines the CGO server build and native media packages. Railpack detects Go and its version from `go.mod` and supplies the default `./out` start command. The package settings follow the [Railpack Go](https://railpack.com/languages/golang/) and [configuration](https://railpack.com/config/file/) documentation. Docker provides the reproducible deployment path for the native codec dependencies.
+
+## Migrate from the Python release
+
+Read the [migration notes](docs/migration.md) before replacing an existing deployment. They cover the app default, PostgreSQL ownership, retained configuration names, and rollback.

@@ -1,0 +1,239 @@
+{
+  "source": "Original Node v24.18.0 compiled implementation preserved before Bun migration, generated 2026-10-13",
+  "dynamic": [
+    {
+      "nonce": 0,
+      "query": "",
+      "body": "00000000000000000000000000000000",
+      "version": 1,
+      "expected": "060345f13613e74ad98c1dd4"
+    },
+    {
+      "nonce": 0,
+      "query": "",
+      "body": "00000000000000000000000000000000",
+      "version": 2,
+      "expected": "6030541f63317ea49dc8d14d"
+    },
+    {
+      "nonce": 0,
+      "query": "",
+      "body": "00000000000000000000000000000000",
+      "version": 3,
+      "expected": "5c591fab6c49bd1083d6478e"
+    },
+    {
+      "nonce": 0,
+      "query": "",
+      "body": "00000000000000000000000000000000",
+      "version": 4,
+      "expected": "60c0a28f6cc8e7529b31b82b"
+    },
+    {
+      "nonce": 0,
+      "query": "",
+      "body": "00000000000000000000000000000000",
+      "version": 5,
+      "expected": "a3af06dee8e60a622baa8250"
+    },
+    {
+      "nonce": 0,
+      "query": "",
+      "body": "00000000000000000000000000000000",
+      "version": 6,
+      "expected": "8ee07f6a77e2ecf192fc6376"
+    },
+    {
+      "nonce": 0,
+      "query": "",
+      "body": "00000000000000000000000000000000",
+      "version": 7,
+      "expected": "1c45808da5184823189eeab9"
+    },
+    {
+      "nonce": 0,
+      "query": "",
+      "body": "00000000000000000000000000000000",
+      "version": 8,
+      "expected": "8a11704baad2dd37b4f96380"
+    },
+    {
+      "nonce": 1234567890,
+      "query": "aid=1233&device_id=1234567890123456789&hello=caf%C3%A9",
+      "body": "00000000000000000000000000000000",
+      "version": 1,
+      "expected": "4f9547237f85e59892c72b2f"
+    },
+    {
+      "nonce": 1234567890,
+      "query": "aid=1233&device_id=1234567890123456789&hello=caf%C3%A9",
+      "body": "00000000000000000000000000000000",
+      "version": 2,
+      "expected": "29a656cd2aa77c76f483900d"
+    },
+    {
+      "nonce": 1234567890,
+      "query": "aid=1233&device_id=1234567890123456789&hello=caf%C3%A9",
+      "body": "00000000000000000000000000000000",
+      "version": 3,
+      "expected": "15cf1d7925dfbfc2c89d7175"
+    },
+    {
+      "nonce": 1234567890,
+      "query": "aid=1233&device_id=1234567890123456789&hello=caf%C3%A9",
+      "body": "00000000000000000000000000000000",
+      "version": 4,
+      "expected": "2956a05d255ee580921c966d"
+    },
+    {
+      "nonce": 1234567890,
+      "query": "aid=1233&device_id=1234567890123456789&hello=caf%C3%A9",
+      "body": "00000000000000000000000000000000",
+      "version": 5,
+      "expected": "ea39040ca17008b05ac4330c"
+    },
+    {
+      "nonce": 1234567890,
+      "query": "aid=1233&device_id=1234567890123456789&hello=caf%C3%A9",
+      "body": "00000000000000000000000000000000",
+      "version": 6,
+      "expected": "32a6acd711dd872f495e8d8f"
+    },
+    {
+      "nonce": 1234567890,
+      "query": "aid=1233&device_id=1234567890123456789&hello=caf%C3%A9",
+      "body": "00000000000000000000000000000000",
+      "version": 7,
+      "expected": "1d885849ec8e4af1ceabcce9"
+    },
+    {
+      "nonce": 1234567890,
+      "query": "aid=1233&device_id=1234567890123456789&hello=caf%C3%A9",
+      "body": "00000000000000000000000000000000",
+      "version": 8,
+      "expected": "c3877299e344dfe519f38f2f"
+    },
+    {
+      "nonce": 4294967295,
+      "query": "a=1&b=2",
+      "body": "00112233445566778899aabbccddeeff",
+      "version": 1,
+      "expected": "f9fcba0ee9ee7c91e336fb12"
+    },
+    {
+      "nonce": 4294967295,
+      "query": "a=1&b=2",
+      "body": "00112233445566778899aabbccddeeff",
+      "version": 2,
+      "expected": "9fcfabe09eeec7193e63bf21"
+    },
+    {
+      "nonce": 4294967295,
+      "query": "a=1&b=2",
+      "body": "00112233445566778899aabbccddeeff",
+      "version": 3,
+      "expected": "a3a6e054b3b426cbb96ca148"
+    },
+    {
+      "nonce": 4294967295,
+      "query": "a=1&b=2",
+      "body": "00112233445566778899aabbccddeeff",
+      "version": 4,
+      "expected": "9f3f5d7097773e89c76cdf48"
+    },
+    {
+      "nonce": 4294967295,
+      "query": "a=1&b=2",
+      "body": "00112233445566778899aabbccddeeff",
+      "version": 5,
+      "expected": "5c50f92182f75463b21b26be"
+    },
+    {
+      "nonce": 4294967295,
+      "query": "a=1&b=2",
+      "body": "00112233445566778899aabbccddeeff",
+      "version": 6,
+      "expected": "64d0c13128b2bfa661d5c434"
+    },
+    {
+      "nonce": 4294967295,
+      "query": "a=1&b=2",
+      "body": "00112233445566778899aabbccddeeff",
+      "version": 7,
+      "expected": "927f77fbc3ffbabefd1b202b"
+    },
+    {
+      "nonce": 4294967295,
+      "query": "a=1&b=2",
+      "body": "00112233445566778899aabbccddeeff",
+      "version": 8,
+      "expected": "75ee8fb426511fdeeb539970"
+    }
+  ],
+  "ladon": {
+    "timestamp": 1800000000,
+    "seed": "01020304",
+    "expected": "AQIDBP3OkaCer2pdekn5/xKL2YPQ28AxEuIoF+PlPOv0uX8J"
+  },
+  "argus": {
+    "payload": "08021205636166c3a91a00",
+    "seed": "01020304",
+    "prefix": "ec0102030401d00518",
+    "padding": "0102030405060708090a0b0c0d",
+    "expected": "AQKyhdOH1T/6Rwwdfh28VqmCFko54sfsuDyMAG0Li/0TdIR6nkwo6OoFA8mP5ddfjLY="
+  },
+  "ttencrypt": {
+    "payload": "08021205636166c3a91a00",
+    "seed": "0707070707070707070707070707070707070707070707070707070707070707",
+    "expected": "7463051000000707070707070707070707070707070707070707070707070707070707070707d7c6b811fada264ad5b0c0f42f580f4c826cb92fcf29d7877dc04f772e5f9a6e8b519143d21c8f7efb43d09124d5c2afacb84926b2c2e0d7bbf87334730c81e6f7320651b5b7fa3ddc1f48e4eee048ff"
+  },
+  "xtea": [
+    {
+      "iv": "0000000027042020",
+      "payload": "00112233445566778899aabbccddeeff",
+      "expected": "d62d3557662ad5bab2d7481da905e39a"
+    },
+    {
+      "iv": "0100000027042020",
+      "payload": "00112233445566778899aabbccddeeff",
+      "expected": "af544bdaa9a9cfdcc07344f3dc8e815b"
+    },
+    {
+      "iv": "0200000027042020",
+      "payload": "00112233445566778899aabbccddeeff",
+      "expected": "72940d505fc1cd1f0119b3b312b59d71"
+    },
+    {
+      "iv": "0300000027042020",
+      "payload": "00112233445566778899aabbccddeeff",
+      "expected": "969da2b485772231ed4a02890086a47e"
+    },
+    {
+      "iv": "0400000027042020",
+      "payload": "00112233445566778899aabbccddeeff",
+      "expected": "40d5cf8e5ab5a609d268049c00ecb5c0"
+    }
+  ],
+  "sdk": [
+    {
+      "payload": "08021205636166c3a91a00",
+      "expected": "c20adb76abe7a3a00d57807e1fbd2bdf11c75e0633f0f5c80d089b1c78b49c8289eab8bb78b16b968ae8eccc86e37986"
+    },
+    {
+      "payload": "08021205636166c3a91a00",
+      "expected": "94a5ac68596967db27a0094b9af647a483e5b573138b0bd3ff6edba01243750acab15db06a14f497da7db5e7d91648e1"
+    },
+    {
+      "payload": "08021205636166c3a91a00",
+      "expected": "3418c1fa6c1e73e560c4b86045e2169c1cc3cf520e7e5b3e1e3d7403d8f1daa6d3110a66fa4bbcb46b8a56cb4e915140"
+    },
+    {
+      "payload": "08021205636166c3a91a00",
+      "expected": "4c6285809d41d9ea1ab97801114bce4f83ebe768ace7a96329df3d02b27f05511f79cd41ba75f2de47881687af7db9b5"
+    },
+    {
+      "payload": "08021205636166c3a91a00",
+      "expected": "f597b59ffa27bbc80e83d86c426193286a9cf46dde3619f6f06135244fa0195f418bb86bd38659624af80aec7fd9d7d5"
+    }
+  ]
+}

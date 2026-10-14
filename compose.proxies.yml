@@ -1,0 +1,12 @@
+# docker compose -f docker-compose.yml -f compose.proxies.yml up --build -d
+services:
+  tt-scrap:
+    environment:
+      PROXY_FILE: /run/secrets/proxies.txt
+    volumes:
+      - type: bind
+        source: ./proxies.txt
+        target: /run/secrets/proxies.txt
+        read_only: true
+        bind:
+          create_host_path: false
