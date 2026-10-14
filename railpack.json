@@ -3,7 +3,10 @@
   "buildAptPackages": ["gcc", "libc6-dev", "pkg-config", "libheif-dev"],
   "steps": {
     "build": {
-      "commands": ["CGO_ENABLED=1 go build -trimpath -ldflags='-s -w' -o out ./cmd/tt-scrap"]
+      "commands": [
+        { "cmd": "env CGO_ENABLED=1 go build -trimpath -ldflags='-s -w' -o out ./cmd/tt-scrap" },
+        { "cmd": "test -x out" }
+      ]
     }
   },
   "deploy": {

@@ -98,6 +98,8 @@ The container runs as an unprivileged user and includes the Go binary and native
 
 For Dokploy with Railpack 0.15.4, `buildAptPackages` must contain only package names: `...` is passed literally to APT and causes dependency conflicts. The `...` in `deploy.aptPackages` is supported and preserves Railpack's default runtime packages.
 
+The build uses structured `cmd` entries because Railpack 0.15.4 wraps string commands in single quotes without escaping embedded quotes. That breaks the linker flags and can report a successful build without producing `out`. The final build command checks that `out` is executable before creating the runtime image.
+
 ## Migrate from the Python release
 
 Read the [migration notes](docs/migration.md) before replacing an existing deployment. They cover the app default, PostgreSQL ownership, retained configuration names, and rollback.
