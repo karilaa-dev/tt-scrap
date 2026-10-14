@@ -6,9 +6,9 @@ The Go service replaces the Python server and its app worker with one binary. Bo
 
 Build the [Docker image](../Dockerfile), or install the native dependencies and run `make build`. Replace the Python entrypoint with `./bin/tt-scrap`. Python, uv, Node, npm, and Bun are no longer part of the build or runtime. FFmpeg and libheif remain required for media handling.
 
-Review `.env` against [`.env.example`](../.env.example). Existing environment variables take precedence over the file. Keep your API key, Instagram key, Telegram settings, and download limits. `YTDLP_COOKIES` remains the name for a Netscape-format web cookie file.
+Review `.env` against [`.env.example`](../.env.example). Existing environment variables take precedence over the file. Keep your API key, Instagram key, Telegram settings, and download limits. Replace `YTDLP_COOKIES` with `TIKTOK_SESSION_ID`, containing only the value of your TikTok `sessionid` cookie. Cookie files and stored account credentials are no longer loaded. Both backends start anonymously and use the environment session only after a content restriction. The session is not saved in PostgreSQL. See the [account fallback configuration](../README.md#identity-lifecycle).
 
-Set `TIKTOK_METHOD=web` to retain web extraction without PostgreSQL. The default is `app`, which requires `DB_URL` and creates only `scrap_proxies` and `scrap_identities` in `DB_SCHEMA` (default `public`). The schema must already exist. The database role needs permission to create, alter, and update those tables. Existing compatible app identities are loaded from the database.
+Set `TIKTOK_METHOD=web` to retain web extraction without PostgreSQL. The default is `app`, which requires `DB_URL` and creates `scrap_proxies` and `scrap_identities` in `DB_SCHEMA` (default `public`). The schema must already exist. The database role needs permission to create, alter, and update those tables. Existing compatible app identities are loaded from the database.
 
 For a new app database, import proxy addresses through `PROXY_FILE`, or set `PROXY_INCLUDE_HOST=true` to use the host directly. Saved database proxies do not require a proxy file. With Docker Compose, use `compose.proxies.yml` alongside `docker-compose.yml` to mount `proxies.txt`. The base Compose file requires only `.env` and a reachable database for app mode.
 
