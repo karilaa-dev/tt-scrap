@@ -746,7 +746,7 @@
         ],
         "summary": "Prepare identities",
         "operationId": "prepareTikTokIdentities",
-        "description": "Start or reuse a background job that fills ten identity slots per proxy address and refreshes expired signing seeds. Each proxy has one worker, with starts spaced at least ten seconds apart. Repeated requests reuse an active job. Accepts no body or an empty JSON object. Startup runs this job before opening the API listener.",
+        "description": "Start or reuse a background job that fills ten identity slots per proxy address and refreshes expired signing seeds. Each proxy has one worker, with a minimum ten-second gap after each attempt completes. Repeated requests reuse an active job. Accepts no body or an empty JSON object. Startup runs this job before opening the API listener.",
         "security": [
           {
             "HTTPBearer": []

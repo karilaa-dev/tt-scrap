@@ -141,12 +141,13 @@ func (p *Pool) prepareSlot(proxy *proxyState, ordinal int) error {
 	if err := proxy.preparationPace.wait(p.lifetime, p.preparationDelay); err != nil {
 		return err
 	}
+	// Start the next gap after completion: variable request setup must not
+	// consume it and allow the following registration to start too soon.
+	defer func() { proxy.preparationPace.next = time.Now().Add(p.preparationDelay) }()
 	l, err := p.acquire(p.lifetime, id)
 	if err != nil {
 		return err
 	}
-	// A busy lease may have delayed the start beyond the reserved time.
-	proxy.preparationPace.next = time.Now().Add(p.preparationDelay)
 	client := l.client()
 	ctx, cancel := context.WithTimeout(l.ctx, p.preparationTimeout)
 	defer cancel()

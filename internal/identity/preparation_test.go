@@ -37,16 +37,25 @@ func TestPreparationPacerSpacesStartsAndHonorsCancellation(t *testing.T) {
 func TestPreparationFillsEachProxyInParallelAndReusesPersistedIdentities(t *testing.T) {
 	cfg, db := testDatabase(t)
 	p := openTestPool(t, cfg, "http://same.example:8001", "http://same.example:8002", "http://other.example:8001")
-	p.preparationDelay = 10 * time.Millisecond
+	p.preparationDelay = 100 * time.Millisecond
 	seed, err := os.ReadFile("testdata/sdk-seed.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var mu sync.Mutex
 	starts := map[*http.Client][]time.Time{}
+	initialized := map[*http.Client]int{}
 	registrations, seeds := 0, 0
 	allStarted := make(chan struct{})
 	p.clientFactory = func(s *tiktokapp.Session, c *http.Client) *tiktokapp.Client {
+		mu.Lock()
+		slowSetup := initialized[c]%2 == 0
+		initialized[c]++
+		mu.Unlock()
+		if slowSetup {
+			// Variable request setup must not consume the next attempt's gap.
+			time.Sleep(2 * p.preparationDelay)
+		}
 		return tiktokapp.NewClient(s, fixtureDoer(func(r *http.Request) (*http.Response, error) {
 			switch r.URL.Path {
 			case "/service/2/device_register/":
@@ -103,7 +112,7 @@ func TestPreparationFillsEachProxyInParallelAndReusesPersistedIdentities(t *test
 		}
 		for i := 1; i < len(times); i++ {
 			if times[i].Sub(times[i-1]) < p.preparationDelay {
-				t.Fatal("registration pacing bypassed")
+				t.Fatalf("registration pacing bypassed: gap %s, minimum %s", times[i].Sub(times[i-1]), p.preparationDelay)
 			}
 		}
 	}
