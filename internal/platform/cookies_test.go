@@ -119,13 +119,18 @@ func TestWebAccountRejectionPreservesRestrictionWithoutRetries(t *testing.T) {
 			status, attempts int
 			code             string
 			publicStatus     int
+			detail           string
 		}{
-			{302, 1, restriction.code, restriction.status},
-			{401, 1, restriction.code, restriction.status},
-			{403, 1, restriction.code, restriction.status},
-			{404, 1, "content_deleted", 404},
-			{429, 3, "upstream_rate_limited", 429},
-			{503, 3, "upstream_network_error", 502},
+			{302, 1, restriction.code, restriction.status, ""},
+			{401, 1, restriction.code, restriction.status, ""},
+			{403, 1, restriction.code, restriction.status, ""},
+			{404, 1, "content_deleted", 404, ""},
+			{429, 3, "upstream_rate_limited", 429, ""},
+			{503, 3, "upstream_network_error", 502, ""},
+			{200, 1, restriction.code, restriction.status, `"statusCode":1,"statusMsg":"Login required"`},
+			{200, 1, restriction.code, restriction.status, `"statusCode":10216`},
+			{200, 1, restriction.code, restriction.status, `"statusCode":10204`},
+			{200, 1, "content_deleted", 404, `"statusCode":10202`},
 		} {
 			t.Run(fmt.Sprintf("%s/%d", restriction.name, accountResponse.status), func(t *testing.T) {
 				var anonymous, authenticated, logins atomic.Int32
@@ -150,6 +155,10 @@ func TestWebAccountRejectionPreservesRestrictionWithoutRetries(t *testing.T) {
 						return
 					}
 					w.WriteHeader(accountResponse.status)
+					if accountResponse.detail != "" {
+						fmt.Fprintf(w, `<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__">{"__DEFAULT_SCOPE__":{"webapp.video-detail":{%s}}}</script>`, accountResponse.detail)
+						return
+					}
 					fmt.Fprint(w, http.StatusText(accountResponse.status))
 				})
 				service.cfg.TikTokSessionID = "web-login"

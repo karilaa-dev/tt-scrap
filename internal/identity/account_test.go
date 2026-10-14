@@ -225,13 +225,21 @@ func TestAccountFallbackDistinguishesRejectionFromUpstreamFailure(t *testing.T) 
 		for _, tc := range []struct {
 			status, publicStatus, failures int
 			code                           string
+			originalStatus                 int
+			body                           string
 		}{
-			{401, 403, 0, "content_private"},
-			{403, 403, 0, "content_private"},
-			{429, 429, 1, "upstream_rate_limited"},
-			{503, 502, 1, "upstream_extraction_error"},
+			{401, 403, 0, "content_private", 10216, "Unavailable"},
+			{403, 403, 0, "content_private", 10216, "Unavailable"},
+			{429, 429, 1, "upstream_rate_limited", 10216, "Unavailable"},
+			{503, 502, 1, "upstream_extraction_error", 10216, "Unavailable"},
+			{200, 451, 0, "region_blocked", 10204, `{"status_code":1,"status_msg":"Login required"}`},
+			{401, 451, 0, "region_blocked", 10204, `{"status_code":1,"status_msg":"Login required"}`},
+			{200, 403, 0, "content_private", 10216, `{"status_code":1,"status_msg":"Login required"}`},
+			{200, 451, 0, "region_blocked", 10204, `{"status_code":10216}`},
+			{200, 403, 0, "content_private", 10216, `{"status_code":10204}`},
+			{404, 404, 0, "content_deleted", 10204, "Not found"},
 		} {
-			t.Run(fmt.Sprintf("%s/%d", operation, tc.status), func(t *testing.T) {
+			t.Run(fmt.Sprintf("%s/%d/%d", operation, tc.originalStatus, tc.status), func(t *testing.T) {
 				cfg, db := testDatabase(t)
 				cfg.TikTokSessionID = "stale-login"
 				p := openTestPool(t, cfg, "")
@@ -242,10 +250,10 @@ func TestAccountFallbackDistinguishesRejectionFromUpstreamFailure(t *testing.T) 
 						if r.URL.Path == "/aweme/v1/play/" || (operation == "detail" && r.URL.Path == "/aweme/v1/aweme/detail/") {
 							if _, err := r.Cookie("sid_tt"); err != nil {
 								anonymous++
-								return fixtureResponse(403, []byte(`{"status_code":10216}`)), nil
+								return fixtureResponse(403, []byte(fmt.Sprintf(`{"status_code":%d}`, tc.originalStatus))), nil
 							}
 							authenticated++
-							return fixtureResponse(tc.status, []byte("Unavailable")), nil
+							return fixtureResponse(tc.status, []byte(tc.body)), nil
 						}
 						return fixture.do(r)
 					}))

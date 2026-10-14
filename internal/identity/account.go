@@ -22,7 +22,7 @@ func (p *Pool) mediaRequest(ctx context.Context, client *tiktokapp.Client, addre
 
 func accountFallbackError(restriction, err error) error {
 	var failure *tiktokapp.UpstreamError
-	if restriction != nil && errors.As(err, &failure) && failure.Code == "upstream_blocked" {
+	if restriction != nil && errors.As(err, &failure) && (failure.Code == "upstream_blocked" || tiktokapp.IsContentRestricted(failure)) {
 		return restriction
 	}
 	return err

@@ -239,13 +239,15 @@ func (t *TikTok) fetchWeb(ctx context.Context, raw, id string) (object, core.Ass
 	}
 	client := newWebClient(transport)
 	detail, asset, err := t.fetchWebWithClient(ctx, client, proxy, raw, id, nil)
-	var failure *core.Error
-	if errors.As(err, &failure) && (failure.Code == "content_private" || failure.Code == "content_restricted" || failure.Code == "region_blocked") && t.cfg.TikTokSessionID != "" {
+	if restriction := webContentRestriction(err); restriction != nil && t.cfg.TikTokSessionID != "" {
 		u := &url.URL{Scheme: "https", Host: "www.tiktok.com", Path: "/"}
 		for _, name := range []string{"sid_tt", "sessionid", "sessionid_ss"} {
 			client.Jar.SetCookies(u, []*http.Cookie{{Name: name, Value: t.cfg.TikTokSessionID, Domain: ".tiktok.com", Path: "/", Secure: true, HttpOnly: true}})
 		}
-		return t.fetchWebWithClient(ctx, client, proxy, raw, id, failure)
+		detail, asset, err = t.fetchWebWithClient(ctx, client, proxy, raw, id, restriction)
+		if webContentRestriction(err) != nil {
+			err = restriction
+		}
 	}
 	return detail, asset, err
 }
@@ -285,9 +287,6 @@ func (t *TikTok) fetchWebWithClient(ctx context.Context, client *http.Client, pr
 			return nil, core.AssetContext{}, statusError(res.StatusCode, "TikTok webpage")
 		}
 		if res.Request.URL.Path == "/login" {
-			if restriction != nil {
-				return nil, core.AssetContext{}, restriction
-			}
 			return nil, core.AssetContext{}, core.NewError("content_private", "TikTok requires login for this content", 403)
 		}
 		detail, status, parseErr := ParseWebDetail(body, id)
@@ -333,6 +332,17 @@ func appDetail(response object, id string) object {
 	}
 	return nil
 }
+func webContentRestriction(err error) *core.Error {
+	var failure *core.Error
+	if errors.As(err, &failure) {
+		switch failure.Code {
+		case "content_private", "content_restricted", "region_blocked":
+			return failure
+		}
+	}
+	return nil
+}
+
 func webStatus(status int) error {
 	switch status {
 	case 10216, 10222:
