@@ -175,3 +175,45 @@ func TestFailureAndCancellationReleaseReaders(t *testing.T) {
 		t.Fatal("failed buffer kept RAM")
 	}
 }
+
+func TestCloseDropsRAM(t *testing.T) {
+	store := NewStore("", 1<<20, 1<<20)
+	fixed, err := store.New(64)
+	if err != nil || !fixed.InMemory() {
+		t.Fatal("fixed buffer left RAM", err)
+	}
+	growing, err := store.New(-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = growing.Writer(0, -1).Write(pattern(100)); err != nil || store.Used() == 64 {
+		t.Fatal("growing buffer reserved no RAM", err, store.Used())
+	}
+	for _, b := range []*Buffer{fixed, growing} {
+		b.Close()
+		b.Close()
+		if b.mem != nil {
+			t.Fatal("closed buffer kept its RAM", cap(b.mem))
+		}
+		if _, err = b.ReadAt(make([]byte, 1), 0); err != ErrClosed {
+			t.Fatal("closed buffer read", err)
+		}
+		if _, err = b.Reader(context.Background(), 0, -1).Read(make([]byte, 1)); err != ErrClosed {
+			t.Fatal("closed buffer streamed", err)
+		}
+		if _, err = b.Writer(0, -1).Write([]byte{1}); err != ErrClosed {
+			t.Fatal("closed buffer accepted a write", err)
+		}
+		if b.Bytes() != nil || b.Complete() != ErrClosed {
+			t.Fatal("closed buffer exposed or completed")
+		}
+	}
+	if store.Used() != 0 {
+		t.Fatal("RAM not returned", store.Used())
+	}
+	if again, _ := store.New(1 << 20); !again.InMemory() {
+		t.Fatal("released budget not reusable")
+	} else {
+		again.Close()
+	}
+}

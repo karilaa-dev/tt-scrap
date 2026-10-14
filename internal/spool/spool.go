@@ -323,7 +323,8 @@ func (b *Buffer) Close() {
 	b.err = ErrClosed
 	b.notifyLocked()
 	b.store.release(b.reserved)
-	b.reserved = 0
+	// Retried deliveries keep closed buffers referenced; drop the released RAM.
+	b.mem, b.reserved = nil, 0
 	if b.file != nil {
 		_ = b.file.Close()
 	}

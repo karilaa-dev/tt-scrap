@@ -221,3 +221,32 @@ func TestSmallJPEGThumbnailValidatesPixelStream(t *testing.T) {
 		t.Fatal("valid thumbnail was unnecessarily re-encoded")
 	}
 }
+
+func TestDiskBackedHEICKeepsHeader(t *testing.T) {
+	data, err := os.ReadFile("testdata/sample.heic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, thumbnail := range []bool{false, true} {
+		source, err := spool.NewStore(t.TempDir(), 0, 0).New(int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = source.Writer(0, -1).Write(data); err != nil || source.Complete() != nil || source.InMemory() {
+			t.Fatal("HEIC fixture not on disk", err)
+		}
+		prepared, err := NewProcessor(1).Prepare(context.Background(), source, "sample.heic", thumbnail)
+		source.Close()
+		if err != nil {
+			t.Fatal(thumbnail, err)
+		}
+		config := configOf(t, prepared)
+		prepared.Cleanup()
+		if prepared.ContentType != "image/jpeg" || prepared.Filename != "sample.jpg" || config.Width <= 0 || config.Height <= 0 {
+			t.Fatalf("%v %#v %#v", thumbnail, prepared, config)
+		}
+		if thumbnail && max(config.Width, config.Height) > 320 {
+			t.Fatalf("thumbnail %dx%d", config.Width, config.Height)
+		}
+	}
+}

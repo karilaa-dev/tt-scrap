@@ -127,7 +127,7 @@ func (p *Processor) Prepare(ctx context.Context, source *spool.Buffer, filename 
 	} else if kind == "image/heic" || kind == "image/heif" || kind == "image/avif" {
 		data := source.Bytes()
 		if data == nil {
-			if data, err = io.ReadAll(f); err != nil {
+			if data, err = io.ReadAll(io.NewSectionReader(source, 0, size)); err != nil {
 				return Prepared{}, err
 			}
 		}
