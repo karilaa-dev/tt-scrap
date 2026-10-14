@@ -200,7 +200,7 @@ func (p *Pool) failedLocked(e *entry, err error) {
 	if !errors.As(err, &typed) && !isNetwork {
 		return
 	}
-	if typed != nil && (typed.Code == "content_private" || typed.Code == "content_deleted" || typed.Code == "region_blocked") {
+	if typed != nil && (typed.Code == "content_deleted" || tiktokapp.IsContentRestricted(typed)) {
 		return
 	}
 	h := &e.health

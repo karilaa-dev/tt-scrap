@@ -70,6 +70,7 @@ type Pool struct {
 	sequence                      uint64
 	queued, queueLimit            int
 	proxiesTable, identitiesTable string
+	account                       tiktokapp.Account
 	reads, writes                 atomic.Uint64
 	mediaTransport                *http.Transport
 	clientFactory                 func(*tiktokapp.Session, *http.Client) *tiktokapp.Client
@@ -88,6 +89,7 @@ func Open(ctx context.Context, cfg core.Config, addresses []string) (*Pool, erro
 	p := &Pool{entries: map[string]*entry{}, notify: make(chan struct{}), lifetime: lifetime, stop: stop, queueLimit: cfg.MaxQueuedRequests,
 		preparationDelay: preparationInterval, preparationTimeout: cfg.UpstreamTimeout,
 		proxiesTable: fmt.Sprintf(`"%s".scrap_proxies`, cfg.DBSchema), identitiesTable: fmt.Sprintf(`"%s".scrap_identities`, cfg.DBSchema),
+		account:       tiktokapp.Account{SessionID: cfg.TikTokSessionID},
 		clientFactory: func(s *tiktokapp.Session, c *http.Client) *tiktokapp.Client { return tiktokapp.NewClient(s, c) }}
 	if p.queueLimit < 1 {
 		p.queueLimit = 1024
