@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TikTok link to Telegram</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: transparent; color: var(--foreground); font-family: var(--font-sans, system-ui); }
+  #tiktok-flow { --font-size-base: 14px; --viz-series-1: var(--chart-1); --viz-series-2: var(--chart-2); font-size: var(--font-size-base); padding: 8px 0 12px; }
+  h2, h3, p { margin: 0; }
+  h2 { font-size: calc(var(--font-size-base) * 1.45); font-weight: 500; margin: 0 92px 8px 0; }
+  h3 { font-size: var(--font-size-base); font-weight: 500; }
+  .text-small { font-size: calc(var(--font-size-base) * .86); }
+  .text-muted { color: var(--muted-foreground); }
+  .eyebrow { margin-bottom: 22px; }
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 28px; align-items: start; }
+  .steps { list-style: none; padding: 0; margin: 0; }
+  .step { position: relative; display: grid; grid-template-columns: 30px minmax(0, 1fr); column-gap: 12px; min-height: 68px; padding-bottom: 16px; }
+  .step:not(:last-child)::after { content: ''; position: absolute; top: 31px; bottom: 1px; left: 14px; width: 1px; background: var(--border); }
+  .number { display: grid; place-items: center; width: 29px; height: 29px; border-radius: 50%; background: var(--secondary); color: var(--secondary-foreground); font-size: var(--font-size-base); font-weight: 500; }
+  .step[aria-current="step"] .number { background: var(--primary); color: var(--primary-foreground); }
+  .step-text { min-width: 0; }
+  .step-text p { margin-top: 4px; color: var(--muted-foreground); font-size: calc(var(--font-size-base) * .86); }
+  .step-select { display: block; appearance: none; border: 0; padding: 3px 0; background: transparent; color: var(--foreground); font: inherit; font-weight: 500; text-align: left; }
+  .step-select:hover { text-decoration: underline; text-underline-offset: 4px; }
+  .step-select[aria-pressed="true"] { text-decoration: underline; text-underline-offset: 4px; }
+  .detail { padding-top: 3px; min-width: 0; }
+  .detail-kicker { margin-bottom: 10px; }
+  #detail-title { margin-bottom: 12px; }
+  #detail-copy { line-height: 1.6; margin-bottom: 18px; }
+  .transform { display: grid; grid-template-columns: minmax(0, 1fr); gap: 9px; margin-bottom: 18px; }
+  .datum { display: grid; grid-template-columns: 48px minmax(0, 1fr); column-gap: 10px; align-items: baseline; }
+  .datum-value { overflow-wrap: anywhere; }
+  .branch { border-left: 2px solid var(--border); padding-left: 12px; margin-top: 16px; line-height: 1.5; }
+  code { font-family: var(--font-mono, ui-monospace, monospace); font-size: calc(var(--font-size-base) * .86); overflow-wrap: anywhere; }
+  .source { margin-top: 20px; line-height: 1.6; }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 16px 0 22px; }
+  .stream-head { display: flex; flex-wrap: wrap; gap: 8px 24px; justify-content: space-between; align-items: baseline; margin-bottom: 18px; }
+  .byte-flow { display: grid; grid-template-columns: minmax(0, 1fr) 24px minmax(0, 1fr) 24px minmax(0, 1fr); align-items: center; margin-bottom: 22px; }
+  .endpoint { min-width: 0; }
+  .endpoint b { font-weight: 500; display: block; margin-bottom: 4px; }
+  .endpoint span { display: block; }
+  .arrow { color: var(--muted-foreground); text-align: center; }
+  .timeline { display: grid; grid-template-columns: 86px minmax(0, 1fr); gap: 12px; }
+  .lane-name { padding-top: 9px; font-weight: 500; }
+  .track { display: grid; grid-template-columns: minmax(0, 60fr) minmax(60px, 16fr) minmax(62px, 14fr) minmax(34px, 10fr); gap: 3px; min-height: 46px; }
+  .prefix-phase { grid-column: 1; margin-left: 18%; }
+  .hold-phase { grid-column: 2 / 4; }
+  .tail-phase { grid-column: 4; }
+  .phase { min-width: 0; padding: 10px 6px; text-align: center; display: flex; align-items: center; justify-content: center; background: var(--secondary); color: var(--secondary-foreground); border-radius: 3px; font-size: calc(var(--font-size-base) * .86); }
+  .download-phase { background: color-mix(in srgb, var(--viz-series-1) 20%, transparent); color: var(--foreground); }
+  .upload-phase { background: color-mix(in srgb, var(--viz-series-2) 20%, transparent); color: var(--foreground); }
+  .empty-phase { background: transparent; padding: 0; }
+  .gate { display: flex; gap: 10px; align-items: baseline; margin-top: 14px; line-height: 1.5; }
+  .gate-mark { width: 9px; height: 9px; flex: 0 0 9px; background: var(--foreground); transform: rotate(45deg); }
+  .fallback { margin-top: 14px; color: var(--muted-foreground); line-height: 1.5; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+  @media (max-width: 560px) {
+    .layout { grid-template-columns: minmax(0, 1fr); gap: 18px; }
+    .step { min-height: 61px; padding-bottom: 12px; }
+    .detail { padding-top: 14px; border-top: 1px solid var(--border); }
+    #detail-copy { margin-bottom: 12px; }
+    .source { margin-top: 14px; }
+    .timeline { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+    .lane-name { padding-top: 7px; }
+    .track { min-height: 52px; }
+    .byte-flow { grid-template-columns: minmax(0, 1fr) 20px minmax(0, 1fr) 20px minmax(0, 1fr); }
+  }
+  @media (pointer: coarse) { .step-select { min-height: 44px; } .step { min-height: 78px; } }
+</style>
+</head>
+<body>
+<main id="tiktok-flow">
+  <h2>From a TikTok link to Telegram</h2>
+  <p class="text-small text-muted eyebrow">tt-scrap · single video · select a step for the details</p>
+  <div class="layout">
+    <ol class="steps" aria-label="Video delivery steps">
+      <li class="step" data-step="0"><span class="number" aria-hidden="true">1</span><div class="step-text"><button type="button" class="step-select cursor-interaction" data-select="0" aria-pressed="false" aria-controls="step-detail">Receive the link</button><p>Video URL + target Telegram chat</p></div></li>
+      <li class="step" data-step="1"><span class="number" aria-hidden="true">2</span><div class="step-text"><button type="button" class="step-select cursor-interaction" data-select="1" aria-pressed="false" aria-controls="step-detail">Resolve the video ID</button><p>Share-link redirects → canonical post</p></div></li>
+      <li class="step" data-step="2"><span class="number" aria-hidden="true">3</span><div class="step-text"><button type="button" class="step-select cursor-interaction" data-select="2" aria-pressed="false" aria-controls="step-detail">Get TikTok metadata</button><p>Cached data or a signed app request</p></div></li>
+      <li class="step" data-step="3"><span class="number" aria-hidden="true">4</span><div class="step-text"><button type="button" class="step-select cursor-interaction" data-select="3" aria-pressed="false" aria-controls="step-detail">Choose the best MP4</button><p>Resolution → frame rate → bitrate</p></div></li>
+      <li class="step" data-step="4" aria-current="step"><span class="number" aria-hidden="true">5</span><div class="step-text"><button type="button" class="step-select cursor-interaction" data-select="4" aria-pressed="true" aria-controls="step-detail">Download & upload together</button><p>CDN → buffer → Telegram sendVideo</p></div></li>
+      <li class="step" data-step="5"><span class="number" aria-hidden="true">6</span><div class="step-text"><button type="button" class="step-select cursor-interaction" data-select="5" aria-pressed="false" aria-controls="step-detail">Complete the delivery</button><p>Telegram accepts → video in the chat</p></div></li>
+    </ol>
+    <section class="detail" id="step-detail" aria-labelledby="detail-title">
+      <div class="text-small text-muted detail-kicker" id="detail-kicker">STEP 5 / 6</div>
+      <h3 id="detail-title">Download & upload together</h3>
+      <p id="detail-copy">The video downloads into a shared buffer. Telegram reads the bytes already available, so upload can begin before download finishes. The final 64 KiB stays unsent until preparation succeeds.</p>
+      <div class="transform">
+        <div class="datum"><span class="text-small text-muted">Input</span><span class="datum-value" id="detail-input">Video URL + identity context</span></div>
+        <div class="datum"><span class="text-small text-muted">Output</span><span class="datum-value" id="detail-output">Multipart upload to sendVideo</span></div>
+      </div>
+      <p class="branch text-small" id="detail-branch">The optional cover downloads alongside the video. Upload starts after the thumbnail succeeds, fails, or times out.</p>
+      <p class="source text-small text-muted">Code path<br><code id="detail-source">httpapi/telegram.go · sendStreamed</code></p>
+      <span class="sr-only" id="step-announcement" aria-live="polite"></span>
+    </section>
+  </div>
+  <hr>
+  <section aria-labelledby="stream-title">
+    <div class="stream-head"><h3 id="stream-title">The download and upload overlap</h3><span class="text-small text-muted">Schematic sequence · no measured timings</span></div>
+    <div class="byte-flow" aria-label="Video bytes flow from TikTok CDN through a memory or disk buffer to Telegram">
+      <div class="endpoint"><b>TikTok CDN</b><span class="text-small text-muted">MP4 with audio</span></div><span class="arrow" aria-hidden="true">→</span>
+      <div class="endpoint"><b>Shared buffer</b><span class="text-small text-muted">RAM or temp file</span></div><span class="arrow" aria-hidden="true">→</span>
+      <div class="endpoint"><b>Telegram</b><span class="text-small text-muted">Bot API upload</span></div>
+    </div>
+    <div class="timeline" role="img" aria-label="Download proceeds while the available prefix uploads. Download completes, the MP4 is checked, and the identity checkpoint is saved. Only then does the final 64 KiB upload.">
+      <div class="lane-name">Prepare</div><div class="track"><span class="phase download-phase">Download</span><span class="phase">MP4 check</span><span class="phase">Save identity</span><span class="phase empty-phase" aria-hidden="true"></span></div>
+      <div class="lane-name">Upload</div><div class="track upload"><span class="phase upload-phase prefix-phase">Upload available bytes</span><span class="phase hold-phase">Hold final 64 KiB</span><span class="phase upload-phase tail-phase">Tail</span></div>
+    </div>
+    <div class="gate"><span class="gate-mark" aria-hidden="true"></span><span class="text-small">Final bytes released only after <b style="font-weight:500">MP4 validation + identity save</b>. Failure aborts the incomplete upload.</span></div>
+    <p class="fallback text-small">Unknown video size: finish downloading first, then upload. Photos and albums also prepare completely before upload.</p>
+  </section>
+</main>
+<script>
+(() => {
+  const root = document.getElementById('tiktok-flow');
+  const steps = [
+    { title: 'Receive the link', copy: 'A caller sends an authenticated delivery request to tt-scrap with the TikTok URL and Telegram fields such as chat_id and an optional caption. The service checks the request and admits it to a bounded delivery pipeline.', input: 'TikTok URL + Telegram chat_id', output: 'Validated delivery request', branch: 'The Telegram bot token is configured on the server. The endpoint is POST /v1/tiktok/telegram-deliveries.', source: 'httpapi/api.go · route → telegramService.deliver' },
+    { title: 'Resolve the video ID', copy: 'A full TikTok post URL already contains the video ID. For a short share link, the service follows redirect headers until a URL identifies the post, then preserves the numeric ID exactly.', input: 'Short or full TikTok URL', output: 'Canonical post URL + exact video ID', branch: 'Resolution results are cached in RAM. Home, profile, and login redirects fail instead of being treated as a video.', source: 'platform/resolve.go · resolve → followShareLink' },
+    { title: 'Get TikTok metadata', copy: 'Fresh metadata can be reused from RAM. Otherwise, the app backend leases a saved device identity and its assigned proxy, signs a TikTok app request, and fetches video details and media addresses.', input: 'Video ID', output: 'Video renditions, cover, caption & identity context', branch: 'Requests start anonymously. A content restriction can trigger one retry with the configured TikTok account; rate limits and network failures do not.', source: 'platform/tiktok.go · extractResolved → fetchMetadata' },
+    { title: 'Choose the best MP4', copy: 'The service ranks the renditions supplied by TikTok: highest pixel resolution first, then frame rate, then bitrate. It records the selected video URL and the context needed to download it.', input: 'TikTok video rendition metadata', output: 'Selected MP4 + optional cover', branch: 'Video selection uses metadata without probing the CDN. The app video already includes audio, so there is no separate audio merge.', source: 'platform/selection.go · selectVideo → betterThan' },
+    { title: 'Download & upload together', copy: 'The video downloads into a shared buffer. Telegram reads the bytes already available, so upload can begin before download finishes. The final 64 KiB stays unsent until preparation succeeds.', input: 'Video URL + identity context', output: 'Multipart upload to sendVideo', branch: 'The optional cover downloads alongside the video. Upload starts after the thumbnail succeeds, fails, or times out.', source: 'httpapi/telegram.go · sendStreamed; telegram_client.go · multipartBody' },
+    { title: 'Complete the delivery', copy: 'After the download passes MP4 checks and the identity checkpoint is saved, the upload releases its final bytes. Telegram can then accept the complete request and create the video message in the target chat.', input: 'Validated media + completed upload', output: 'Telegram response returned to the caller', branch: 'Temporary media is cleaned up. A failed or ambiguous Telegram upload is not automatically replayed, avoiding duplicate messages.', source: 'httpapi/telegram.go · sendStreamed; telegram_client.go · telegramResponse' }
+  ];
+  let selected = 4;
+  const el = id => root.querySelector('#' + id);
+  function render(index, announce) {
+    if (!Number.isInteger(index) || !steps[index]) return;
+    selected = index;
+    const step = steps[index];
+    root.querySelectorAll('[data-select]').forEach(button => button.setAttribute('aria-pressed', String(Number(button.dataset.select) === index)));
+    root.querySelectorAll('[data-step]').forEach(node => {
+      if (Number(node.dataset.step) === index) node.setAttribute('aria-current', 'step');
+      else node.removeAttribute('aria-current');
+    });
+    el('detail-kicker').textContent = 'STEP ' + (index + 1) + ' / ' + steps.length;
+    el('detail-title').textContent = step.title;
+    el('detail-copy').textContent = step.copy;
+    el('detail-input').textContent = step.input;
+    el('detail-output').textContent = step.output;
+    el('detail-branch').textContent = step.branch;
+    el('detail-source').textContent = step.source;
+    if (announce) el('step-announcement').textContent = 'Step ' + (index + 1) + ': ' + step.title + '. ' + step.copy;
+  }
+  function restore(state) {
+    const index = state?.privateContent?.step;
+    if (Number.isInteger(index) && steps[index]) render(index, false);
+  }
+  root.querySelectorAll('[data-select]').forEach(button => button.addEventListener('click', () => {
+    render(Number(button.dataset.select), true);
+    if (window.openai?.setWidgetState) Promise.resolve(window.openai.setWidgetState({ modelContent: { selectedStep: steps[selected].title }, privateContent: { step: selected } })).catch(() => {});
+  }));
+  render(4, false);
+  restore(window.openai?.widgetState);
+  window.addEventListener('openai:set_globals', event => restore(event.detail?.globals?.widgetState));
+})();
+</script>
+</body>
+</html>
