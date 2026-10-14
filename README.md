@@ -96,6 +96,8 @@ The container runs as an unprivileged user and includes the Go binary and native
 
 `railpack.json` defines the CGO server build and native media packages. Railpack detects Go and its version from `go.mod` and supplies the default `./out` start command. The package settings follow the [Railpack Go](https://railpack.com/languages/golang/) and [configuration](https://railpack.com/config/file/) documentation. Docker provides the reproducible deployment path for the native codec dependencies.
 
+For Dokploy with Railpack 0.15.4, `buildAptPackages` must contain only package names: `...` is passed literally to APT and causes dependency conflicts. The `...` in `deploy.aptPackages` is supported and preserves Railpack's default runtime packages.
+
 ## Migrate from the Python release
 
 Read the [migration notes](docs/migration.md) before replacing an existing deployment. They cover the app default, PostgreSQL ownership, retained configuration names, and rollback.

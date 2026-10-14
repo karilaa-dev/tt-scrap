@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.railpack.com",
-  "buildAptPackages": ["...", "gcc", "libc6-dev", "pkg-config", "libheif-dev"],
+  "buildAptPackages": ["gcc", "libc6-dev", "pkg-config", "libheif-dev"],
   "steps": {
     "build": {
       "commands": ["CGO_ENABLED=1 go build -trimpath -ldflags='-s -w' -o out ./cmd/tt-scrap"]
