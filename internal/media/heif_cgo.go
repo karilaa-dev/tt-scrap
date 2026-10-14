@@ -23,7 +23,8 @@ import (
 	"unsafe"
 )
 
-func decodeHEIF(data []byte) (image.Image, error) {
+// decodeHEIF calls admit with the primary image dimensions before decoding it.
+func decodeHEIF(data []byte, admit func(width, height int) error) (image.Image, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("empty HEIF image")
 	}
@@ -46,8 +47,8 @@ func decodeHEIF(data []byte) (image.Image, error) {
 	}
 	defer C.heif_image_handle_release(handle)
 	w, h := int(C.heif_image_handle_get_width(handle)), int(C.heif_image_handle_get_height(handle))
-	if w <= 0 || h <= 0 || int64(w)*int64(h) > maxPixels {
-		return nil, fmt.Errorf("HEIF image dimensions exceed limit")
+	if err := admit(w, h); err != nil {
+		return nil, err
 	}
 	var decoded *C.struct_heif_image
 	if result := C.decode_image(handle, &decoded); result.code != C.heif_error_Ok {

@@ -38,6 +38,7 @@ type Config struct {
 	TelegramTimeout, ThumbnailWait                                                    time.Duration
 	TelegramMaxBytes                                                                  int64
 	ImageConcurrency                                                                  int
+	ImageMemoryBytes                                                                  int64
 	LogLevel                                                                          string
 }
 
@@ -55,7 +56,7 @@ func DefaultConfig() Config {
 		TelegramAPIBaseURL: "https://api.telegram.org", TelegramPipelineConcurrency: 32, TelegramUploadConcurrency: 32,
 		TelegramPreparationConcurrency: 32,
 		TelegramTimeout:                600 * time.Second, ThumbnailWait: 1500 * time.Millisecond, TelegramMaxBytes: 50 * 1024 * 1024,
-		ImageConcurrency: 32, LogLevel: "INFO",
+		ImageConcurrency: 32, ImageMemoryBytes: 1 << 30, LogLevel: "INFO",
 	}
 }
 
@@ -148,7 +149,7 @@ func ParseConfig(env map[string]string) (Config, error) {
 	duration("INSTAGRAM_RETRY_DELAY_SECONDS", &c.InstagramRetryDelay, 0, 30)
 	duration("TELEGRAM_UPLOAD_TIMEOUT_SECONDS", &c.TelegramTimeout, .001, 3600)
 	duration("TELEGRAM_THUMBNAIL_WAIT_SECONDS", &c.ThumbnailWait, 0, 30)
-	for key, dst := range map[string]*int64{"MAX_ASSET_BYTES": &c.MaxAssetBytes, "TELEGRAM_UPLOAD_MAX_MB": &c.TelegramMaxBytes, "MEDIA_MEMORY_MAX_MB": &c.MediaMemoryFileBytes, "MEDIA_MEMORY_BUDGET_MB": &c.MediaMemoryBudgetBytes} {
+	for key, dst := range map[string]*int64{"MAX_ASSET_BYTES": &c.MaxAssetBytes, "TELEGRAM_UPLOAD_MAX_MB": &c.TelegramMaxBytes, "MEDIA_MEMORY_MAX_MB": &c.MediaMemoryFileBytes, "MEDIA_MEMORY_BUDGET_MB": &c.MediaMemoryBudgetBytes, "IMAGE_MEMORY_BUDGET_MB": &c.ImageMemoryBytes} {
 		if v, ok := env[key]; ok {
 			n, e := strconv.ParseInt(v, 10, 64)
 			if e != nil || n < 0 || n > 1<<40 {
@@ -159,6 +160,9 @@ func ParseConfig(env map[string]string) (Config, error) {
 				*dst = n
 			}
 		}
+	}
+	if c.ImageMemoryBytes == 0 {
+		c.ImageMemoryBytes = DefaultConfig().ImageMemoryBytes
 	}
 	boolean("PROXY_INCLUDE_HOST", &c.ProxyIncludeHost)
 	boolean("PROXY_DATA_ONLY", &c.ProxyDataOnly)

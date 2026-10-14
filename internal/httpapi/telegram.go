@@ -134,7 +134,7 @@ type telegramService struct {
 }
 
 func newTelegramService(settings core.Config, dependencies Dependencies) *telegramService {
-	return &telegramService{settings: settings, tiktok: dependencies.TikTok, instagram: dependencies.Instagram, assets: dependencies.Assets, downloader: dependencies.Downloader, client: newTelegramClient(settings, dependencies.HTTPClient), images: media.NewProcessor(settings.ImageConcurrency), pipelines: core.NewLimiter(settings.TelegramPipelineConcurrency, settings.MaxQueuedRequests)}
+	return &telegramService{settings: settings, tiktok: dependencies.TikTok, instagram: dependencies.Instagram, assets: dependencies.Assets, downloader: dependencies.Downloader, client: newTelegramClient(settings, dependencies.HTTPClient), images: media.NewProcessor(settings.ImageConcurrency, settings.ImageMemoryBytes), pipelines: core.NewLimiter(settings.TelegramPipelineConcurrency, settings.MaxQueuedRequests)}
 }
 
 func (s *telegramService) deliver(ctx context.Context, request telegramRequest, instagram bool) (result deliveryResult, err error) {

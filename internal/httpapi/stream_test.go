@@ -54,6 +54,7 @@ func TestSingleVideoUploadStreamsWhileDownloading(t *testing.T) {
 			uploading := make(chan struct{})
 			var signal sync.Once
 			cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("ETag", `"video"`)
 				if !strings.HasPrefix(r.Header.Get("Range"), "bytes=0-") {
 					select {
 					case <-uploading:

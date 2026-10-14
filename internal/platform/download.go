@@ -134,7 +134,7 @@ func (d *Downloader) retryDelay(attempt int) time.Duration {
 	delay := min(d.cfg.RetryDelay*time.Duration(1<<min(attempt, 10)), d.cfg.DownloadTimeout)
 	return min(delay+time.Duration(rand.Float64()*float64(delay)*0.1), d.cfg.DownloadTimeout)
 }
-func (d *Downloader) open(ctx context.Context, asset core.AssetContext, source, byteRange string, appOpen core.OpenAppMedia) (*http.Response, error) {
+func (d *Downloader) open(ctx context.Context, asset core.AssetContext, source, byteRange, ifRange string, appOpen core.OpenAppMedia) (*http.Response, error) {
 	headers := asset.Headers.Clone()
 	if headers == nil {
 		headers = make(http.Header)
@@ -148,6 +148,9 @@ func (d *Downloader) open(ctx context.Context, asset core.AssetContext, source, 
 	}
 	if byteRange != "" {
 		headers.Set("Range", byteRange)
+	}
+	if ifRange != "" {
+		headers.Set("If-Range", ifRange)
 	}
 	if asset.IdentityID != "" {
 		return appOpen(ctx, source, headers)
@@ -165,22 +168,40 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 	if ranged {
 		byteRange = "bytes=0-" + strconv.Itoa(firstPart-1)
 	}
-	res, e := d.open(ctx, asset, source, byteRange, open)
+	res, e := d.open(ctx, asset, source, byteRange, "", open)
 	if e != nil {
 		return nil, networkError(ctx, e)
 	}
-	defer res.Body.Close()
+	defer func() { res.Body.Close() }()
 	// total is the file size and end the bytes this response carries; -1 if unknown.
 	total, end := res.ContentLength, res.ContentLength
-	switch {
-	case res.StatusCode == http.StatusPartialContent && ranged:
+	var pinned representation
+	if res.StatusCode == http.StatusPartialContent && ranged {
 		first, last, size, ok := contentRange(res.Header.Get("Content-Range"))
 		if !ok || first != 0 || res.ContentLength >= 0 && res.ContentLength != last+1 {
 			return nil, invalidRange()
 		}
 		total, end = size, last+1
+		pinned = representation{url: finalURL(res, source), etag: strongETag(res.Header)}
+		if total > end && pinned.etag == "" {
+			// Without a strong validator, later parts could come from a different
+			// file of the same size; fetch the whole file in one response instead.
+			res.Body.Close()
+			whole, e := d.open(ctx, asset, source, "", "", open)
+			if e != nil {
+				return nil, networkError(ctx, e)
+			}
+			res = whole
+			if res.StatusCode != http.StatusOK {
+				return nil, core.NewError("upstream_network_error", "Media download returned an unsuccessful response", 502)
+			}
+		}
+	}
+	switch {
+	case res.StatusCode == http.StatusPartialContent && ranged:
 	case res.StatusCode == http.StatusOK:
 		ranged = false
+		total, end = res.ContentLength, res.ContentLength
 	default:
 		return nil, core.NewError("upstream_network_error", "Media download returned an unsuccessful response", 502)
 	}
@@ -223,7 +244,7 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 			return core.NewError("upstream_network_error", "Upstream video is not MP4", 502)
 		}
 		if ranged && total > end {
-			parts = d.startRanges(ctx, asset, partSources(res, source), open, data, end, total)
+			parts = d.startRanges(ctx, asset, partSources(res, source), pinned, open, data, end, total)
 		}
 		if started != nil && total >= 0 {
 			started(&core.Downloaded{Data: data, Filename: detectedFilename(asset.Filename, mime), ContentType: mime, Size: total})
@@ -301,13 +322,32 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 	return &core.Downloaded{Data: data, Filename: detectedFilename(asset.Filename, mime), ContentType: mime, Size: size, SHA256: hex.EncodeToString(digest.Sum(nil)), Width: width, Height: height}, nil
 }
 
+// representation identifies the file the first response came from. Parts must
+// match both its post-redirect address and its strong ETag, because an ETag
+// only identifies versions of one resource.
+type representation struct{ url, etag string }
+
+// strongETag returns the ETag if it can validate byte ranges (RFC 9110 8.8.3).
+func strongETag(header http.Header) string {
+	tag := header.Get("ETag")
+	if len(tag) < 2 || tag[0] != '"' || tag[len(tag)-1] != '"' {
+		return ""
+	}
+	return tag
+}
+
+func finalURL(res *http.Response, source string) string {
+	if res.Request != nil && res.Request.URL != nil && (res.Request.URL.Scheme == "https" || res.Request.URL.Scheme == "http") {
+		return res.Request.URL.String()
+	}
+	return source
+}
+
 // partSources prefers the post-redirect address, so parts skip app redirects;
 // part retries alternate with the original source in case that address fails.
 func partSources(res *http.Response, source string) []string {
-	if res.Request != nil && res.Request.URL != nil && (res.Request.URL.Scheme == "https" || res.Request.URL.Scheme == "http") {
-		if final := res.Request.URL.String(); final != source {
-			return []string{final, source}
-		}
+	if final := finalURL(res, source); final != source {
+		return []string{final, source}
 	}
 	return []string{source}
 }
@@ -333,6 +373,10 @@ func invalidRange() error {
 	return core.NewError("upstream_network_error", "Media download returned an invalid range", 502)
 }
 
+// errChanged ends a ranged transfer whose file changed after the first part;
+// the download then restarts from a fresh buffer instead of mixing versions.
+var errChanged = core.NewError("upstream_network_error", "Media changed during download", 502)
+
 // rangeJob downloads the parts after the first response. Extra connections use
 // free transfer slots only, so a busy gate downloads with fewer connections.
 type rangeJob struct {
@@ -341,6 +385,7 @@ type rangeJob struct {
 	cancel  context.CancelFunc
 	asset   core.AssetContext
 	sources []string
+	pinned  representation
 	open    core.OpenAppMedia
 	data    *spool.Buffer
 	from    int64
@@ -353,11 +398,11 @@ type rangeJob struct {
 	err     error
 }
 
-func (d *Downloader) startRanges(ctx context.Context, asset core.AssetContext, sources []string, open core.OpenAppMedia, data *spool.Buffer, from, total int64) *rangeJob {
+func (d *Downloader) startRanges(ctx context.Context, asset core.AssetContext, sources []string, pinned representation, open core.OpenAppMedia, data *spool.Buffer, from, total int64) *rangeJob {
 	connections := int64(d.cfg.DownloadParts)
 	// Two parts per connection keep the ready prefix moving for streaming readers.
 	part := max(minPart, (total-from+connections*2-1)/(connections*2))
-	j := &rangeJob{d: d, asset: asset, sources: sources, open: open, data: data, from: from, total: total, part: part, count: (total - from + part - 1) / part}
+	j := &rangeJob{d: d, asset: asset, sources: sources, pinned: pinned, open: open, data: data, from: from, total: total, part: part, count: (total - from + part - 1) / part}
 	j.ctx, j.cancel = context.WithCancel(ctx)
 	for range min(connections-1, j.count) {
 		release, ok := d.gate.TryAcquire()
@@ -416,8 +461,8 @@ func (j *rangeJob) fetch(start, end int64) error {
 				return networkError(j.ctx, err)
 			}
 		}
-		if last = j.fetchOnce(writer, j.sources[attempt%len(j.sources)], end); last == nil {
-			return nil
+		if last = j.fetchOnce(writer, j.sources[attempt%len(j.sources)], end); last == nil || last == errChanged {
+			return last
 		}
 		if j.ctx.Err() != nil {
 			return networkError(j.ctx, j.ctx.Err())
@@ -428,11 +473,19 @@ func (j *rangeJob) fetch(start, end int64) error {
 
 func (j *rangeJob) fetchOnce(writer *spool.Writer, source string, end int64) error {
 	offset := writer.Offset()
-	res, err := j.d.open(j.ctx, j.asset, source, "bytes="+strconv.FormatInt(offset, 10)+"-"+strconv.FormatInt(end-1, 10), j.open)
+	res, err := j.d.open(j.ctx, j.asset, source, "bytes="+strconv.FormatInt(offset, 10)+"-"+strconv.FormatInt(end-1, 10), j.pinned.etag, j.open)
 	if err != nil {
 		return networkError(j.ctx, err)
 	}
 	defer res.Body.Close()
+	if finalURL(res, source) != j.pinned.url {
+		return invalidRange()
+	}
+	// A 200 answers If-Range with a newer file; a 206 must still carry the
+	// pinned ETag in case the server ignores If-Range.
+	if res.StatusCode == http.StatusOK || res.StatusCode == http.StatusPartialContent && strongETag(res.Header) != j.pinned.etag {
+		return errChanged
+	}
 	first, last, size, ok := contentRange(res.Header.Get("Content-Range"))
 	if res.StatusCode != http.StatusPartialContent || !ok || first != offset || last != end-1 || size != j.total {
 		return invalidRange()

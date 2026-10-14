@@ -68,6 +68,7 @@ func BenchmarkThrottledVideoDelivery(b *testing.B) {
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end-1, len(data)))
 			status = http.StatusPartialContent
 		}
+		w.Header().Set("ETag", `"benchmark"`)
 		w.Header().Set("Content-Length", strconv.Itoa(end-start))
 		w.WriteHeader(status)
 		for offset := start; offset < end; offset += 64 << 10 {

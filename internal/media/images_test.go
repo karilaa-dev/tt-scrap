@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"image/png"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/karilaa-dev/tt-scrap/internal/spool"
 )
@@ -61,7 +64,7 @@ func configOf(t *testing.T, prepared Prepared) image.Config {
 func TestPhotoPreservesNativeJPEGBytes(t *testing.T) {
 	path := writeImage(t, 600, 400, "jpg")
 	input, _ := os.ReadFile(path)
-	prepared, err := NewProcessor(2).Prepare(context.Background(), load(t, path), "photo.bin", false)
+	prepared, err := NewProcessor(2, 1<<30).Prepare(context.Background(), load(t, path), "photo.bin", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +77,7 @@ func TestPhotoPreservesNativeJPEGBytes(t *testing.T) {
 
 func TestThumbnailPNGBecomesBoundedJPEG(t *testing.T) {
 	path := writeImage(t, 800, 600, "png")
-	prepared, err := NewProcessor(1).Prepare(context.Background(), load(t, path), "cover.png", true)
+	prepared, err := NewProcessor(1, 1<<30).Prepare(context.Background(), load(t, path), "cover.png", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +94,7 @@ func TestThumbnailPNGBecomesBoundedJPEG(t *testing.T) {
 
 func TestPhotoPadsExtremeAspectRatio(t *testing.T) {
 	path := writeImage(t, 1000, 10, "png")
-	prepared, err := NewProcessor(1).Prepare(context.Background(), load(t, path), "wide.png", false)
+	prepared, err := NewProcessor(1, 1<<30).Prepare(context.Background(), load(t, path), "wide.png", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +106,7 @@ func TestPhotoPadsExtremeAspectRatio(t *testing.T) {
 }
 
 func TestHEICUsesNativeDecoder(t *testing.T) {
-	prepared, err := NewProcessor(1).Prepare(context.Background(), load(t, "testdata/sample.heic"), "sample.heic", false)
+	prepared, err := NewProcessor(1, 1<<30).Prepare(context.Background(), load(t, "testdata/sample.heic"), "sample.heic", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +118,7 @@ func TestHEICUsesNativeDecoder(t *testing.T) {
 }
 
 func TestCorruptImagesFailAndCancelledQueueStops(t *testing.T) {
-	processor := NewProcessor(1)
+	processor := NewProcessor(1, 1<<30)
 	path := filepath.Join(t.TempDir(), "bad.jpg")
 	if err := os.WriteFile(path, []byte{0xff, 0xd8, 0xff, 0, 0}, 0600); err != nil {
 		t.Fatal(err)
@@ -146,7 +149,7 @@ func TestJPEGOrientationAppliedToThumbnail(t *testing.T) {
 	if err := os.WriteFile(path, append(withExif, make([]byte, 200000)...), 0600); err != nil {
 		t.Fatal(err)
 	}
-	prepared, err := NewProcessor(1).Prepare(context.Background(), load(t, path), "rotated.jpg", true)
+	prepared, err := NewProcessor(1, 1<<30).Prepare(context.Background(), load(t, path), "rotated.jpg", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +163,7 @@ func TestJPEGOrientationAppliedToThumbnail(t *testing.T) {
 func TestAnimatedImagesBecomeSingleJPEGFrames(t *testing.T) {
 	for _, name := range []string{"animated.webp", "animated.png"} {
 		t.Run(name, func(t *testing.T) {
-			prepared, err := NewProcessor(1).Prepare(context.Background(), load(t, filepath.Join("testdata", name)), name, false)
+			prepared, err := NewProcessor(1, 1<<30).Prepare(context.Background(), load(t, filepath.Join("testdata", name)), name, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -204,7 +207,7 @@ func TestSmallJPEGThumbnailValidatesPixelStream(t *testing.T) {
 	if err = os.WriteFile(path, broken, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if result, err := NewProcessor(1).Prepare(context.Background(), load(t, path), "cover.jpg", true); err == nil {
+	if result, err := NewProcessor(1, 1<<30).Prepare(context.Background(), load(t, path), "cover.jpg", true); err == nil {
 		result.Cleanup()
 		t.Fatal("truncated JPEG accepted as a thumbnail")
 	}
@@ -212,7 +215,7 @@ func TestSmallJPEGThumbnailValidatesPixelStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := load(t, path)
-	result, err := NewProcessor(1).Prepare(context.Background(), source, "cover.jpg", true)
+	result, err := NewProcessor(1, 1<<30).Prepare(context.Background(), source, "cover.jpg", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +238,7 @@ func TestDiskBackedHEICKeepsHeader(t *testing.T) {
 		if _, err = source.Writer(0, -1).Write(data); err != nil || source.Complete() != nil || source.InMemory() {
 			t.Fatal("HEIC fixture not on disk", err)
 		}
-		prepared, err := NewProcessor(1).Prepare(context.Background(), source, "sample.heic", thumbnail)
+		prepared, err := NewProcessor(1, 1<<30).Prepare(context.Background(), source, "sample.heic", thumbnail)
 		source.Close()
 		if err != nil {
 			t.Fatal(thumbnail, err)
@@ -248,5 +251,98 @@ func TestDiskBackedHEICKeepsHeader(t *testing.T) {
 		if thumbnail && max(config.Width, config.Height) > 320 {
 			t.Fatalf("thumbnail %dx%d", config.Width, config.Height)
 		}
+	}
+}
+
+func TestDecodingWaitsForImageMemory(t *testing.T) {
+	read := func(path string) []byte {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	photo := read(writeImage(t, 600, 400, "jpg"))
+	scan := bytes.Index(photo, []byte{0xff, 0xda})
+	brokenPixels := photo[:scan+2+int(binary.BigEndian.Uint16(photo[scan+2:scan+4]))]
+	for _, input := range []struct {
+		name      string
+		data      []byte
+		thumbnail bool
+		corrupt   bool
+	}{
+		{"validated JPEG", photo, false, false},
+		{"JPEG with corrupt pixels", brokenPixels, false, true},
+		{"converted PNG", read(writeImage(t, 800, 600, "png")), true, false},
+		{"animated WebP", read("testdata/animated.webp"), false, false},
+		{"animated PNG", read("testdata/animated.png"), false, false},
+		{"HEIC", read("testdata/sample.heic"), false, false},
+	} {
+		t.Run(input.name, func(t *testing.T) {
+			p := NewProcessor(32, 64<<20)
+			// Other decodes hold the whole budget.
+			if !p.memory.TryAcquire(p.budget) {
+				t.Fatal("budget unavailable")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			_, err := p.Prepare(ctx, spool.Bytes(input.data), input.name, input.thumbnail)
+			cancel()
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("decoded without image memory: %v", err)
+			}
+			p.memory.Release(p.budget)
+			prepared, err := p.Prepare(context.Background(), spool.Bytes(input.data), input.name, input.thumbnail)
+			if input.corrupt != (err != nil) {
+				t.Fatalf("corrupt=%v: %v", input.corrupt, err)
+			}
+			prepared.Cleanup()
+			// Cancellation, failure, and success each return their reservation.
+			if !p.memory.TryAcquire(p.budget) {
+				t.Fatal("image memory leaked")
+			}
+		})
+	}
+}
+
+func TestImageMemoryAdmitsSmallImagesTogetherAndOversizedAlone(t *testing.T) {
+	small := load(t, writeImage(t, 16, 16, "png")).Bytes()
+	large := load(t, writeImage(t, 1000, 1000, "png")).Bytes()
+	p := NewProcessor(32, 2<<20)
+	if !p.memory.TryAcquire(1 << 20) {
+		t.Fatal("budget unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var group sync.WaitGroup
+	errs := make(chan error, 32)
+	for range 32 {
+		group.Go(func() {
+			prepared, err := p.Prepare(ctx, spool.Bytes(small), "small.png", true)
+			prepared.Cleanup()
+			errs <- err
+		})
+	}
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal("small image did not fit beside other work:", err)
+		}
+	}
+	waiting, stop := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	_, err := p.Prepare(waiting, spool.Bytes(large), "large.png", false)
+	stop()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("large image decoded beside other work: %v", err)
+	}
+	p.memory.Release(1 << 20)
+	// The large image needs more than the whole budget, so it runs alone.
+	prepared, err := p.Prepare(ctx, spool.Bytes(large), "large.png", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared.Cleanup()
+	if !p.memory.TryAcquire(p.budget) {
+		t.Fatal("image memory leaked")
 	}
 }

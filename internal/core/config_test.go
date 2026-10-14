@@ -98,15 +98,19 @@ func TestLogLevelValidationAndNormalization(t *testing.T) {
 func TestMediaMemoryAndParallelPartSettings(t *testing.T) {
 	base := map[string]string{"TT_SCRAP_API_KEY": "test-key-sixteen-characters", "DB_URL": "postgresql://localhost/test"}
 	cfg, err := ParseConfig(base)
-	if err != nil || cfg.MediaMemoryFileBytes != 250<<20 || cfg.MediaMemoryBudgetBytes != 1<<30 || cfg.DownloadParts != 4 {
+	if err != nil || cfg.MediaMemoryFileBytes != 250<<20 || cfg.MediaMemoryBudgetBytes != 1<<30 || cfg.DownloadParts != 4 || cfg.ImageConcurrency != 32 || cfg.ImageMemoryBytes != 1<<30 {
 		t.Fatalf("defaults: %+v %v", cfg, err)
 	}
-	base["MEDIA_MEMORY_MAX_MB"], base["MEDIA_MEMORY_BUDGET_MB"], base["DOWNLOAD_PARALLEL_PARTS"] = "0", "64", "1"
+	base["MEDIA_MEMORY_MAX_MB"], base["MEDIA_MEMORY_BUDGET_MB"], base["DOWNLOAD_PARALLEL_PARTS"], base["IMAGE_MEMORY_BUDGET_MB"] = "0", "64", "1", "256"
 	cfg, err = ParseConfig(base)
-	if err != nil || cfg.MediaMemoryFileBytes != 0 || cfg.MediaMemoryBudgetBytes != 64<<20 || cfg.DownloadParts != 1 {
+	if err != nil || cfg.MediaMemoryFileBytes != 0 || cfg.MediaMemoryBudgetBytes != 64<<20 || cfg.DownloadParts != 1 || cfg.ImageMemoryBytes != 256<<20 {
 		t.Fatalf("overrides: %+v %v", cfg, err)
 	}
-	for key, value := range map[string]string{"MEDIA_MEMORY_MAX_MB": "-1", "MEDIA_MEMORY_BUDGET_MB": "lots", "DOWNLOAD_PARALLEL_PARTS": "0"} {
+	base["IMAGE_MEMORY_BUDGET_MB"] = "0"
+	if cfg, err = ParseConfig(base); err != nil || cfg.ImageMemoryBytes != 1<<30 {
+		t.Fatalf("zero image memory budget did not use the default: %+v %v", cfg, err)
+	}
+	for key, value := range map[string]string{"MEDIA_MEMORY_MAX_MB": "-1", "MEDIA_MEMORY_BUDGET_MB": "lots", "DOWNLOAD_PARALLEL_PARTS": "0", "IMAGE_MEMORY_BUDGET_MB": "-1"} {
 		env := map[string]string{"TT_SCRAP_API_KEY": "test-key-sixteen-characters", "DB_URL": "postgresql://localhost/test", key: value}
 		if _, err := ParseConfig(env); err == nil || !strings.Contains(err.Error(), key) {
 			t.Errorf("%s=%s accepted: %v", key, value, err)

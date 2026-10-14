@@ -39,16 +39,17 @@ func putLittle24(data []byte, value int) {
 	data[2] = byte(value >> 16)
 }
 
-// A WebP animation embeds ordinary WebP chunks inside each ANMF frame.
-// Decode only the first frame and composite it onto the declared canvas.
-func firstWebPFrame(file *io.SectionReader, prefix []byte) (image.Image, error) {
+// webPCanvas reads the canvas size from an extended WebP header.
+func webPCanvas(prefix []byte) (width, height int, err error) {
 	if len(prefix) < 30 {
-		return nil, fmt.Errorf("truncated WebP canvas")
+		return 0, 0, fmt.Errorf("truncated WebP canvas")
 	}
-	w, h := little24(prefix[24:27])+1, little24(prefix[27:30])+1
-	if w <= 0 || h <= 0 || int64(w)*int64(h) > maxPixels {
-		return nil, fmt.Errorf("WebP dimensions exceed limits")
-	}
+	return little24(prefix[24:27]) + 1, little24(prefix[27:30]) + 1, nil
+}
+
+// A WebP animation embeds ordinary WebP chunks inside each ANMF frame.
+// Decode only the first frame and composite it onto the w×h canvas.
+func firstWebPFrame(file *io.SectionReader, w, h int) (image.Image, error) {
 	if _, err := file.Seek(12, 0); err != nil {
 		return nil, err
 	}
