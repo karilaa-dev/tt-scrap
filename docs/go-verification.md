@@ -1,5 +1,13 @@
 # Go project verification
 
+## App short-link resolution (2026-10-14)
+
+The running server logged one uncached resolution at 1,961 ms and another resolution at 0.193 ms. Those request-level logs cannot separate proxy connection time from TikTok response time; they are not a before/after benchmark.
+
+`TestAppShortLinkStopsBeforePostPage` reproduced the unnecessary final-page fetch for both video and photo links. App mode now stops after a validated redirect reveals the post ID: the two-hop fixture makes two requests instead of three and preserves the resolution fields. Web mode still fetches the final page. Twenty concurrent calls for one short link share one upstream request. Tests also cover relative redirects, IDs embedded only in query strings, invalid destinations, redirect limits, and error statuses.
+
+The short-link tests passed three race-test runs, and `make check` passed with isolated PostgreSQL 18. The verified saving is one final-page request; no live latency percentage is claimed.
+
 
 ## Startup preparation and API-based video selection (2026-10-14)
 

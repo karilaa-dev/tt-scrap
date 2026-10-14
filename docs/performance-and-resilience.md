@@ -6,6 +6,8 @@ An identity stays on one proxy and is exclusively leased while its request or me
 
 App extraction ranks video candidates using API-reported resolution, frame rate, and bitrate without CDN quality probes. Cached clients preserve cookie jars between operations. Cookie snapshots rebuild only after a change or expiry. The [earlier app comparison](go-app-optimization.md) measured the previous build with probes and does not establish latency for this change.
 
+App short-link resolution stops at the first validated redirect containing a video or photo ID in its path. It returns that destination without fetching the post's web page. HTTPS/domain validation, redirect limits, proxy routing, resolution caching, and concurrent request coalescing still apply. Web-mode resolution keeps following redirects to the final response.
+
 App downloads keep one identity lease across fallback URLs and adaptive tracks, then save one completion checkpoint. Adaptive video and audio download concurrently, cancel together on failure, and share one cumulative byte budget before muxing. Failed attempts release their budget after temporary-file cleanup. With `PROXY_DATA_ONLY=true`, CDN bytes use a direct transport while signed app endpoints keep their identity proxy. Web media retries rotate through the configured proxies after the initial sticky choice fails.
 
 Slideshow assets sharing an identity wait for its exclusive lease before starting their transfer timeout. Caller cancellation still applies while queued, and local cancellation or transfer deadlines do not mark the identity or proxy unhealthy.

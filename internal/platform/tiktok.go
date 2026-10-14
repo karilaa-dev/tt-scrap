@@ -66,6 +66,20 @@ func (t *TikTok) resolve(ctx context.Context, raw string, refresh bool) (core.Ti
 				return core.TikTokResolution{}, e
 			}
 			client := newWebClient(transport)
+			var resolved string
+			if t.cfg.TikTokMethod == "app" {
+				checkRedirect := client.CheckRedirect
+				client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+					if err := checkRedirect(req, via); err != nil {
+						return err
+					}
+					if videoID(req.URL.Path) != "" {
+						resolved = req.URL.String()
+						return http.ErrUseLastResponse
+					}
+					return nil
+				}
+			}
 			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
 			req.Header.Set("User-Agent", browserAgent)
 			res, e := client.Do(req)
@@ -74,6 +88,9 @@ func (t *TikTok) resolve(ctx context.Context, raw string, refresh bool) (core.Ti
 				continue
 			}
 			res.Body.Close()
+			if resolved != "" {
+				return core.TikTokResolution{Platform: "tiktok", SourceID: videoID(resolved), SourceURL: raw, ResolvedURL: resolved}, nil
+			}
 			if res.StatusCode == 400 || res.StatusCode == 404 || res.StatusCode == 410 {
 				return core.TikTokResolution{}, core.InvalidLink("Invalid or expired TikTok link")
 			}
@@ -81,7 +98,7 @@ func (t *TikTok) resolve(ctx context.Context, raw string, refresh bool) (core.Ti
 				last = statusError(res.StatusCode, "TikTok link resolution")
 				continue
 			}
-			resolved := res.Request.URL.String()
+			resolved = res.Request.URL.String()
 			id := videoID(resolved)
 			if id == "" {
 				return core.TikTokResolution{}, core.InvalidLink("TikTok link does not identify a post")
