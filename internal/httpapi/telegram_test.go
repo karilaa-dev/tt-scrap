@@ -102,6 +102,9 @@ func TestTelegramSingleVideoMultipartAndRawResponse(t *testing.T) {
 	if response.Code != 429 || response.Body.String() != `{"ok":false,"error_code":429,"parameters":{"retry_after":3}}` || !received.Load() {
 		t.Fatalf("%d %s", response.Code, response.Body.String())
 	}
+	if response.Header().Get("X-Telegram-Method") != "sendVideo" {
+		t.Fatal("missing actual Telegram method", response.Header())
+	}
 	if downloader.leaked() != 0 {
 		t.Fatal("download buffers leaked")
 	}

@@ -38,6 +38,7 @@ type telegramCall struct {
 	OK          bool
 }
 type deliveryResult struct {
+	Method      string
 	Status      int
 	ContentType string
 	Body        []byte
@@ -220,7 +221,7 @@ func telegramResponse(calls []telegramCall) (deliveryResult, error) {
 		return deliveryResult{}, core.NewError("internal_error", "Telegram delivery produced no result", 500)
 	}
 	if len(calls) == 1 {
-		return deliveryResult{Status: calls[0].Status, ContentType: calls[0].ContentType, Body: calls[0].Body}, nil
+		return deliveryResult{Method: calls[0].Method, Status: calls[0].Status, ContentType: calls[0].ContentType, Body: calls[0].Body}, nil
 	}
 	allOK, someOK := true, false
 	deliveries := make([]fields, 0, len(calls))

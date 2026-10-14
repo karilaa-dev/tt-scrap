@@ -107,10 +107,21 @@ func decodedBytes(kind string, config image.Config, progressive, interlaced bool
 	return 4
 }
 
+// mode selects how an image is converted for Telegram.
+type mode int
+
+const (
+	photoMode mode = iota
+	thumbnailMode
+	// documentMode always converts to JPEG at full size, without the photo
+	// size, aspect-ratio, and byte limits.
+	documentMode
+)
+
 // convertedBytes covers the RGBA canvases conversion keeps: orientation,
 // scaled, padded, and resized images, and the encoded JPEG.
-func convertedBytes(width, height int, thumbnail bool, orientation int) int64 {
-	_, _, paddedW, paddedH := outputSize(width, height, thumbnail)
+func convertedBytes(width, height int, m mode, orientation int) int64 {
+	_, _, paddedW, paddedH := outputSize(width, height, m)
 	canvases := 16 * int64(paddedW) * int64(paddedH)
 	if orientation >= 2 && orientation <= 8 {
 		canvases += 4 * int64(width) * int64(height)
@@ -120,21 +131,21 @@ func convertedBytes(width, height int, thumbnail bool, orientation int) int64 {
 
 // outputSize returns the scaled size of a converted image and its size after
 // padding to Telegram's maximum aspect ratio.
-func outputSize(width, height int, thumbnail bool) (w, h, paddedW, paddedH int) {
+func outputSize(width, height int, m mode) (w, h, paddedW, paddedH int) {
 	w, h = width, height
-	if thumbnail {
+	if m == thumbnailMode {
 		scale := min(1.0, 320.0/float64(max(w, h)))
 		w = max(1, int(float64(w)*scale))
 		h = max(1, int(float64(h)*scale))
-	} else if w+h > 10000 {
+	} else if m == photoMode && w+h > 10000 {
 		scale := 10000.0 / float64(w+h)
 		w = max(1, int(float64(w)*scale))
 		h = max(1, int(float64(h)*scale))
 	}
 	paddedW, paddedH = w, h
-	if !thumbnail && w > h*20 {
+	if m == photoMode && w > h*20 {
 		paddedH = (w + 19) / 20
-	} else if !thumbnail && h > w*20 {
+	} else if m == photoMode && h > w*20 {
 		paddedW = (h + 19) / 20
 	}
 	return w, h, paddedW, paddedH
@@ -178,7 +189,21 @@ func DetectImageType(prefix []byte) string {
 	return ""
 }
 
+// Prepare forwards an image Telegram accepts as a photo or thumbnail, or
+// converts it to a JPEG within Telegram's limits.
 func (p *Processor) Prepare(ctx context.Context, source *spool.Buffer, filename string, thumbnail bool) (Prepared, error) {
+	if thumbnail {
+		return p.prepare(ctx, source, filename, thumbnailMode)
+	}
+	return p.prepare(ctx, source, filename, photoMode)
+}
+
+// PrepareDocument converts an image to a full-size JPEG document.
+func (p *Processor) PrepareDocument(ctx context.Context, source *spool.Buffer, filename string) (Prepared, error) {
+	return p.prepare(ctx, source, filename, documentMode)
+}
+
+func (p *Processor) prepare(ctx context.Context, source *spool.Buffer, filename string, m mode) (Prepared, error) {
 	select {
 	case p.slots <- struct{}{}:
 		defer func() { <-p.slots }()
@@ -218,7 +243,7 @@ func (p *Processor) Prepare(ctx context.Context, source *spool.Buffer, filename 
 			return Prepared{}, err
 		}
 		// The first frame and the canvas it is composited onto.
-		if release, err = p.reserve(ctx, width, height, func(pixels int64) int64 { return 12*pixels + convertedBytes(width, height, thumbnail, 1) }); err != nil {
+		if release, err = p.reserve(ctx, width, height, func(pixels int64) int64 { return 12*pixels + convertedBytes(width, height, m, 1) }); err != nil {
 			return Prepared{}, err
 		}
 		if img, err = firstWebPFrame(f, width, height); err != nil {
@@ -233,7 +258,7 @@ func (p *Processor) Prepare(ctx context.Context, source *spool.Buffer, filename 
 		// libheif's decoded planes of up to 16-bit samples, its RGBA output, the
 		// Go copy of that output, the C copy of the encoded file, and libheif's
 		// copy of the coded image.
-		cost := func(w, h int) int64 { return 16*int64(w)*int64(h) + 2*size + convertedBytes(w, h, thumbnail, 1) }
+		cost := func(w, h int) int64 { return 16*int64(w)*int64(h) + 2*size + convertedBytes(w, h, m, 1) }
 		reserved := cost(width, height)
 		if release, err = p.reserve(ctx, width, height, func(int64) int64 { return reserved }); err != nil {
 			return Prepared{}, err
@@ -256,8 +281,8 @@ func (p *Processor) Prepare(ctx context.Context, source *spool.Buffer, filename 
 			return Prepared{}, configErr
 		}
 		width, height = config.Width, config.Height
-		thumbnailFits := thumbnail && kind == "image/jpeg" && width <= 320 && height <= 320 && size < 200000
-		photoFits := !thumbnail && native && size <= photoMaxBytes && width+height <= 10000 && max(float64(width)/float64(height), float64(height)/float64(width)) <= 20
+		thumbnailFits := m == thumbnailMode && kind == "image/jpeg" && width <= 320 && height <= 320 && size < 200000
+		photoFits := m == photoMode && native && size <= photoMaxBytes && width+height <= 10000 && max(float64(width)/float64(height), float64(height)/float64(width)) <= 20
 		progressive := kind == "image/jpeg" && progressiveJPEG(f)
 		interlaced := kind == "image/png" && n > 28 && prefix[28] == 1
 		orientation = readOrientation(f, kind)
@@ -265,7 +290,7 @@ func (p *Processor) Prepare(ctx context.Context, source *spool.Buffer, filename 
 			if thumbnailFits || photoFits {
 				return decodedBytes(kind, config, progressive, interlaced) * pixels
 			}
-			return decodedBytes(kind, config, progressive, interlaced)*pixels + convertedBytes(width, height, thumbnail, orientation)
+			return decodedBytes(kind, config, progressive, interlaced)*pixels + convertedBytes(width, height, m, orientation)
 		}); err != nil {
 			return Prepared{}, err
 		}
@@ -286,7 +311,7 @@ func (p *Processor) Prepare(ctx context.Context, source *spool.Buffer, filename 
 	if err = ctx.Err(); err != nil {
 		return Prepared{}, err
 	}
-	width, height, paddedW, paddedH := outputSize(img.Bounds().Dx(), img.Bounds().Dy(), thumbnail)
+	width, height, paddedW, paddedH := outputSize(img.Bounds().Dx(), img.Bounds().Dy(), m)
 	dst := image.NewRGBA(image.Rect(0, 0, width, height))
 	stddraw.Draw(dst, dst.Bounds(), image.NewUniform(color.White), image.Point{}, stddraw.Src)
 	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), img, img.Bounds(), draw.Over, nil)
@@ -299,9 +324,13 @@ func (p *Processor) Prepare(ctx context.Context, source *spool.Buffer, filename 
 		width, height = paddedW, paddedH
 	}
 	limit, quality := int64(photoMaxBytes), 85
-	if thumbnail {
+	switch m {
+	case thumbnailMode:
 		limit = 199999
 		quality = 80
+	case documentMode:
+		// Telegram's document size limit applies to the upload.
+		limit = math.MaxInt64
 	}
 	var output bytes.Buffer
 	for attempt := 0; attempt < 4; attempt++ {

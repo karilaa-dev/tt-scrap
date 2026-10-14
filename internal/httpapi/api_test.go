@@ -55,9 +55,16 @@ func (f *fakeInstagram) GetExtraction(context.Context, string) (core.InstagramEx
 	return f.extraction, nil
 }
 
+// fakeFile overrides the downloader's data and mime for one upstream URL.
+type fakeFile struct {
+	data []byte
+	mime string
+}
+
 type fakeDownloader struct {
 	data    []byte
 	mime    string
+	files   map[string]fakeFile
 	fail    string
 	mu      sync.Mutex
 	buffers []*spool.Buffer
@@ -85,12 +92,16 @@ func (d *fakeDownloader) Download(ctx context.Context, asset core.AssetContext, 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	data := spool.Bytes(bytes.Clone(d.data))
+	file := fakeFile{d.data, d.mime}
+	if override, ok := d.files[asset.UpstreamURL]; ok {
+		file = override
+	}
+	data := spool.Bytes(bytes.Clone(file.data))
 	d.mu.Lock()
 	d.buffers = append(d.buffers, data)
 	d.mu.Unlock()
-	hash := sha256.Sum256(d.data)
-	return &core.Downloaded{Data: data, Filename: asset.Filename, ContentType: d.mime, Size: int64(len(d.data)), SHA256: hex.EncodeToString(hash[:])}, nil
+	hash := sha256.Sum256(file.data)
+	return &core.Downloaded{Data: data, Filename: asset.Filename, ContentType: file.mime, Size: int64(len(file.data)), SHA256: hex.EncodeToString(hash[:])}, nil
 }
 
 // leaked counts downloads whose buffers were never released.

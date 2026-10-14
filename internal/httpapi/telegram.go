@@ -341,6 +341,10 @@ func (s *telegramService) prepare(ctx context.Context, item deliveryItem, docume
 	var started func(*core.Downloaded)
 	if stream != nil {
 		started = func(asset *core.Downloaded) {
+			// Converted media uploads only after the download completes.
+			if jpegDocument(item, document, asset) {
+				return
+			}
 			announcements.Go(func() {
 				image := thumbnail.wait()
 				if ctx.Err() == nil {
@@ -368,8 +372,24 @@ func (s *telegramService) prepare(ctx context.Context, item deliveryItem, docume
 			return result, core.NewError("image_conversion_failed", "Unsupported or corrupt Telegram photo", 502)
 		}
 		result.Media = converted
+	} else if jpegDocument(item, document, asset) {
+		converted, err := s.images.PrepareDocument(ctx, asset.Data, item.Descriptor.Filename)
+		if err != nil {
+			if ctx.Err() != nil {
+				return result, ctx.Err()
+			}
+			return result, core.NewError("image_conversion_failed", "Unsupported or corrupt Telegram document image", 502)
+		}
+		result.Media = converted
 	}
 	return result, nil
+}
+
+// jpegDocument reports whether an image document is sent as JPEG. Telegram
+// rejects WebP documents in media groups with "Wrong file identifier/HTTP URL
+// specified", so WebP is converted in every document delivery.
+func jpegDocument(item deliveryItem, document bool, asset *core.Downloaded) bool {
+	return document && item.Kind == "image" && asset.ContentType == "image/webp"
 }
 
 func preparedMedia(item deliveryItem, asset *core.Downloaded) media.Prepared {
@@ -435,7 +455,8 @@ func (s *telegramService) send(ctx context.Context, items []deliveryItem, parame
 		}
 		groups[asset.IdentityID] = append(groups[asset.IdentityID], i)
 	}
-	// Photos need complete bytes for conversion; other single media streams.
+	// Photos need complete bytes for conversion; other single media streams
+	// unless preparation converts it.
 	if len(items) == 1 && (document || items[0].Kind != "image") {
 		return s.sendStreamed(ctx, items[0], parameters, document, event)
 	}
@@ -658,7 +679,8 @@ func (s *telegramService) sendStreamed(ctx context.Context, item deliveryItem, p
 		}
 	}
 	if current == nil {
-		// The transfer never announced a length; upload the complete media.
+		// The transfer never announced a length, or its media was converted;
+		// upload the prepared media.
 		event.FailedStage = "upload"
 		return s.sendSingle(ctx, final, parameters, document, event)
 	}

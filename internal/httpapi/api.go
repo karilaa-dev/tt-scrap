@@ -301,7 +301,11 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) (response, error
 			return response{}, err
 		}
 		output, err := h.telegram.deliver(r.Context(), request, instagram)
-		return response{status: output.Status, headers: http.Header{"Content-Type": []string{output.ContentType}}, data: output.Body, delivery: output.Event}, err
+		headers := http.Header{"Content-Type": []string{output.ContentType}}
+		if output.Method != "" {
+			headers.Set("X-Telegram-Method", output.Method)
+		}
+		return response{status: output.Status, headers: headers, data: output.Body, delivery: output.Event}, err
 	}
 	return jsonResponse(404, fields{"detail": "Not Found"})
 }

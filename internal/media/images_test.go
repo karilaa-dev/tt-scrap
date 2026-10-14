@@ -487,3 +487,56 @@ func TestConcurrentHEIFAdmissionCompletes(t *testing.T) {
 		}
 	}
 }
+
+func TestPhotoPreservesNativeStaticWebP(t *testing.T) {
+	input, _ := os.ReadFile("testdata/static.webp")
+	prepared, err := NewProcessor(1, 1<<30).Prepare(context.Background(), spool.Bytes(input), "photo.webp", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prepared.Cleanup()
+	if prepared.Owned || prepared.ContentType != "image/webp" || prepared.Filename != "photo.webp" || !bytes.Equal(prepared.Data.Bytes(), input) {
+		t.Fatalf("native photo changed: %#v", prepared)
+	}
+}
+
+// Documents keep their full size: no photo scaling or aspect-ratio padding.
+func TestDocumentBecomesFullSizeJPEG(t *testing.T) {
+	for _, test := range []struct {
+		path          string
+		width, height int
+	}{
+		{"testdata/static.webp", 400, 301},
+		{"testdata/animated.webp", 16, 12},
+		{writeImage(t, 1000, 10, "png"), 1000, 10},
+		{writeImage(t, 9000, 1100, "png"), 9000, 1100},
+	} {
+		t.Run(filepath.Base(test.path), func(t *testing.T) {
+			prepared, err := NewProcessor(1, 1<<30).PrepareDocument(context.Background(), load(t, test.path), "document.webp")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer prepared.Cleanup()
+			if !prepared.Owned || prepared.ContentType != "image/jpeg" || prepared.Filename != "document.jpg" {
+				t.Fatalf("%#v", prepared)
+			}
+			assertOwnsOnlyJPEG(t, prepared, test.width, test.height)
+		})
+	}
+}
+
+func TestDocumentFlattensAlphaOnWhite(t *testing.T) {
+	prepared, err := NewProcessor(1, 1<<30).PrepareDocument(context.Background(), load(t, "testdata/static.webp"), "rose.webp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prepared.Cleanup()
+	img, err := jpeg.Decode(bytes.NewReader(prepared.Data.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fixture's corner is fully transparent.
+	if r, g, b, _ := img.At(0, 0).RGBA(); r < 60000 || g < 60000 || b < 60000 {
+		t.Fatal("transparent pixels not flattened on white", r, g, b)
+	}
+}
