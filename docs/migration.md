@@ -18,7 +18,7 @@ App startup prepares all ten identities per proxy before opening the HTTP listen
 
 Stop the previous app service before starting the Go service against the same schema. One app process owns a schema through a PostgreSQL advisory lock. Overlapping app replicas cannot share a schema, including during a rolling deployment. Use separate schemas and proxy assignments for independent app instances.
 
-Start the new service and check `/health/live`, `/health/ready`, and an authenticated request. Readiness requires the Instagram API key as well as a healthy app pool when app mode is enabled. Startup loads saved identities without registering new ones. The first request for an unused slot registers that identity; overdue signing material refreshes on use.
+Start the new service and check `/health/live`, `/health/ready`, and an authenticated request. Readiness requires the Instagram API key as well as a healthy app pool when app mode is enabled. Startup reuses saved identities, registers missing slots, and refreshes expired signing material until all ten identities per proxy are ready; the HTTP listener opens only afterward. During normal operation, overdue signing material refreshes on use.
 
 RAM caches and asset tokens restart with the process. Request fresh metadata after deployment instead of reusing old asset tokens. Allow 40 seconds for container shutdown so the service can finish its 30-second request drain.
 

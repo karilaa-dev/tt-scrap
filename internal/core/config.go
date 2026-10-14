@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -164,6 +165,11 @@ func ParseConfig(env map[string]string) (Config, error) {
 	}
 	if c.TikTokMethod == "app" && c.DBURL == "" {
 		return c, ConfigError("DB_URL")
+	}
+	c.TelegramAPIBaseURL = strings.TrimRight(strings.TrimSpace(c.TelegramAPIBaseURL), "/")
+	telegramURL, err := url.Parse(c.TelegramAPIBaseURL)
+	if err != nil || (telegramURL.Scheme != "https" && telegramURL.Scheme != "http") || telegramURL.Hostname() == "" || telegramURL.RawQuery != "" || telegramURL.Fragment != "" {
+		return c, ConfigError("TELEGRAM_API_BASE_URL")
 	}
 	return c, nil
 }

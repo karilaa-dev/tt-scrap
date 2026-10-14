@@ -57,21 +57,27 @@ func healthcheck() error {
 	return nil
 }
 
-func run(logger *slog.Logger) error {
-	config, err := core.LoadConfig()
-	if err != nil {
-		return err
-	}
+func logLevel(name string) slog.Level {
 	level := slog.LevelInfo
-	switch strings.ToUpper(config.LogLevel) {
+	switch strings.ToUpper(strings.TrimSpace(name)) {
 	case "DEBUG":
 		level = slog.LevelDebug
 	case "WARN", "WARNING":
 		level = slog.LevelWarn
 	case "ERROR":
 		level = slog.LevelError
+	case "CRITICAL":
+		level = slog.LevelError + 4
 	}
-	logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	return level
+}
+
+func run(logger *slog.Logger) error {
+	config, err := core.LoadConfig()
+	if err != nil {
+		return err
+	}
+	logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel(config.LogLevel)}))
 	if config.TempDir != "" {
 		if err := os.MkdirAll(config.TempDir, 0700); err != nil {
 			return errors.New("cannot create TEMP_DIR")

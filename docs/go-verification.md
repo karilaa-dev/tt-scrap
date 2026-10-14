@@ -6,7 +6,22 @@ The running server logged one uncached resolution at 1,961 ms and another resolu
 
 `TestAppShortLinkStopsBeforePostPage` reproduced the unnecessary final-page fetch for both video and photo links. App mode now stops after a validated redirect reveals the post ID: the two-hop fixture makes two requests instead of three and preserves the resolution fields. Web mode still fetches the final page. Twenty concurrent calls for one short link share one upstream request. Tests also cover relative redirects, IDs embedded only in query strings, invalid destinations, redirect limits, and error statuses.
 
-The short-link tests passed three race-test runs, and `make check` passed with isolated PostgreSQL 18. The verified saving is one final-page request; no live latency percentage is claimed.
+The short-link tests passed three race-test runs, and `make check` passed with isolated PostgreSQL 18. The production Docker build passed. The updated development server reused all 100 prepared identities with zero startup writes.
+
+A live comparison used the two supplied public short links, five runs per version per link, alternating old/new order. Each pair used the same proxy address; five configured proxies were used across the pairs. Every run used a fresh resolver and transport, avoiding resolution-cache and connection-reuse differences. The retained web-mode redirect behavior is identical to the previous app resolver and served as the baseline; no web extraction was performed. The timer covered `ResolveURL`, including redirects, but excluded service construction, app metadata, media transfer, and Telegram upload. Host load was 0.37 across eight cores.
+
+| Short code | Old median (range), ms | New median (range), ms |
+| --- | --- | --- |
+| `ZP83rLASJ` | 1,475 (1,340–1,572) | 718 (716–871) |
+| `ZTyudHPLu` | 1,432 (1,300–2,483) | 746 (703–807) |
+
+All 20 calls succeeded and returned the same source ID for each link. HTTP traces recorded two upstream requests before and one afterward, with one new connection in both versions. Removing the final-page request explains the approximately halved resolution latency; this is not a claim about total bot delivery time. [Raw samples](benchmarks/short-link-resolution-20261014.jsonl) include request counts, connections, source IDs, and durations.
+
+Through the updated authenticated HTTP API, the first resolutions of these short links took 733 ms and 727 ms; their immediate cached repeats took under 1 ms. The supplied full video URL also returned its embedded ID without contacting upstream. These six HTTP smoke calls all returned 200 and are separate from the comparison above.
+
+## Configuration and documentation review (2026-10-14)
+
+Focused tests first reproduced acceptance of invalid Telegram base URLs and lower-level messages leaking through `LOG_LEVEL=CRITICAL`. Configuration now normalizes and validates the Telegram HTTP/HTTPS base URL before startup, and CRITICAL maps above ERROR in the Go logger. The tests pass, as does the complete `make check` with isolated PostgreSQL 18. A built-binary smoke confirmed invalid URL rejection and healthy startup/readiness/shutdown with no lower-level output at CRITICAL. Migration and app documentation now consistently describe eager startup preparation and metadata-only video quality selection.
 
 
 ## Startup preparation and API-based video selection (2026-10-14)
