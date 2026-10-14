@@ -43,7 +43,7 @@ func BenchmarkAppExtraction(b *testing.B) {
 		for _, concurrency := range []int{1, 4, 16} {
 			b.Run(fmt.Sprintf("delay%dms/c%d", delay.Milliseconds(), concurrency), func(b *testing.B) {
 				cfg, _ := testDatabase(b)
-				cfg.TikTokMethod = "app"
+
 				cfg.MaxQueuedRequests = 128
 				cfg.CacheMaxEntries = 64
 				p := openTestPool(b, cfg, "")

@@ -271,7 +271,7 @@ func TestDownloadFallbackRetainsPinnedIdentity(t *testing.T) {
 			return fixtureResponse(200, []byte{255, 216, 255, 0, 1, 2}), nil
 		}))
 	}
-	d := platform.NewDownloader(cfg, p, nil)
+	d := platform.NewDownloader(cfg, p)
 	defer d.Close()
 	before := p.Stats().Writes
 	asset := core.AssetContext{Platform: "tiktok", Kind: "image", Filename: "x.jpg", IdentityID: id, UpstreamURL: "https://cdn.example/bad", AlternateURLs: []string{"https://cdn.example/good"}}
@@ -326,7 +326,7 @@ func TestAppDataOnlyUsesDirectCDNWithPinnedPlayRequest(t *testing.T) {
 			return fixture.do(r)
 		}))
 	}
-	d := platform.NewDownloader(cfg, p, nil)
+	d := platform.NewDownloader(cfg, p)
 	defer d.Close()
 	file, err := d.Download(context.Background(), core.AssetContext{Platform: "tiktok", Kind: "image", Filename: "x.jpg", IdentityID: id, UpstreamURL: "https://api19-va.tiktokv.com/aweme/v1/play/"}, 0)
 	if err != nil {
@@ -358,7 +358,7 @@ func TestPinnedDownloadWaitDoesNotConsumeTransferTimeout(t *testing.T) {
 	active := mustAcquire(t, p, "")
 	id := active.entry.id
 	defer active.finish(nil)
-	d := platform.NewDownloader(cfg, p, nil)
+	d := platform.NewDownloader(cfg, p)
 	defer d.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -411,7 +411,7 @@ func TestPinnedDownloadTransferTimeoutRemainsEnforced(t *testing.T) {
 			return nil, r.Context().Err()
 		}))
 	}
-	d := platform.NewDownloader(cfg, p, nil)
+	d := platform.NewDownloader(cfg, p)
 	defer d.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

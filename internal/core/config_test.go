@@ -20,7 +20,7 @@ func TestTikTokSessionIDConfiguration(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, err := ParseConfig(map[string]string{
 				"TT_SCRAP_API_KEY": "test-key-sixteen-characters",
-				"TIKTOK_METHOD":    "web", "TIKTOK_SESSION_ID": tc.value,
+				"DB_URL":           "postgresql://localhost/test", "TIKTOK_SESSION_ID": tc.value,
 			})
 			if tc.invalid {
 				if err == nil || err.Error() != "invalid configuration: TIKTOK_SESSION_ID" {
@@ -39,7 +39,7 @@ func TestTikTokSessionIDConfiguration(t *testing.T) {
 func TestTikTokSessionIDEnvironmentOverridesDotEnv(t *testing.T) {
 	t.Chdir(t.TempDir())
 	t.Setenv("TT_SCRAP_API_KEY", "test-key-sixteen-characters")
-	t.Setenv("TIKTOK_METHOD", "web")
+	t.Setenv("DB_URL", "postgresql://localhost/test")
 	t.Setenv("TIKTOK_SESSION_ID", "environment-session")
 	if err := os.WriteFile(".env", []byte("TIKTOK_SESSION_ID=file-session\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -65,7 +65,7 @@ func TestTelegramBaseURLValidationAndNormalization(t *testing.T) {
 		{"https://", ""}, {"https://api.telegram.org:bad", ""},
 		{"https://api.telegram.org?option=1", ""}, {"https://api.telegram.org/#part", ""},
 	} {
-		env := map[string]string{"TT_SCRAP_API_KEY": "test-key-sixteen-characters", "TIKTOK_METHOD": "web", "TELEGRAM_API_BASE_URL": test.input}
+		env := map[string]string{"TT_SCRAP_API_KEY": "test-key-sixteen-characters", "DB_URL": "postgresql://localhost/test", "TELEGRAM_API_BASE_URL": test.input}
 		cfg, err := ParseConfig(env)
 		if test.want == "" {
 			if err == nil {
@@ -83,7 +83,7 @@ func TestLogLevelValidationAndNormalization(t *testing.T) {
 		{" warning ", "WARNING"}, {"error", "ERROR"}, {" critical ", "CRITICAL"},
 		{"", ""}, {"  ", ""}, {"ERORR", ""}, {"TRACE", ""}, {"FATAL", ""},
 	} {
-		env := map[string]string{"TT_SCRAP_API_KEY": "test-key-sixteen-characters", "TIKTOK_METHOD": "web", "LOG_LEVEL": test.input}
+		env := map[string]string{"TT_SCRAP_API_KEY": "test-key-sixteen-characters", "DB_URL": "postgresql://localhost/test", "LOG_LEVEL": test.input}
 		cfg, err := ParseConfig(env)
 		if test.want == "" {
 			if err == nil || !strings.Contains(err.Error(), "LOG_LEVEL") {

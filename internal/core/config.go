@@ -14,7 +14,7 @@ import (
 )
 
 type Config struct {
-	APIKey, Host, AppVersion, DBURL, DBSchema, TikTokMethod                           string
+	APIKey, Host, AppVersion, DBURL, DBSchema                                         string
 	Port                                                                              int
 	ProxyFile                                                                         string
 	ProxyIncludeHost, ProxyDataOnly                                                   bool
@@ -41,7 +41,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		Host: "0.0.0.0", Port: 8000, AppVersion: "1.3.5", DBSchema: "public", TikTokMethod: "app",
+		Host: "0.0.0.0", Port: 8000, AppVersion: "1.3.5", DBSchema: "public",
 		CacheTTL: 600 * time.Second, MetadataTTL: 60 * time.Second, ResolutionTTL: 600 * time.Second, CacheMaxEntries: 10000,
 		ExtractionConcurrency: 32, DownloadConcurrency: 64, HTTPMaxConnections: 128, MaxQueuedRequests: 1024,
 		MaxVideoDuration: 0, UpstreamTimeout: 180 * time.Second, ResolveTimeout: 12 * time.Second, DownloadTimeout: 60 * time.Second,
@@ -111,7 +111,7 @@ func ParseConfig(env map[string]string) (Config, error) {
 			}
 		}
 	}
-	for key, dst := range map[string]*string{"TT_SCRAP_API_KEY": &c.APIKey, "HOST": &c.Host, "APP_VERSION": &c.AppVersion, "DB_URL": &c.DBURL, "DB_SCHEMA": &c.DBSchema, "TIKTOK_METHOD": &c.TikTokMethod, "PROXY_FILE": &c.ProxyFile, "TIKTOK_SESSION_ID": &c.TikTokSessionID, "TEMP_DIR": &c.TempDir, "RAPIDAPI_KEY": &c.RapidAPIKey, "RAPIDAPI_HOST": &c.RapidAPIHost, "RAPIDAPI_BASE_URL": &c.RapidAPIBaseURL, "TELEGRAM_BOT_TOKEN": &c.TelegramBotToken, "TELEGRAM_API_BASE_URL": &c.TelegramAPIBaseURL, "LOG_LEVEL": &c.LogLevel} {
+	for key, dst := range map[string]*string{"TT_SCRAP_API_KEY": &c.APIKey, "HOST": &c.Host, "APP_VERSION": &c.AppVersion, "DB_URL": &c.DBURL, "DB_SCHEMA": &c.DBSchema, "PROXY_FILE": &c.ProxyFile, "TIKTOK_SESSION_ID": &c.TikTokSessionID, "TEMP_DIR": &c.TempDir, "RAPIDAPI_KEY": &c.RapidAPIKey, "RAPIDAPI_HOST": &c.RapidAPIHost, "RAPIDAPI_BASE_URL": &c.RapidAPIBaseURL, "TELEGRAM_BOT_TOKEN": &c.TelegramBotToken, "TELEGRAM_API_BASE_URL": &c.TelegramAPIBaseURL, "LOG_LEVEL": &c.LogLevel} {
 		stringValue(key, dst)
 	}
 	number("PORT", &c.Port, 1, 65535)
@@ -164,13 +164,10 @@ func ParseConfig(env map[string]string) (Config, error) {
 	if len(c.APIKey) < 16 {
 		return c, ConfigError("TT_SCRAP_API_KEY")
 	}
-	if c.TikTokMethod != "app" && c.TikTokMethod != "web" {
-		return c, ConfigError("TIKTOK_METHOD")
-	}
 	if (&http.Cookie{Name: "sessionid", Value: c.TikTokSessionID}).Valid() != nil {
 		return c, ConfigError("TIKTOK_SESSION_ID")
 	}
-	if c.TikTokMethod == "app" && c.DBURL == "" {
+	if strings.TrimSpace(c.DBURL) == "" {
 		return c, ConfigError("DB_URL")
 	}
 	c.LogLevel = strings.ToUpper(strings.TrimSpace(c.LogLevel))

@@ -141,7 +141,7 @@ func BenchmarkAppDelivery(b *testing.B) {
 				}))
 				defer telegram.Close()
 				cfg.TelegramAPIBaseURL = telegram.URL
-				d := platform.NewDownloader(cfg, p, nil)
+				d := platform.NewDownloader(cfg, p)
 				defer d.Close()
 				h := httpapi.NewHandler(httpapi.Dependencies{Config: cfg, Assets: assets, TikTok: posts, Downloader: d})
 				var next, failures atomic.Int64

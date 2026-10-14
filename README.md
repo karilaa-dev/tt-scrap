@@ -1,15 +1,15 @@
 # tt-scrap
 
-Native Go service for TikTok app and web extraction, Instagram extraction, authenticated media downloads, and Telegram delivery. Existing extraction and delivery contracts are preserved; the [OpenAPI document](openapi.json) also includes identity preparation.
+Native Go service for TikTok app extraction, Instagram extraction, authenticated media downloads, and Telegram delivery. Existing extraction and delivery contracts are preserved; the [OpenAPI document](openapi.json) also includes identity preparation.
 
-Production runs one Go binary. TikTok registration and signing run in Go; image conversion uses Go decoders and native libheif. FFmpeg handles video inspection and separate audio/video remuxing.
+Production runs one Go binary. TikTok registration and signing run in Go; image conversion uses Go decoders and native libheif. TikTok app videos include their audio; MP4 validation runs in Go.
 
 ## Run
 
-Install Go **1.27.2**, a C compiler, `pkg-config`, `libheif-dev`, and FFmpeg. Debian/Ubuntu installations that split HEIF codecs into plugins also need `libheif-plugin-libde265` for HEIC and `libheif-plugin-dav1d` for AVIF. On Debian 13 or recent Ubuntu:
+Install Go **1.27.2**, a C compiler, `pkg-config`, and `libheif-dev`. Debian/Ubuntu installations that split HEIF codecs into plugins also need `libheif-plugin-libde265` for HEIC and `libheif-plugin-dav1d` for AVIF. On Debian 13 or recent Ubuntu:
 
 ```sh
-sudo apt-get install build-essential pkg-config libheif-dev libheif-plugin-libde265 libheif-plugin-dav1d ffmpeg
+sudo apt-get install build-essential pkg-config libheif-dev libheif-plugin-libde265 libheif-plugin-dav1d
 cp .env.example .env
 # Edit .env before starting.
 go mod download
@@ -17,9 +17,9 @@ make build
 ./bin/tt-scrap
 ```
 
-Configure `TT_SCRAP_API_KEY` with at least 16 characters. Set `TIKTOK_METHOD=app` for the Android app method or `TIKTOK_METHOD=web` for the web method. App mode requires `DB_URL`; web mode does not. Set `RAPIDAPI_KEY` for Instagram and readiness. Existing environment variables take precedence over `.env`.
+Configure `TT_SCRAP_API_KEY` with at least 16 characters. TikTok uses the Android app method and requires `DB_URL` for its identity pool. Set `RAPIDAPI_KEY` for Instagram and readiness. Existing environment variables take precedence over `.env`.
 
-App mode reads saved proxies from PostgreSQL. `PROXY_FILE` optionally bootstraps addresses, one HTTP, HTTPS, or SOCKS5 address per line. `PROXY_INCLUDE_HOST=true` explicitly adds a direct-connection slot. `PROXY_DATA_ONLY=true` sends CDN transfers directly while app registration, signing, and play API requests keep the assigned proxy. Web media retries try another configured proxy after a failure. Both backends accept an optional account session through `TIKTOK_SESSION_ID`.
+TikTok reads saved proxies from PostgreSQL. `PROXY_FILE` optionally bootstraps addresses, one HTTP, HTTPS, or SOCKS5 address per line. `PROXY_INCLUDE_HOST=true` explicitly adds a direct-connection slot. `PROXY_DATA_ONLY=true` sends CDN transfers directly while app registration, signing, and play API requests keep the assigned proxy. TikTok accepts an optional account session through `TIKTOK_SESSION_ID`.
 
 ## API
 
@@ -40,15 +40,15 @@ Downloads preserve `Content-Length`, MIME type, SHA-256, ETag, and attachment he
 
 ## Identity lifecycle
 
-Video information retained by tt-bot stays in its database; tt-scrap caches API responses and temporary asset references in RAM. tt-scrap manages `scrap_proxies` and `scrap_identities` in PostgreSQL. App mode loads them once into RAM. Selection, balancing, cooldowns, and identity information reads then happen in memory; operation results are written to PostgreSQL after the operation finishes.
+Video information retained by tt-bot stays in its database; tt-scrap caches API responses and temporary asset references in RAM. tt-scrap manages `scrap_proxies` and `scrap_identities` in PostgreSQL. The service loads them once into RAM. Selection, balancing, cooldowns, and identity information reads then happen in memory; operation results are written to PostgreSQL after the operation finishes.
 
 TikTok requests start anonymously. For restricted videos, set `TIKTOK_SESSION_ID` to the value of your TikTok `sessionid` cookie, without the `sessionid=` prefix. The session comes only from the environment (including `.env`) and stays in memory; it is never saved in PostgreSQL. An age, login, private-content, or regional restriction triggers one retry with the account. The account must have access to the post. Rate limits, bot challenges, network failures, and deleted posts do not trigger account use. Account cookies stay separate from device sessions, so later public requests remain anonymous.
 
-Restart after changing `TIKTOK_SESSION_ID`. Leaving it unset or empty disables account fallback. Cookie files and `YTDLP_COOKIES` are no longer used. Web mode uses the same environment setting and does not require PostgreSQL.
+Restart after changing `TIKTOK_SESSION_ID`. Leaving it unset or empty disables account fallback. Cookie files and `YTDLP_COOKIES` are no longer used.
 
 Each proxy address has ten identity slots. Before opening the API listener, startup registers missing slots and refreshes expired signing material. One worker per proxy runs in parallel with the other proxies; each address waits at least ten seconds after an attempt completes before starting the next one. Fresh saved identities are reused. A slot retains its proxy permanently and renews signing material on use after three hours. Explicit signing failures trigger renewal; invalid device registrations trigger recreation. Network errors and rate limits apply cooldowns rather than discarding valid identities. Preparation waits for identity and proxy cooldowns before retrying. Each attempt bounds cooldown waiting, lease acquisition, and registration/signing by `TIKTOK_APP_TIMEOUT_SECONDS`; shutdown cancels these waits.
 
-One active app-mode process owns each database schema through a PostgreSQL advisory lock. Losing that connection stops identity work until restart. This prevents two RAM pools from concurrently updating the same identities. Existing healthy saved devices continue working; new identities draw from the Pixel and Samsung catalog.
+One active service process owns each database schema through a PostgreSQL advisory lock. Losing that connection stops identity work until restart. This prevents two RAM pools from concurrently updating the same identities. Existing healthy saved devices continue working; new identities draw from the Pixel and Samsung catalog.
 
 To prepare identities again after startup, call the authenticated endpoint (no body required):
 
@@ -59,11 +59,11 @@ curl http://localhost:8000/v1/tiktok/identities/preparations \
   -H "Authorization: Bearer $TT_SCRAP_API_KEY"
 ```
 
-POST returns `202` for a running job or `200` when the pool is already prepared. GET returns `state`, `proxies`, `target`, `ready`, `failed`, and timestamps. Repeated POSTs share one job; polling reads RAM only. Failed slots receive up to three paced attempts per run; later calls or restarts reuse saved progress. A failed startup does not open the API port. Both operations return `503` in web mode. Ten proxy addresses mean ten workers and 100 identities, even when their gateway hostname is shared.
+POST returns `202` for a running job or `200` when the pool is already prepared. GET returns `state`, `proxies`, `target`, `ready`, `failed`, and timestamps. Repeated POSTs share one job; polling reads RAM only. Failed slots receive up to three paced attempts per run; later calls or restarts reuse saved progress. A failed startup does not open the API port. Ten proxy addresses mean ten workers and 100 identities, even when their gateway hostname is shared.
 
 ## Throughput and memory
 
-Upstream connections are pooled and reused. Matching metadata requests share work. Downloads and Telegram multipart uploads stream through temporary files without buffering entire videos in RAM. App deliveries share one identity lease across video, thumbnail, and slideshow downloads, with one database checkpoint after preparation. Identity waits do not occupy download slots. Each adaptive video/audio track uses its own download slot; a limit of one serializes the tracks. Muxing takes one slot after both tracks finish. Media retries use exponential delay plus up to 10% jitter within the download deadline. Native image conversions have a separate concurrency bound. Queues are bounded, and cancellation propagates through network calls and preparation.
+Upstream connections are pooled and reused. Matching metadata requests share work. Downloads and Telegram multipart uploads stream through temporary files without buffering entire videos in RAM. App deliveries share one identity lease across video, thumbnail, and slideshow downloads, with one database checkpoint after preparation. Identity waits do not occupy download slots. Each media file uses one download slot; a limit of one serializes transfers. Media retries use exponential delay plus up to 10% jitter within the download deadline. Native image conversions have a separate concurrency bound. Queues are bounded, and cancellation propagates through network calls and preparation.
 
 App video selection uses only API metadata: highest pixel resolution, then frame rate, then bitrate. Extraction makes no CDN quality-probe requests. Download validation still inspects the actual downloaded file. Protocol clients and cookie jars stay in RAM across operations.
 
@@ -86,7 +86,7 @@ docker build -t tt-scrap:go .
 docker compose up --build -d
 ```
 
-The container runs as an unprivileged user and includes the Go binary, FFmpeg, and native HEIF codecs. `tt-scrap healthcheck` probes readiness. Shutdown drains requests for up to 30 seconds before cancelling remaining work.
+The container runs as an unprivileged user and includes the Go binary and native HEIF codecs. `tt-scrap healthcheck` probes readiness. Shutdown drains requests for up to 30 seconds before cancelling remaining work.
 
 `DB_URL` must be reachable from the container. A host-only `127.0.0.1` address refers to the container itself: join the database's Docker network and use its service hostname, or configure a host gateway. The base Compose file uses saved database proxies without a file mount. To import `proxies.txt`, use `docker compose -f docker-compose.yml -f compose.proxies.yml up --build -d`. For a new app database, provide that file or explicitly set `PROXY_INCLUDE_HOST=true`. Leave `PROXY_FILE` unset when using only saved database proxies. For account fallback, set `TIKTOK_SESSION_ID` in `.env`; Compose passes it to the service.
 

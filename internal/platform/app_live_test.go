@@ -95,7 +95,6 @@ func TestLiveAppExtractionDownload(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	cfg.TikTokMethod = "app"
 	cfg.TempDir = t.TempDir()
 	if cfg.ProxyFile != "" && !filepath.IsAbs(cfg.ProxyFile) {
 		cfg.ProxyFile = filepath.Join("../..", cfg.ProxyFile)
@@ -115,7 +114,7 @@ func TestLiveAppExtractionDownload(t *testing.T) {
 	assets := core.NewAssets(cfg.CacheTTL, cfg.CacheMaxEntries)
 	service := platform.NewTikTok(cfg, assets, pool, proxies)
 	defer service.Close()
-	downloader := platform.NewDownloader(cfg, pool, pool.ProxyAddresses())
+	downloader := platform.NewDownloader(cfg, pool)
 	defer downloader.Close()
 	started := time.Now()
 	post, e := service.ExtractURL(ctx, "https://www.tiktok.com/@wwe/video/7695962883523464478", true)

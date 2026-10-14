@@ -27,13 +27,19 @@ func newTransports(max int) *transports {
 	}
 	return &transports{items: make(map[string]*http.Transport), max: max}
 }
+func newTransport(max int) *http.Transport {
+	if max <= 0 {
+		max = 128
+	}
+	return &http.Transport{DialContext: (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext, ForceAttemptHTTP2: true, MaxIdleConns: max * 2, MaxIdleConnsPerHost: max, MaxConnsPerHost: max, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 25 * time.Second, ExpectContinueTimeout: time.Second, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
+}
 func (p *transports) get(proxy string) (*http.Transport, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if t := p.items[proxy]; t != nil {
 		return t, nil
 	}
-	t := &http.Transport{DialContext: (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext, ForceAttemptHTTP2: true, MaxIdleConns: p.max * 2, MaxIdleConnsPerHost: p.max, MaxConnsPerHost: p.max, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: 25 * time.Second, ExpectContinueTimeout: time.Second, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
+	t := newTransport(p.max)
 	if proxy != "" {
 		u, e := url.Parse(proxy)
 		if e != nil || u.Hostname() == "" {

@@ -19,7 +19,6 @@ var instagramPath = regexp.MustCompile(`(?i)^/(?:p|reels?|tv|stories)/[\w-]+`)
 type Instagram struct {
 	cfg         core.Config
 	assets      *core.Assets
-	transports  *transports
 	client      *http.Client
 	posts       *memo[core.InstagramExtraction]
 	extractions *memo[core.InstagramExtraction]
@@ -27,16 +26,14 @@ type Instagram struct {
 }
 
 func NewInstagram(cfg core.Config, assets *core.Assets) *Instagram {
-	pool := newTransports(cfg.HTTPMaxConnections)
-	transport, _ := pool.get("")
 	limit := min(cfg.InstagramConcurrency, cfg.ExtractionConcurrency)
 	if limit < 1 {
 		limit = 4
 	}
 	cacheCapacity := core.CacheBudget(cfg.CacheMaxEntries).Responses
-	return &Instagram{cfg: cfg, assets: assets, transports: pool, client: &http.Client{Transport: transport, Timeout: cfg.InstagramTimeout}, posts: newMemo[core.InstagramExtraction](cfg.CacheTTL, cacheCapacity, cfg.CacheMaxEntries), extractions: newMemo[core.InstagramExtraction](cfg.CacheTTL, cacheCapacity, cfg.CacheMaxEntries), gate: core.NewLimiter(limit, cfg.MaxQueuedRequests)}
+	return &Instagram{cfg: cfg, assets: assets, client: &http.Client{Transport: newTransport(cfg.HTTPMaxConnections), Timeout: cfg.InstagramTimeout}, posts: newMemo[core.InstagramExtraction](cfg.CacheTTL, cacheCapacity, cfg.CacheMaxEntries), extractions: newMemo[core.InstagramExtraction](cfg.CacheTTL, cacheCapacity, cfg.CacheMaxEntries), gate: core.NewLimiter(limit, cfg.MaxQueuedRequests)}
 }
-func (i *Instagram) Close() { i.transports.close() }
+func (i *Instagram) Close() { i.client.CloseIdleConnections() }
 func normalizeInstagram(raw string) (string, string, error) {
 	u, e := url.Parse(strings.TrimSpace(raw))
 	if e != nil {
@@ -66,7 +63,7 @@ func (i *Instagram) ExtractURL(ctx context.Context, raw string, refresh bool) (c
 		if e != nil {
 			return core.InstagramExtraction{}, e
 		}
-		extraction := token()
+		extraction := core.NewID()
 		expires := time.Now().UTC().Add(i.cfg.CacheTTL)
 		response := core.InstagramExtraction{Platform: "instagram", ExtractionID: extraction, SourceID: id, SourceURL: raw, ExpiresAt: expires.Format(time.RFC3339Nano), Media: []core.InstagramMedia{}}
 		response.CreatorUsername = instagramCreator(data)

@@ -74,12 +74,6 @@ type InstagramExtraction struct {
 	Media           []InstagramMedia `json:"media"`
 	ExpiresAt       string           `json:"expires_at"`
 }
-type AuxiliaryAsset struct {
-	UpstreamURL   string
-	AlternateURLs []string
-	ContentType   string
-	Cookies       map[string]string
-}
 type AssetContext struct {
 	Platform        string
 	Kind            string
@@ -88,16 +82,12 @@ type AssetContext struct {
 	AlternateURLs   []string
 	ContentType     string
 	Referer         string
-	ProxyURL        string
-	Cookies         map[string]string
-	CookieJar       http.CookieJar
 	Headers         http.Header
 	IdentityID      string
 	ExpectedWidth   int
 	ExpectedHeight  int
 	DurationSeconds int
 	ExtractionID    string
-	Audio           *AuxiliaryAsset
 }
 type Downloaded struct {
 	Path        string
@@ -156,7 +146,6 @@ type OpenAppMedia func(context.Context, string, http.Header) (*http.Response, er
 type AppDetail struct {
 	Response   map[string]any
 	IdentityID string
-	ProxyURL   string
 	UserAgent  string
 }
 

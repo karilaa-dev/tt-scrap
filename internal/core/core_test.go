@@ -51,13 +51,13 @@ func TestLimiterCancelsWaitingWorkAndReleasesOnce(t *testing.T) {
 	}
 	next()
 }
-func TestConfigRejectsInvalidLimitsAndDoesNotRequireDBForWeb(t *testing.T) {
-	base := map[string]string{"TT_SCRAP_API_KEY": "test-key-sixteen-characters", "TIKTOK_METHOD": "web"}
+func TestConfigRejectsInvalidLimitsAndRequiresDatabase(t *testing.T) {
+	base := map[string]string{"TT_SCRAP_API_KEY": "test-key-sixteen-characters", "DB_URL": "postgresql://localhost/test"}
 	config, err := ParseConfig(base)
 	if err != nil || config.Port != 8000 {
-		t.Fatal("web configuration requires an app database", err)
+		t.Fatal("valid app configuration failed", err)
 	}
-	for _, entry := range [][2]string{{"TIKTOK_APP_TIMEOUT_SECONDS", "NaN"}, {"TIKTOK_APP_TIMEOUT_SECONDS", "+Inf"}, {"EXTRACTION_CONCURRENCY", "0"}, {"MAX_ASSET_BYTES", "-1"}, {"PROXY_INCLUDE_HOST", "maybe"}, {"TIKTOK_METHOD", "invalid"}} {
+	for _, entry := range [][2]string{{"TIKTOK_APP_TIMEOUT_SECONDS", "NaN"}, {"TIKTOK_APP_TIMEOUT_SECONDS", "+Inf"}, {"EXTRACTION_CONCURRENCY", "0"}, {"MAX_ASSET_BYTES", "-1"}, {"PROXY_INCLUDE_HOST", "maybe"}} {
 		env := map[string]string{}
 		for k, v := range base {
 			env[k] = v
@@ -67,9 +67,11 @@ func TestConfigRejectsInvalidLimitsAndDoesNotRequireDBForWeb(t *testing.T) {
 			t.Errorf("accepted invalid %s", entry[0])
 		}
 	}
-	base["TIKTOK_METHOD"] = "app"
-	if _, err := ParseConfig(base); err == nil {
-		t.Fatal("app accepted absent database")
+	for _, value := range []string{"", "  "} {
+		base["DB_URL"] = value
+		if _, err := ParseConfig(base); err == nil || err.Error() != "invalid configuration: DB_URL" {
+			t.Fatal("app accepted absent database", err)
+		}
 	}
 }
 

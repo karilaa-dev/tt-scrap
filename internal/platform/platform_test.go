@@ -4,20 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httptest"
-	"net/url"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,41 +49,6 @@ func testConfig() core.Config {
 	cfg.TempDir = ""
 	return cfg
 }
-func TestWebJSONPreservesIDAndSIGIFallback(t *testing.T) {
-	for _, html := range []string{`<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">{"__DEFAULT_SCOPE__":{"webapp.video-detail":{"statusCode":0,"itemInfo":{"itemStruct":{"id":7695962883523464478,"video":{"width":1080}}}}}}</script>`, `<script type="application/json" id="SIGI_STATE">{"ItemModule":{"7695962883523464478":{"id":"7695962883523464478","video":{"width":1080}}}}</script>`} {
-		detail, status, e := ParseWebDetail([]byte(html), "7695962883523464478")
-		if e != nil || status != 0 || str(detail["id"]) != "7695962883523464478" {
-			t.Fatalf("detail=%v status=%d err=%v", detail, status, e)
-		}
-	}
-}
-func TestWebChallengeSolvesNativeSHA256(t *testing.T) {
-	prefix := []byte("fixture-seed")
-	sum := sha256.Sum256(append(prefix, []byte("42")...))
-	challenge, _ := json.Marshal(object{"v": object{"a": base64.StdEncoding.EncodeToString(prefix), "c": base64.StdEncoding.EncodeToString(sum[:])}})
-	body := []byte(fmt.Sprintf(`<div id="cs" class="%s"></div><div id="wci" class="_wafchallengeid"></div>`, base64.StdEncoding.EncodeToString(challenge)))
-	jar, _ := cookiejar.New(nil)
-	ok, e := solveWebChallenge(context.Background(), body, jar)
-	if e != nil || !ok {
-		t.Fatal(e)
-	}
-	u, _ := url.Parse("https://www.tiktok.com/")
-	cookies := jar.Cookies(u)
-	if len(cookies) != 1 {
-		t.Fatal(cookies)
-	}
-	raw, _ := base64.StdEncoding.DecodeString(cookies[0].Value)
-	decoded, _ := decode(raw)
-	if decoded["d"] != "NDI=" {
-		t.Fatal(decoded)
-	}
-}
-func TestWebQualityPrefersMeasuredMVMAFAtMaximumResolution(t *testing.T) {
-	source := selectVideo(object{"width": 720, "height": 1280, "playAddr": "https://x/regular", "bitrateInfo": []any{object{"GearName": "normal_1080", "Bitrate": 9000000, "MVMAF": `{"v2.0":{"ori":{"v1080":91}}}`, "PlayAddr": object{"Width": 1080, "Height": 1920, "UrlList": []any{"https://x/highrate"}}}, object{"GearName": "normal_1080", "Bitrate": 5000000, "MVMAF": `{"v2.0":{"ori":{"v1080":95}}}`, "PlayAddr": object{"Width": 1080, "Height": 1920, "UrlList": []any{"https://x/best"}}}}}, false)
-	if source.URLs[0] != "https://x/best" {
-		t.Fatal(source)
-	}
-}
 func TestDownloadStreamsHashAndHonorsDeclaredAndChunkedLimits(t *testing.T) {
 	data := testVideo(1080, 1920)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -104,7 +62,7 @@ func TestDownloadStreamsHashAndHonorsDeclaredAndChunkedLimits(t *testing.T) {
 	defer server.Close()
 	cfg := testConfig()
 	cfg.TempDir = t.TempDir()
-	d := NewDownloader(cfg, nil, nil)
+	d := NewDownloader(cfg, nil)
 	defer d.Close()
 	asset := core.AssetContext{Kind: "video", Filename: "123.mp4", UpstreamURL: server.URL + "/known"}
 	got, e := d.Download(context.Background(), asset, 0)
@@ -132,7 +90,7 @@ func TestDownloadStreamsHashAndHonorsDeclaredAndChunkedLimits(t *testing.T) {
 		t.Fatal("temp files leaked")
 	}
 }
-func TestDownloadRejectsHTMLAndFallbackPreservesCookies(t *testing.T) {
+func TestDownloadRejectsHTMLAndUsesFallback(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
@@ -140,15 +98,12 @@ func TestDownloadRejectsHTMLAndFallbackPreservesCookies(t *testing.T) {
 			io.WriteString(w, "<html>Access denied</html>")
 			return
 		}
-		if r.Header.Get("Cookie") != "session=sticky" {
-			t.Error("missing cookie")
-		}
 		w.Write([]byte{255, 216, 255, 0, 1, 2})
 	}))
 	defer server.Close()
-	d := NewDownloader(testConfig(), nil, nil)
+	d := NewDownloader(testConfig(), nil)
 	defer d.Close()
-	got, e := d.Download(context.Background(), core.AssetContext{Kind: "image", Filename: "photo.png", UpstreamURL: server.URL + "/bad", AlternateURLs: []string{server.URL + "/good"}, Cookies: map[string]string{"session": "sticky"}}, 0)
+	got, e := d.Download(context.Background(), core.AssetContext{Kind: "image", Filename: "photo.png", UpstreamURL: server.URL + "/bad", AlternateURLs: []string{server.URL + "/good"}}, 0)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -245,6 +200,9 @@ func TestAppMetadataQualityWithoutMediaRequestsAndStickyAssets(t *testing.T) {
 				t.Error("duplicate extraction")
 			}
 			id = post.ExtractionID
+			if post.CreatorUsername == nil || *post.CreatorUsername != "creator" || post.DurationSeconds == nil || *post.DurationSeconds != 12 || post.Likes == nil || *post.Likes != 42 || post.Views == nil || *post.Views != 99 {
+				t.Errorf("app metadata was not normalized: %+v", post)
+			}
 			if post.Width == nil || *post.Width != 2160 || post.Height == nil || *post.Height != 3840 {
 				t.Error("API resolution was not selected", post)
 			}
@@ -346,31 +304,6 @@ func TestCanceledMetadataWaiterDoesNotCancelLeader(t *testing.T) {
 	}
 }
 
-func TestWebNormalizationPreservesCookies(t *testing.T) {
-	cfg := testConfig()
-	cfg.TikTokMethod = "web"
-	assets := core.NewAssets(time.Minute, 100)
-	service := NewTikTok(cfg, assets, nil, nil)
-	defer service.Close()
-
-	data, e := parseFixtureWeb("123")
-	if e != nil {
-		t.Fatal(e)
-	}
-	post, e := service.normalize(context.Background(), data, core.AssetContext{Platform: "tiktok", Cookies: map[string]string{"web_session": "sticky"}}, core.TikTokResolution{SourceID: "123", SourceURL: "https://www.tiktok.com/@webuser/video/123", ResolvedURL: "https://www.tiktok.com/@webuser/video/123"}, false)
-	if e != nil {
-		t.Fatal(e)
-	}
-	asset, e := assets.GetAsset(post.Media[0].AssetID)
-	if e != nil || asset.Cookies["web_session"] != "sticky" || asset.UpstreamURL != "https://cdn.example/video.mp4" || *post.DurationSeconds != 15 {
-		t.Fatal(asset, e)
-	}
-}
-
-func parseFixtureWeb(id string) (object, error) {
-	return decode([]byte(fmt.Sprintf(`{"id":"%s","author":{"uniqueId":"webuser"},"video":{"width":1080,"height":1920,"duration":15,"playAddr":"https://cdn.example/video.mp4"}}`, id)))
-}
-
 func TestMusicDoesNotDownloadOrRejectLongVideoAndSharesExpiry(t *testing.T) {
 	backend := &fakeApp{server: "https://unused.example"}
 	cfg := testConfig()
@@ -439,7 +372,7 @@ func TestIdentitySaveFailureRejectsDownloadedMedia(t *testing.T) {
 	backend := &closeFailureBackend{fakeApp: fakeApp{server: "https://unused.example"}}
 	cfg := testConfig()
 	cfg.TempDir = t.TempDir()
-	downloader := NewDownloader(cfg, backend, nil)
+	downloader := NewDownloader(cfg, backend)
 	defer downloader.Close()
 	_, e := downloader.Download(context.Background(), core.AssetContext{Kind: "video", IdentityID: "sticky", Filename: "123.mp4", UpstreamURL: "https://unused.example/video"}, 0)
 	var api *core.Error
@@ -467,7 +400,7 @@ func TestOpenMediaOwnershipFailureIsPreservedWithoutRetries(t *testing.T) {
 	backend := &openFailureBackend{}
 	cfg := testConfig()
 	cfg.DownloadRetries = 5
-	downloader := NewDownloader(cfg, backend, nil)
+	downloader := NewDownloader(cfg, backend)
 	defer downloader.Close()
 	_, err := downloader.Download(context.Background(), core.AssetContext{Kind: "video", IdentityID: "sticky", UpstreamURL: "https://unused.example/video"}, 0)
 	var api *core.Error
@@ -496,102 +429,18 @@ func TestCreatorAndCoverFallbacks(t *testing.T) {
 	assets := core.NewAssets(time.Minute, 100)
 	service := NewTikTok(cfg, assets, nil, nil)
 	defer service.Close()
-	data, _ := parseFixtureWeb("123")
+	response, _ := (&fakeApp{server: "https://cdn.example"}).Detail(context.Background(), "123")
+	data := appDetail(response.Response, "123")
 	obj(data["video"])["cover"] = object{"url_list": []any{}}
-	obj(data["video"])["originCover"] = []any{"https://cdn.example/cover.jpg"}
-	data["music"] = object{"playUrl": "https://cdn.example/music.mp3", "coverLarge": []any{}, "coverMedium": "https://cdn.example/music-cover.jpg"}
-	post, err := service.normalize(context.Background(), data, core.AssetContext{}, core.TikTokResolution{SourceID: "123"}, false)
+	obj(data["video"])["origin_cover"] = []any{"https://cdn.example/cover.jpg"}
+	data["music"] = object{"play_url": "https://cdn.example/music.mp3", "cover_large": []any{}, "cover_medium": "https://cdn.example/music-cover.jpg"}
+	post, err := service.normalize(context.Background(), data, core.AssetContext{}, core.TikTokResolution{SourceID: "123"})
 	if err != nil || post.Cover == nil || post.Music.Cover == nil {
 		t.Fatal(post, err)
 	}
 	cover, _ := assets.GetAsset(post.Cover.AssetID)
 	if cover.UpstreamURL != "https://cdn.example/cover.jpg" {
 		t.Fatal(cover)
-	}
-}
-func TestWebProxyDataOnlyDownloadsDirectly(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte{255, 216, 255, 0, 1, 2}) }))
-	defer server.Close()
-	cfg := testConfig()
-	cfg.ProxyDataOnly = true
-	downloader := NewDownloader(cfg, nil, nil)
-	defer downloader.Close()
-	file, err := downloader.Download(context.Background(), core.AssetContext{Platform: "tiktok", Kind: "image", Filename: "test.jpg", ProxyURL: "invalid-proxy", UpstreamURL: server.URL}, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Cleanup()
-}
-func TestSeparateAudioMuxPreservesBothStreamsAndRejectsOversize(t *testing.T) {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		t.Skip("FFmpeg is required for mux verification")
-	}
-	dir := t.TempDir()
-	videoPath, audioPath := filepath.Join(dir, "video.mp4"), filepath.Join(dir, "audio.m4a")
-	commands := [][]string{{"-nostdin", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=32x24:r=1:d=1", "-an", "-c:v", "libx264", "-threads", "1", "-movflags", "+faststart", videoPath}, {"-nostdin", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "3", "-c:a", "aac", "-threads", "1", audioPath}}
-	for _, args := range commands {
-		if out, err := exec.Command("ffmpeg", args...).CombinedOutput(); err != nil {
-			t.Fatalf("fixture: %v %s", err, out)
-		}
-	}
-	video, _ := os.ReadFile(videoPath)
-	audio, _ := os.ReadFile(audioPath)
-	var trackRequests atomic.Int32
-	bothStarted := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if trackRequests.Add(1) == 2 {
-			close(bothStarted)
-		}
-		select {
-		case <-bothStarted:
-		case <-r.Context().Done():
-			return
-		}
-		if r.URL.Path == "/audio" {
-			w.Write(audio)
-		} else {
-			w.Write(video)
-		}
-	}))
-	defer server.Close()
-	cfg := testConfig()
-	cfg.TempDir = dir
-	cfg.DownloadTimeout = 2 * time.Second
-	downloader := NewDownloader(cfg, nil, nil)
-	defer downloader.Close()
-	asset := core.AssetContext{Platform: "tiktok", Kind: "video", Filename: "123.mp4", UpstreamURL: server.URL + "/video", Audio: &core.AuxiliaryAsset{UpstreamURL: server.URL + "/audio", ContentType: "audio/mp4"}}
-	file, err := downloader.Download(context.Background(), asset, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Cleanup()
-	out, err := exec.Command("ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", file.Path).Output()
-	if err != nil || !strings.Contains(string(out), "video") || !strings.Contains(string(out), "audio") {
-		t.Fatal(string(out), err)
-	}
-	out, err = exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file.Path).Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	duration, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
-	if err != nil || duration < 0.9 || duration > 1.25 {
-		t.Fatalf("one-second video with three-second audio muxed to %v seconds: %v", duration, err)
-	}
-	if file.Width != 32 || file.Height != 24 {
-		t.Fatal(file)
-	}
-	cfg.DownloadConcurrency = 1
-	serial := NewDownloader(cfg, nil, nil)
-	defer serial.Close()
-	serialized, err := serial.Download(context.Background(), asset, 0)
-	if err != nil {
-		t.Fatal("one transfer slot must serialize both tracks and still mux", err)
-	}
-	serialized.Cleanup()
-	_, err = downloader.Download(context.Background(), asset, int64(max(len(video), len(audio))))
-	var api *core.Error
-	if !errors.As(err, &api) || api.Code != "asset_too_large" {
-		t.Fatal("oversized mux was returned", err)
 	}
 }
 
@@ -612,9 +461,9 @@ func TestFractionalJSONNumbersPreserveFPSRanking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	candidates := appCandidates(data)
-	if integer(data["width"]) != 1080 || integer(data["duration"]) != 12345 || candidates[0].URLs[0] != "https://cdn.example/60" {
-		t.Fatal(candidates, data)
+	selected := selectVideo(data)
+	if integer(data["width"]) != 1080 || integer(data["duration"]) != 12345 || selected.URLs[0] != "https://cdn.example/60" {
+		t.Fatal(selected, data)
 	}
 }
 
@@ -634,110 +483,6 @@ func TestInstagramProviderAuthenticationFailureIsNetworkError(t *testing.T) {
 	}
 }
 
-func TestAdaptiveTracksShareByteBudgetBeforeMux(t *testing.T) {
-	for _, chunked := range []bool{false, true} {
-		t.Run(strconv.FormatBool(chunked), func(t *testing.T) {
-			video := testVideo(32, 24)
-			audio := append([]byte("ID3"), make([]byte, len(video)-3)...)
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				data := video
-				if r.URL.Path == "/audio" {
-					data = audio
-				}
-				if chunked {
-					w.(http.Flusher).Flush()
-				} else {
-					w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-				}
-				_, _ = w.Write(data)
-			}))
-			defer server.Close()
-			cfg := testConfig()
-			cfg.TempDir = t.TempDir()
-			d := NewDownloader(cfg, nil, nil)
-			defer d.Close()
-			asset := core.AssetContext{Kind: "video", Filename: "x.mp4", UpstreamURL: server.URL + "/video", Audio: &core.AuxiliaryAsset{UpstreamURL: server.URL + "/audio"}}
-			result, err := d.Download(context.Background(), asset, int64(len(video)+len(audio)-1))
-			result.Cleanup()
-			var api *core.Error
-			if !errors.As(err, &api) || api.Code != "asset_too_large" {
-				t.Fatal("track sum reached mux instead of byte limit", err)
-			}
-			files, err := os.ReadDir(cfg.TempDir)
-			if err != nil || len(files) != 0 {
-				t.Fatal("failed tracks leaked temporary files", files, err)
-			}
-		})
-	}
-}
-
-func TestWebMediaRetryRotatesConfiguredProxies(t *testing.T) {
-	var first, backup atomic.Int32
-	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { first.Add(1); w.WriteHeader(503) }))
-	defer bad.Close()
-	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		backup.Add(1)
-		if r.URL.Host != "cdn.example" {
-			t.Error("proxy lost original URL", r.URL)
-		}
-		_, _ = w.Write([]byte{255, 216, 255, 0, 1, 2})
-	}))
-	defer good.Close()
-	cfg := testConfig()
-	cfg.DownloadRetries = 2
-	cfg.RetryDelay = time.Millisecond
-	d := NewDownloader(cfg, nil, []string{good.URL, bad.URL})
-	defer d.Close()
-	file, err := d.Download(context.Background(), core.AssetContext{Platform: "tiktok", Kind: "image", Filename: "x.jpg", UpstreamURL: "http://cdn.example/photo", ProxyURL: bad.URL}, 0)
-	if err != nil {
-		t.Fatal("healthy backup proxy was not attempted", err)
-	}
-	file.Cleanup()
-	if first.Load() != 1 || backup.Load() != 1 {
-		t.Fatal("initial proxy was not retained before rotation", first.Load(), backup.Load())
-	}
-}
-
-func TestAdaptiveFailureCancelsSiblingAndCleansFiles(t *testing.T) {
-	started := make(chan struct{})
-	stopped := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/audio" {
-			close(started)
-			<-r.Context().Done()
-			close(stopped)
-			return
-		}
-		select {
-		case <-started:
-		case <-r.Context().Done():
-			return
-		}
-		w.WriteHeader(403)
-	}))
-	defer server.Close()
-	cfg := testConfig()
-	cfg.TempDir = t.TempDir()
-	d := NewDownloader(cfg, nil, nil)
-	defer d.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	file, err := d.Download(ctx, core.AssetContext{Kind: "video", UpstreamURL: server.URL + "/video", Audio: &core.AuxiliaryAsset{UpstreamURL: server.URL + "/audio"}}, 0)
-	file.Cleanup()
-	if err == nil || ctx.Err() != nil {
-		t.Fatal("failure did not cancel the sibling promptly", err, ctx.Err())
-	}
-	select {
-	case <-stopped:
-	case <-ctx.Done():
-		t.Fatal("audio request leaked")
-	}
-	files, err := os.ReadDir(cfg.TempDir)
-	if err != nil || len(files) != 0 {
-		t.Fatal("failed adaptive download leaked files", files, err)
-	}
-}
-
 func TestFailedDownloadReturnsByteBudgetBeforeFallback(t *testing.T) {
 	data := testVideo(32, 24)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -751,7 +496,7 @@ func TestFailedDownloadReturnsByteBudgetBeforeFallback(t *testing.T) {
 	cfg := testConfig()
 	cfg.TempDir = t.TempDir()
 	cfg.RetryDelay = time.Millisecond
-	d := NewDownloader(cfg, nil, nil)
+	d := NewDownloader(cfg, nil)
 	defer d.Close()
 	file, err := d.Download(context.Background(), core.AssetContext{Kind: "video", Filename: "x.mp4", UpstreamURL: server.URL + "/bad", AlternateURLs: []string{server.URL + "/good"}}, int64(len(data)))
 	if err != nil {
@@ -768,62 +513,54 @@ func TestFailedDownloadReturnsByteBudgetBeforeFallback(t *testing.T) {
 }
 
 func TestSelectedRenditionDimensionsValidateDownloadedFallbacks(t *testing.T) {
-	for _, app := range []bool{true, false} {
-		t.Run(fmt.Sprintf("app=%t", app), func(t *testing.T) {
-			var mismatches, matches atomic.Int32
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/match" {
-					matches.Add(1)
-					w.Write(testVideo(1080, 1920))
-				} else {
-					mismatches.Add(1)
-					w.Write(testVideo(540, 960))
-				}
-			}))
-			defer server.Close()
-			cfg := testConfig()
-			cfg.TempDir = t.TempDir()
-			assets := core.NewAssets(time.Minute, 100)
-			backend := &fakeApp{server: server.URL}
-			service := NewTikTok(cfg, assets, backend, nil)
-			defer service.Close()
-			downloader := NewDownloader(cfg, backend, nil)
-			defer downloader.Close()
-			for _, fallback := range []string{"/match", "/mismatch-again"} {
-				data := object{"video": object{"width": 1080, "height": 1920}}
-				base := core.AssetContext{Platform: "tiktok"}
-				sources := []any{server.URL + "/mismatch", server.URL + fallback}
-				if app {
-					obj(data["video"])["play_addr"] = object{"width": 1080, "height": 1920, "url_list": sources}
-					base.IdentityID = "sticky"
-				} else {
-					obj(data["video"])["playAddr"] = object{"Width": 1080, "Height": 1920, "UrlList": sources}
-				}
-				post, err := service.normalize(context.Background(), data, base, core.TikTokResolution{SourceID: "123"}, app)
-				if err != nil {
-					t.Fatal(err)
-				}
-				asset, err := assets.GetAsset(post.Media[0].AssetID)
-				if err != nil {
-					t.Fatal(err)
-				}
-				file, err := downloader.Download(context.Background(), asset, 0)
-				if fallback == "/match" {
-					if err != nil || file.Width != 1080 || file.Height != 1920 {
-						t.Errorf("did not return matching fallback: file=%+v error=%v", file, err)
-					}
-				} else if err == nil {
-					t.Error("accepted a video that does not match advertised dimensions")
-				}
-				file.Cleanup()
+	var mismatches, matches atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/match" {
+			matches.Add(1)
+			w.Write(testVideo(1080, 1920))
+		} else {
+			mismatches.Add(1)
+			w.Write(testVideo(540, 960))
+		}
+	}))
+	defer server.Close()
+	cfg := testConfig()
+	cfg.TempDir = t.TempDir()
+	assets := core.NewAssets(time.Minute, 100)
+	backend := &fakeApp{server: server.URL}
+	service := NewTikTok(cfg, assets, backend, nil)
+	defer service.Close()
+	downloader := NewDownloader(cfg, backend)
+	defer downloader.Close()
+	for _, fallback := range []string{"/match", "/mismatch-again"} {
+		data := object{"video": object{"width": 1080, "height": 1920}}
+		base := core.AssetContext{Platform: "tiktok"}
+		sources := []any{server.URL + "/mismatch", server.URL + fallback}
+		obj(data["video"])["play_addr"] = object{"width": 1080, "height": 1920, "url_list": sources}
+		base.IdentityID = "sticky"
+		post, err := service.normalize(context.Background(), data, base, core.TikTokResolution{SourceID: "123"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		asset, err := assets.GetAsset(post.Media[0].AssetID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		file, err := downloader.Download(context.Background(), asset, 0)
+		if fallback == "/match" {
+			if err != nil || file.Width != 1080 || file.Height != 1920 {
+				t.Errorf("did not return matching fallback: file=%+v error=%v", file, err)
 			}
-			if mismatches.Load() != 3 || matches.Load() != 1 {
-				t.Errorf("fallbacks not validated: mismatches=%d matches=%d", mismatches.Load(), matches.Load())
-			}
-			files, err := os.ReadDir(cfg.TempDir)
-			if err != nil || len(files) != 0 {
-				t.Fatal("rendition validation leaked files", files, err)
-			}
-		})
+		} else if err == nil {
+			t.Error("accepted a video that does not match advertised dimensions")
+		}
+		file.Cleanup()
+	}
+	if mismatches.Load() != 3 || matches.Load() != 1 {
+		t.Errorf("fallbacks not validated: mismatches=%d matches=%d", mismatches.Load(), matches.Load())
+	}
+	files, err := os.ReadDir(cfg.TempDir)
+	if err != nil || len(files) != 0 {
+		t.Fatal("rendition validation leaked files", files, err)
 	}
 }

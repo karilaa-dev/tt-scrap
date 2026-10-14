@@ -121,16 +121,7 @@ func urls(v any) []string {
 		}
 		return result
 	case map[string]any:
-		for _, k := range []string{"UrlList", "urlList", "url_list"} {
-			if u := urls(t[k]); len(u) > 0 {
-				return u
-			}
-		}
-		var result []string
-		for _, k := range []string{"MainUrl", "main_url", "BackupUrl", "backup_url", "FallbackUrl", "fallback_url", "src", "url", "download"} {
-			result = append(result, urls(t[k])...)
-		}
-		return result
+		return urls(t["url_list"])
 	}
 	return nil
 }

@@ -63,7 +63,7 @@ func TestIdentityWaitDoesNotReserveDownloadCapacity(t *testing.T) {
 	free := mustAcquire(t, p, "")
 	freeID := free.entry.id
 	finishLease(t, free, nil)
-	d := platform.NewDownloader(cfg, p, nil)
+	d := platform.NewDownloader(cfg, p)
 	defer d.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -145,7 +145,7 @@ func TestTelegramRelatedMediaShareIdentityAndRunConcurrently(t *testing.T) {
 			}))
 			defer telegram.Close()
 			cfg.TelegramAPIBaseURL = telegram.URL
-			d := platform.NewDownloader(cfg, p, nil)
+			d := platform.NewDownloader(cfg, p)
 			defer d.Close()
 			h := httpapi.NewHandler(httpapi.Dependencies{Config: cfg, Assets: assets, TikTok: deliveryPost{post: post}, Downloader: d})
 			before := p.Stats()
@@ -244,7 +244,7 @@ func TestTelegramPreparationBoundsWorkAndCancelsSiblings(t *testing.T) {
 			}))
 			defer telegram.Close()
 			cfg.TelegramAPIBaseURL = telegram.URL
-			d := platform.NewDownloader(cfg, p, nil)
+			d := platform.NewDownloader(cfg, p)
 			defer d.Close()
 			h := httpapi.NewHandler(httpapi.Dependencies{Config: cfg, Assets: assets, TikTok: deliveryPost{post: post}, Downloader: d})
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -347,7 +347,7 @@ func TestTelegramRecoveryRepreparesBeforeOneUpload(t *testing.T) {
 			}))
 			defer telegram.Close()
 			cfg.TelegramAPIBaseURL = telegram.URL
-			d := platform.NewDownloader(cfg, p, nil)
+			d := platform.NewDownloader(cfg, p)
 			defer d.Close()
 			h := httpapi.NewHandler(httpapi.Dependencies{Config: cfg, Assets: assets, TikTok: deliveryPost{post: post}, Downloader: d})
 			before := p.Stats()
@@ -436,7 +436,7 @@ func TestConcurrentTelegramDeliveriesRespectTransferLimit(t *testing.T) {
 	}))
 	defer telegram.Close()
 	cfg.TelegramAPIBaseURL = telegram.URL
-	d := platform.NewDownloader(cfg, p, nil)
+	d := platform.NewDownloader(cfg, p)
 	defer d.Close()
 	h := httpapi.NewHandler(httpapi.Dependencies{Config: cfg, Assets: assets, TikTok: posts, Downloader: d})
 	before := p.Stats()

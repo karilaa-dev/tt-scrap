@@ -248,7 +248,7 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) (response, error
 			return response{}, invalidRequest()
 		}
 		if d.Identities == nil {
-			return response{}, core.NewError("service_not_configured", "Identity preparation requires TikTok app mode", 503)
+			return response{}, core.NewError("service_not_configured", "TikTok identity pool is unavailable", 503)
 		}
 		if r.Method == "GET" {
 			return jsonResponse(200, d.Identities.PreparationStatus())

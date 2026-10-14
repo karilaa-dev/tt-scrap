@@ -14,7 +14,7 @@ import (
 	"github.com/karilaa-dev/tt-scrap/internal/core"
 )
 
-func resolutionFixture(t *testing.T, method string, handler http.HandlerFunc) *TikTok {
+func resolutionFixture(t *testing.T, handler http.HandlerFunc) *TikTok {
 	t.Helper()
 	server := httptest.NewTLSServer(handler)
 	t.Cleanup(server.Close)
@@ -24,7 +24,6 @@ func resolutionFixture(t *testing.T, method string, handler http.HandlerFunc) *T
 		return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
 	}
 	cfg := testConfig()
-	cfg.TikTokMethod = method
 	cfg.ResolveRetries = 1
 	service := NewTikTok(cfg, core.NewAssets(time.Minute, 100), nil, nil)
 	service.transports.items[""] = transport
@@ -41,7 +40,7 @@ func TestAppShortLinkValidatesRedirectBeforeAcceptingID(t *testing.T) {
 	} {
 		t.Run(target, func(t *testing.T) {
 			var calls atomic.Int32
-			service := resolutionFixture(t, "app", func(w http.ResponseWriter, r *http.Request) {
+			service := resolutionFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 				http.Redirect(w, r, target, http.StatusFound)
 			})
@@ -54,7 +53,7 @@ func TestAppShortLinkValidatesRedirectBeforeAcceptingID(t *testing.T) {
 
 func TestAppShortLinkFollowsQueryOnlyIDAndRelativeRedirect(t *testing.T) {
 	var calls atomic.Int32
-	service := resolutionFixture(t, "app", func(w http.ResponseWriter, r *http.Request) {
+	service := resolutionFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		switch r.URL.Path {
 		case "/short":
@@ -71,11 +70,27 @@ func TestAppShortLinkFollowsQueryOnlyIDAndRelativeRedirect(t *testing.T) {
 	}
 }
 
+func TestShortLinkDoesNotTreatQueryOrFragmentAsPostID(t *testing.T) {
+	for _, suffix := range []string{"?next=/@creator/video/999", "#/@creator/video/999"} {
+		t.Run(suffix, func(t *testing.T) {
+			var calls atomic.Int32
+			service := resolutionFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				http.Redirect(w, r, "https://www.tiktok.com/@creator/video/1234567890123456789", http.StatusFound)
+			})
+			result, err := service.ResolveURL(context.Background(), "https://vm.tiktok.com/short"+suffix)
+			if err != nil || result.SourceID != "1234567890123456789" || calls.Load() != 1 {
+				t.Fatalf("resolution = %+v, error = %v, requests = %d", result, err, calls.Load())
+			}
+		})
+	}
+}
+
 func TestAppShortLinkKeepsRedirectLimitAndErrorStatuses(t *testing.T) {
 	for _, status := range []int{302, 404, 429} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			var calls atomic.Int32
-			service := resolutionFixture(t, "app", func(w http.ResponseWriter, r *http.Request) {
+			service := resolutionFixture(t, func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 				w.Header().Set("Location", "/loop")
 				w.WriteHeader(status)
@@ -98,7 +113,7 @@ func TestAppShortLinkKeepsRedirectLimitAndErrorStatuses(t *testing.T) {
 
 func TestAppShortLinkCoalescesConcurrentResolutions(t *testing.T) {
 	var calls atomic.Int32
-	service := resolutionFixture(t, "app", func(w http.ResponseWriter, r *http.Request) {
+	service := resolutionFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		http.Redirect(w, r, "https://www.tiktok.com/@creator/video/1234567890123456789", http.StatusFound)
 	})
@@ -118,39 +133,34 @@ func TestAppShortLinkCoalescesConcurrentResolutions(t *testing.T) {
 }
 
 func TestAppShortLinkStopsBeforePostPage(t *testing.T) {
-	for _, method := range []string{"app", "web"} {
-		for _, kind := range []string{"video", "photo"} {
-			t.Run(method+"/"+kind, func(t *testing.T) {
-				var redirects, pages atomic.Int32
-				canonical := "https://www.tiktok.com/@creator/" + kind + "/1234567890123456789?share=1"
-				service := resolutionFixture(t, method, func(w http.ResponseWriter, r *http.Request) {
-					switch r.URL.Path {
-					case "/short":
-						redirects.Add(1)
-						http.Redirect(w, r, "https://www.tiktok.com/hop", http.StatusFound)
-					case "/hop":
-						redirects.Add(1)
-						http.Redirect(w, r, canonical, http.StatusFound)
-					default:
-						pages.Add(1)
-						w.Write([]byte("unnecessary post page"))
-					}
-				})
-				raw := "https://vm.tiktok.com/short"
-				for range 2 {
-					result, err := service.ResolveURL(context.Background(), raw)
-					if err != nil || result.SourceID != "1234567890123456789" || result.SourceURL != raw || result.ResolvedURL != canonical {
-						t.Fatalf("resolution = %+v, error = %v", result, err)
-					}
-				}
-				wantPages := int32(0)
-				if method == "web" {
-					wantPages = 1
-				}
-				if redirects.Load() != 2 || pages.Load() != wantPages {
-					t.Fatalf("redirect requests = %d; post-page requests = %d, want %d", redirects.Load(), pages.Load(), wantPages)
+	for _, kind := range []string{"video", "photo"} {
+		t.Run(kind, func(t *testing.T) {
+			var redirects, pages atomic.Int32
+			canonical := "https://www.tiktok.com/@creator/" + kind + "/1234567890123456789?share=1"
+			service := resolutionFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/short":
+					redirects.Add(1)
+					http.Redirect(w, r, "https://www.tiktok.com/hop", http.StatusFound)
+				case "/hop":
+					redirects.Add(1)
+					http.Redirect(w, r, canonical, http.StatusFound)
+				default:
+					pages.Add(1)
+					w.Write([]byte("unnecessary post page"))
 				}
 			})
-		}
+			raw := "https://vm.tiktok.com/short"
+			for range 2 {
+				result, err := service.ResolveURL(context.Background(), raw)
+				if err != nil || result.SourceID != "1234567890123456789" || result.SourceURL != raw || result.ResolvedURL != canonical {
+					t.Fatalf("resolution = %+v, error = %v", result, err)
+				}
+			}
+			wantPages := int32(0)
+			if redirects.Load() != 2 || pages.Load() != wantPages {
+				t.Fatalf("redirect requests = %d; post-page requests = %d, want %d", redirects.Load(), pages.Load(), wantPages)
+			}
+		})
 	}
 }
