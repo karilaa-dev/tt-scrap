@@ -28,7 +28,7 @@ func invalidRequest() error {
 	return core.NewError("validation_error", "Request validation failed", 422)
 }
 
-func readBody(w http.ResponseWriter, r *http.Request) (fields, error) {
+func readBody(w http.ResponseWriter, r *http.Request, allowEmpty bool) (fields, error) {
 	if header := r.Header.Get("Content-Type"); header != "" {
 		kind, _, err := mime.ParseMediaType(header)
 		if err != nil || !(kind == "application/json" || strings.HasPrefix(kind, "application/") && strings.HasSuffix(kind, "+json")) {
@@ -39,7 +39,11 @@ func readBody(w http.ResponseWriter, r *http.Request) (fields, error) {
 	decoder := json.NewDecoder(r.Body)
 	decoder.UseNumber()
 	var value fields
-	if err := decoder.Decode(&value); err != nil || value == nil {
+	err := decoder.Decode(&value)
+	if err == io.EOF && allowEmpty {
+		return nil, nil
+	}
+	if err != nil || value == nil {
 		return nil, invalidRequest()
 	}
 	var extra any

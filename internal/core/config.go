@@ -169,6 +169,12 @@ func ParseConfig(env map[string]string) (Config, error) {
 	if c.TikTokMethod == "app" && c.DBURL == "" {
 		return c, ConfigError("DB_URL")
 	}
+	c.LogLevel = strings.ToUpper(strings.TrimSpace(c.LogLevel))
+	switch c.LogLevel {
+	case "DEBUG", "INFO", "WARN", "WARNING", "ERROR", "CRITICAL":
+	default:
+		return c, ConfigError("LOG_LEVEL")
+	}
 	c.TelegramAPIBaseURL = strings.TrimRight(strings.TrimSpace(c.TelegramAPIBaseURL), "/")
 	telegramURL, err := url.Parse(c.TelegramAPIBaseURL)
 	if err != nil || (telegramURL.Scheme != "https" && telegramURL.Scheme != "http") || telegramURL.Hostname() == "" || telegramURL.RawQuery != "" || telegramURL.Fragment != "" {

@@ -1,5 +1,11 @@
 # Go project verification
 
+## Review compatibility fixes (2026-10-14)
+
+Four focused regressions failed on `9c3f49b` before the fixes: an adaptive one-second video muxed with three-second audio produced a three-second MP4; invalid log levels were accepted; an empty chunked preparation POST returned 422; and a 540×960 download was returned under 1080×1920 metadata without trying its fallback.
+
+Muxing now uses `-shortest`, configuration normalizes and validates supported log levels, preparation accepts EOF for its optional body, and normalized video assets carry the selected dimensions into the existing download check. The checks use real FFmpeg output, actual chunked HTTP transport, and app/web extraction-to-download fallbacks. They also verify retained authentication, required JSON bodies on other endpoints, malformed/oversized body rejection, both muxed streams, byte caps, and temporary-file cleanup. No CDN quality probes were added. Focused race tests and the complete PostgreSQL-backed `make check` passed.
+
 ## Shared app-media preparation (2026-10-14)
 
 App Telegram delivery now shares one identity lease across related media. Video and thumbnail download together; slideshows use four preparation workers by default. One checkpoint follows preparation, and the lease is released before Telegram upload. Identity waiters acquire no download permits. `TELEGRAM_PREPARATION_CONCURRENCY` controls per-delivery workers; existing download, conversion, pipeline, upload, and queue limits remain in force. tt-bot continues to own persisted video information; no media or video-info database cache was added.

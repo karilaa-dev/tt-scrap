@@ -163,7 +163,7 @@ func (d *Downloader) downloadAsset(ctx context.Context, asset core.AssetContext,
 			os.Remove(path)
 		}
 	}()
-	args := []string{"-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", video.Path, "-i", audio.Path, "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-movflags", "+faststart"}
+	args := []string{"-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", video.Path, "-i", audio.Path, "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-shortest", "-movflags", "+faststart"}
 	args = append(args, path)
 	command := exec.CommandContext(ctx, "ffmpeg", args...)
 	if e = command.Run(); e != nil {

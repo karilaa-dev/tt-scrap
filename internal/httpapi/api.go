@@ -207,7 +207,7 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) (response, error
 	var body fields
 	var err error
 	if r.Method == "POST" && (path != preparationPath || r.ContentLength != 0) {
-		body, err = readBody(w, r)
+		body, err = readBody(w, r, path == preparationPath)
 		if err != nil {
 			return response{}, err
 		}

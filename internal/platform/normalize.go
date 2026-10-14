@@ -79,6 +79,8 @@ func (t *TikTok) normalize(ctx context.Context, data object, base core.AssetCont
 	asset.AlternateURLs = selected.URLs[1:]
 	asset.ContentType = "video/mp4"
 	asset.DurationSeconds = duration
+	asset.ExpectedWidth = selected.Width
+	asset.ExpectedHeight = selected.Height
 	if len(selected.AudioURLs) > 0 {
 		asset.Audio = &core.AuxiliaryAsset{UpstreamURL: selected.AudioURLs[0], AlternateURLs: selected.AudioURLs[1:], ContentType: "audio/mp4", Cookies: base.Cookies}
 	}

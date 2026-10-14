@@ -1,6 +1,9 @@
 package core
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestTelegramBaseURLValidationAndNormalization(t *testing.T) {
 	for _, test := range []struct{ input, want string }{
@@ -20,6 +23,24 @@ func TestTelegramBaseURLValidationAndNormalization(t *testing.T) {
 			}
 		} else if err != nil || cfg.TelegramAPIBaseURL != test.want {
 			t.Errorf("base URL %q: got %q, error %v; want %q", test.input, cfg.TelegramAPIBaseURL, err, test.want)
+		}
+	}
+}
+
+func TestLogLevelValidationAndNormalization(t *testing.T) {
+	for _, test := range []struct{ input, want string }{
+		{"debug", "DEBUG"}, {" INFO ", "INFO"}, {"wArN", "WARN"},
+		{" warning ", "WARNING"}, {"error", "ERROR"}, {" critical ", "CRITICAL"},
+		{"", ""}, {"  ", ""}, {"ERORR", ""}, {"TRACE", ""}, {"FATAL", ""},
+	} {
+		env := map[string]string{"TT_SCRAP_API_KEY": "test-key-sixteen-characters", "TIKTOK_METHOD": "web", "LOG_LEVEL": test.input}
+		cfg, err := ParseConfig(env)
+		if test.want == "" {
+			if err == nil || !strings.Contains(err.Error(), "LOG_LEVEL") {
+				t.Errorf("invalid log level %q did not fail startup: %v", test.input, err)
+			}
+		} else if err != nil || cfg.LogLevel != test.want {
+			t.Errorf("log level %q: got %q, error %v; want %q", test.input, cfg.LogLevel, err, test.want)
 		}
 	}
 }

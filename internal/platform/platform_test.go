@@ -528,7 +528,7 @@ func TestSeparateAudioMuxPreservesBothStreamsAndRejectsOversize(t *testing.T) {
 	}
 	dir := t.TempDir()
 	videoPath, audioPath := filepath.Join(dir, "video.mp4"), filepath.Join(dir, "audio.m4a")
-	commands := [][]string{{"-nostdin", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=32x24:r=1:d=1", "-an", "-c:v", "libx264", "-threads", "1", "-movflags", "+faststart", videoPath}, {"-nostdin", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "1", "-c:a", "aac", "-threads", "1", audioPath}}
+	commands := [][]string{{"-nostdin", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=32x24:r=1:d=1", "-an", "-c:v", "libx264", "-threads", "1", "-movflags", "+faststart", videoPath}, {"-nostdin", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "3", "-c:a", "aac", "-threads", "1", audioPath}}
 	for _, args := range commands {
 		if out, err := exec.Command("ffmpeg", args...).CombinedOutput(); err != nil {
 			t.Fatalf("fixture: %v %s", err, out)
@@ -568,6 +568,14 @@ func TestSeparateAudioMuxPreservesBothStreamsAndRejectsOversize(t *testing.T) {
 	out, err := exec.Command("ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", file.Path).Output()
 	if err != nil || !strings.Contains(string(out), "video") || !strings.Contains(string(out), "audio") {
 		t.Fatal(string(out), err)
+	}
+	out, err = exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file.Path).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	duration, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil || duration < 0.9 || duration > 1.25 {
+		t.Fatalf("one-second video with three-second audio muxed to %v seconds: %v", duration, err)
 	}
 	if file.Width != 32 || file.Height != 24 {
 		t.Fatal(file)
@@ -748,5 +756,66 @@ func TestFailedDownloadReturnsByteBudgetBeforeFallback(t *testing.T) {
 	files, err := os.ReadDir(cfg.TempDir)
 	if err != nil || len(files) != 0 {
 		t.Fatal("fallback leaked files", files, err)
+	}
+}
+
+func TestSelectedRenditionDimensionsValidateDownloadedFallbacks(t *testing.T) {
+	for _, app := range []bool{true, false} {
+		t.Run(fmt.Sprintf("app=%t", app), func(t *testing.T) {
+			var mismatches, matches atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/match" {
+					matches.Add(1)
+					w.Write(testVideo(1080, 1920))
+				} else {
+					mismatches.Add(1)
+					w.Write(testVideo(540, 960))
+				}
+			}))
+			defer server.Close()
+			cfg := testConfig()
+			cfg.TempDir = t.TempDir()
+			assets := core.NewAssets(time.Minute, 100)
+			backend := &fakeApp{server: server.URL}
+			service := NewTikTok(cfg, assets, backend, nil)
+			defer service.Close()
+			downloader := NewDownloader(cfg, backend, nil)
+			defer downloader.Close()
+			for _, fallback := range []string{"/match", "/mismatch-again"} {
+				data := object{"video": object{"width": 1080, "height": 1920}}
+				base := core.AssetContext{Platform: "tiktok"}
+				sources := []any{server.URL + "/mismatch", server.URL + fallback}
+				if app {
+					obj(data["video"])["play_addr"] = object{"width": 1080, "height": 1920, "url_list": sources}
+					base.IdentityID = "sticky"
+				} else {
+					obj(data["video"])["playAddr"] = object{"Width": 1080, "Height": 1920, "UrlList": sources}
+				}
+				post, err := service.normalize(context.Background(), data, base, core.TikTokResolution{SourceID: "123"}, app)
+				if err != nil {
+					t.Fatal(err)
+				}
+				asset, err := assets.GetAsset(post.Media[0].AssetID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				file, err := downloader.Download(context.Background(), asset, 0)
+				if fallback == "/match" {
+					if err != nil || file.Width != 1080 || file.Height != 1920 {
+						t.Errorf("did not return matching fallback: file=%+v error=%v", file, err)
+					}
+				} else if err == nil {
+					t.Error("accepted a video that does not match advertised dimensions")
+				}
+				file.Cleanup()
+			}
+			if mismatches.Load() != 3 || matches.Load() != 1 {
+				t.Errorf("fallbacks not validated: mismatches=%d matches=%d", mismatches.Load(), matches.Load())
+			}
+			files, err := os.ReadDir(cfg.TempDir)
+			if err != nil || len(files) != 0 {
+				t.Fatal("rendition validation leaked files", files, err)
+			}
+		})
 	}
 }
