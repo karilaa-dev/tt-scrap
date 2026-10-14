@@ -19,8 +19,11 @@ func normalizedHost(u *url.URL) string {
 	return strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
 }
 
-// tt.site is TikTok's share-link domain; its links redirect to tiktok.com.
-func shareHost(host string) bool { return host == "tt.site" || host == "www.tt.site" }
+// tt.site is TikTok's share-link domain; its /t/ links redirect to tiktok.com.
+// Other paths there are not posts, so their embedded IDs are never trusted.
+func shareLink(host, path string) bool {
+	return (host == "tt.site" || host == "www.tt.site") && strings.HasPrefix(path, "/t/")
+}
 
 func validTikTokURL(raw string) bool {
 	u, e := url.Parse(raw)
@@ -28,7 +31,7 @@ func validTikTokURL(raw string) bool {
 		return false
 	}
 	host := normalizedHost(u)
-	return u.Scheme == "https" && (host == "tiktok.com" || strings.HasSuffix(host, ".tiktok.com") || shareHost(host)) && u.User == nil
+	return u.Scheme == "https" && (host == "tiktok.com" || strings.HasSuffix(host, ".tiktok.com") || shareLink(host, u.Path)) && u.User == nil
 }
 
 // Share links are served from www.tt.site; the apex host fails TLS handshakes.

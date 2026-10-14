@@ -75,13 +75,15 @@ func TestTTSiteShareLinkResolvesThroughWWWHost(t *testing.T) {
 	}
 }
 
-func TestShareHostRejectsLookalikesWithoutRequests(t *testing.T) {
+func TestShareHostRejectsLookalikesAndNonShareLinksWithoutRequests(t *testing.T) {
 	for _, raw := range []string{
 		"https://www.tt.site.example.com/t/ZSboJ1v8D/",
 		"https://xtt.site/t/ZSboJ1v8D/",
 		"https://m.tt.site/t/ZSboJ1v8D/",
 		"http://www.tt.site/t/ZSboJ1v8D/",
 		"https://user@www.tt.site/t/ZSboJ1v8D/",
+		"https://www.tt.site/video/7685286340551855380",
+		"https://tt.site/@creator/photo/7685286340551855380",
 	} {
 		t.Run(raw, func(t *testing.T) {
 			var calls atomic.Int32
