@@ -11,7 +11,6 @@
 /bin/
 /out
 /tt-scrap
-/bench-api
 *.test
 *.pprof
 *.trace

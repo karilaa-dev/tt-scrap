@@ -24,4 +24,4 @@ RAM caches and asset tokens restart with the process. Request fresh metadata aft
 
 ## Roll back
 
-Keep the previous image and configuration until verification finishes. Stop Go before starting the previous app implementation against its database. The `scrap_*` tables are separate from older application tables; do not drop unrelated tables. The Python release at `v1.3.5` remains in Git history. The later Python app reference and comparison tools were archived locally outside the Go repository during this migration.
+Keep the previous image and configuration until verification finishes. Stop Go before starting the previous app implementation against its database. The `scrap_*` tables are separate from older application tables; do not drop unrelated tables. The Python release at `v1.3.5` remains in Git history.

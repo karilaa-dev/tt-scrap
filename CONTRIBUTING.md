@@ -43,7 +43,6 @@ HTTP tests use local fixtures. Live tests require explicit `TT_SCRAP_LIVE_APP=1`
 | `internal/tiktokapp` | Native registration, signing, app requests, and device catalog |
 | `internal/nettransport` | Shared HTTP transports and explicit proxies |
 | `internal/media` | Images, animation, and native HEIF decoding |
-| `cmd/bench-api` | Isolated HTTP measurement for prepared app requests |
 | `openapi.json` | Embedded public API contract |
 
 ## Measure performance
@@ -54,10 +53,4 @@ make bench
 
 Signing benchmarks run locally. Extraction benchmarks require the test database URL and use local HTTP fixtures with isolated database schemas. They exercise concurrency 1, 4, and 16. `BenchmarkAppDelivery` also exercises the complete Telegram delivery handler at concurrency 1, 16, and 64, with cached metadata, real PostgreSQL checkpoints, a controlled CDN delay, and local multipart uploads whose bytes are verified. It excludes identity generation and signing. These measurements describe local work and simulated upstream waits, not TikTok capacity. Use repeated trials before reporting changes. Keep registration and seed renewal outside upstream-API measurements.
 
-`go build -o bin/bench-api ./cmd/bench-api` builds the optional Linux HTTP executor. It reads newline-delimited JSON commands from stdin and writes correlated replies to stdout. Send `init` with `id`, `proxy`, `concurrency`, and `requestTimeoutMs`; then send `execute` with `id`, `concurrency`, and `requests`. Each request contains `source_id`, `url`, and `headers` as an array of name/value pairs. Wait for the reply before sending `shutdown`. The executor consumes and validates complete response bodies, reports HTTP and validation time separately, and does not register identities, sign requests, or use the database. Prepared URLs and headers can contain credentials; keep executor input and output private.
-
-Historical measurements and their limitations are in the [Go/Python comparison](docs/go-python-comparison.md) and [app optimization report](docs/go-app-optimization.md). To inspect a compressed artifact:
-
-```sh
-gzip -dc docs/benchmarks/go-app-optimization-live.json.gz > /tmp/tt-scrap-measurement.json
-```
+Write benchmark output outside the repository, for example `/tmp/tt-scrap-bench.txt`.

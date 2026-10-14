@@ -57,19 +57,15 @@ curl http://localhost:8000/v1/tiktok/identities/preparations \
 
 POST returns `202` for a running job or `200` when the pool is already prepared. GET returns `state`, `proxies`, `target`, `ready`, `failed`, and timestamps. Repeated POSTs share one job; polling reads RAM only. Failed slots receive up to three paced attempts per run; later calls or restarts reuse saved progress. A failed startup does not open the API port. Both operations return `503` in web mode. Ten proxy addresses mean ten workers and 100 identities, even when their gateway hostname is shared.
 
-
 ## Throughput and memory
 
 Upstream connections are pooled and reused. Matching metadata requests share work. Downloads and Telegram multipart uploads stream through temporary files without buffering entire videos in RAM. App deliveries share one identity lease across video, thumbnail, and slideshow downloads, with one database checkpoint after preparation. Identity waits do not occupy download slots. Each adaptive video/audio track uses its own download slot; a limit of one serializes the tracks. Muxing takes one slot after both tracks finish. Media retries use exponential delay plus up to 10% jitter within the download deadline. Native image conversions have a separate concurrency bound. Queues are bounded, and cancellation propagates through network calls and preparation.
 
-App video selection uses only API metadata: highest pixel resolution, then frame rate, then bitrate. Extraction makes no CDN quality-probe requests. Download validation still inspects the actual downloaded file. Protocol clients and cookie jars stay in RAM across operations. The [app optimization comparison](docs/go-app-optimization.md) describes the earlier build with probes; those measurements do not measure the current selection path.
+App video selection uses only API metadata: highest pixel resolution, then frame rate, then bitrate. Extraction makes no CDN quality-probe requests. Download validation still inspects the actual downloaded file. Protocol clients and cookie jars stay in RAM across operations.
 
 Tune `EXTRACTION_CONCURRENCY`, `DOWNLOAD_CONCURRENCY`, `HTTP_MAX_CONNECTIONS`, `MAX_QUEUED_REQUESTS`, and Telegram concurrency limits for the number of proxies and available memory. `TELEGRAM_PREPARATION_CONCURRENCY` defaults to four media items per delivery (thumbnails run alongside), so a large album cannot create a worker for every image. `TELEGRAM_PIPELINE_CONCURRENCY` bounds whole deliveries and `TELEGRAM_UPLOAD_CONCURRENCY` bounds uploads. `IMAGE_CONVERSION_WORKERS` controls simultaneous decoded images. `MAX_ASSET_BYTES` limits downloads; `GOMEMLIMIT` provides an optional Go heap budget. Request IDs, timings, status codes, and byte counts are logged as JSON. Telegram delivery logs also include the outcome, failed stage, planned/attempted/successful batch counts, and safe error codes. HTTP 200 rejections and partial deliveries produce warnings; HTTP 5xx failures produce errors. Payloads, captions, chat IDs, and bot tokens are excluded from these delivery fields.
 
 `CACHE_MAX_ENTRIES` is the total retained-entry budget: each of six response caches receives one twelfth, and asset references receive the remainder. The default 10,000 allows 5,002 asset references and 833 entries per response cache. The independent caches keep separate locks; unused capacity in one partition is not borrowed by another. Active metadata requests retain their separate queue limit. Reused music responses expire no later than their original asset URLs.
-
-The [18-minute Go/Python comparison](docs/go-python-comparison.md) measured substantially lower Go CPU and memory use, with close, network-dependent end-to-end latency. It covers metadata, downloads, both consecutively, and isolated API requests with signing excluded, at concurrency one and four. See [verification results](docs/go-verification.md) for race tests, real downloads and container checks.
-
 
 ## Verify
 
@@ -90,8 +86,8 @@ The container runs as an unprivileged user and includes the Go binary, FFmpeg, a
 
 `DB_URL` must be reachable from the container. A host-only `127.0.0.1` address refers to the container itself: join the database's Docker network and use its service hostname, or configure a host gateway. The base Compose file uses saved database proxies without a file mount. To import `proxies.txt`, use `docker compose -f docker-compose.yml -f compose.proxies.yml up --build -d`. For a new app database, provide that file or explicitly set `PROXY_INCLUDE_HOST=true`. Leave `PROXY_FILE` unset when using only saved database proxies. For web cookies, mount the file and point `YTDLP_COOKIES` to its container path.
 
-`railpack.json` selects the Go provider and a CGO build with libheif. The package settings follow the [Railpack Go](https://railpack.com/languages/golang/) and [configuration](https://railpack.com/config/file/) documentation. Docker provides the reproducible deployment path for the native codec dependencies.
+`railpack.json` defines the CGO server build and native media packages. Railpack detects Go and its version from `go.mod` and supplies the default `./out` start command. The package settings follow the [Railpack Go](https://railpack.com/languages/golang/) and [configuration](https://railpack.com/config/file/) documentation. Docker provides the reproducible deployment path for the native codec dependencies.
 
 ## Migrate from the Python release
 
-Read the [migration notes](docs/migration.md) before replacing an existing deployment. They cover the app default, PostgreSQL ownership, retained configuration names, and rollback. Historical cross-runtime results remain in `docs`; runtime code and development tooling use Go.
+Read the [migration notes](docs/migration.md) before replacing an existing deployment. They cover the app default, PostgreSQL ownership, retained configuration names, and rollback.
