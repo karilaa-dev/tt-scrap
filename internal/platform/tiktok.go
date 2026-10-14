@@ -273,6 +273,9 @@ func (t *TikTok) fetchWebWithClient(ctx context.Context, client *http.Client, pr
 			return nil, core.AssetContext{}, statusError(res.StatusCode, "TikTok webpage")
 		}
 		if res.Request.URL.Path == "/login" {
+			if restriction != nil {
+				return nil, core.AssetContext{}, restriction
+			}
 			return nil, core.AssetContext{}, core.NewError("content_private", "TikTok requires login for this content", 403)
 		}
 		detail, status, parseErr := ParseWebDetail(body, id)

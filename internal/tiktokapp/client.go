@@ -1,11 +1,13 @@
 package tiktokapp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -76,9 +78,9 @@ func ClassifyFailure(status, appStatus int, message string, blocked bool, retry 
 		e.Code = "upstream_unavailable"
 	case status == 404:
 		e.Code = "content_deleted"
-	case appStatus == 10216 || appStatus == 10222:
+	case !blocked && (appStatus == 10216 || appStatus == 10222):
 		e.Code = "content_private"
-	case appStatus == 10204:
+	case !blocked && appStatus == 10204:
 		e.Code = "region_blocked"
 	case identityFailurePattern.MatchString(message):
 		e.Code = "identity_rejected"
@@ -615,8 +617,22 @@ func (c *Client) MediaRequestWithAccount(ctx context.Context, address string, he
 	if err != nil {
 		return nil, err
 	}
-	if response.StatusCode >= 400 || response.Header.Get("tt_block") != "" {
+	contentType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
+	jsonBody := contentType == "application/json" || strings.HasSuffix(contentType, "+json")
+	if response.StatusCode == http.StatusOK && !jsonBody && response.Header.Get("tt_block") == "" {
+		reader := bufio.NewReaderSize(response.Body, 512)
+		prefix, _ := reader.Peek(512)
+		response.Body = struct {
+			io.Reader
+			io.Closer
+		}{reader, response.Body}
+		jsonBody = bytes.HasPrefix(bytes.TrimSpace(prefix), []byte("{"))
+	}
+	if response.StatusCode >= 400 || response.Header.Get("tt_block") != "" || jsonBody {
 		_, err = jsonResponseBounded(response, 256<<10)
+		if err == nil {
+			err = &UpstreamError{Code: "upstream_invalid_response", Recovery: RecoveryNone, HTTPStatus: response.StatusCode}
+		}
 		return nil, err
 	}
 	return response, nil

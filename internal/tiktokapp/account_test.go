@@ -43,6 +43,8 @@ func TestAccountCookiesAreRequestScoped(t *testing.T) {
 				header.Add("Set-Cookie", "authenticated_only=private; Domain=.tiktokv.com; Path=/; Secure")
 			}
 			return testResponse(200, []byte(`{"aweme_detail":{"aweme_id":"1234567890123456789"}}`), header), nil
+		case "/aweme/v1/play/":
+			return testResponse(200, []byte("media bytes"), nil), nil
 		default:
 			return testResponse(200, []byte(`{"status_code":0}`), nil), nil
 		}

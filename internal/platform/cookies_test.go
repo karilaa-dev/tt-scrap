@@ -105,6 +105,7 @@ func TestWebAccountRejectionPreservesRestrictionWithoutRetries(t *testing.T) {
 			code             string
 			publicStatus     int
 		}{
+			{302, 1, restriction.code, restriction.status},
 			{401, 1, restriction.code, restriction.status},
 			{403, 1, restriction.code, restriction.status},
 			{404, 1, "content_deleted", 404},
@@ -112,8 +113,13 @@ func TestWebAccountRejectionPreservesRestrictionWithoutRetries(t *testing.T) {
 			{503, 3, "upstream_network_error", 502},
 		} {
 			t.Run(fmt.Sprintf("%s/%d", restriction.name, accountResponse.status), func(t *testing.T) {
-				var anonymous, authenticated atomic.Int32
+				var anonymous, authenticated, logins atomic.Int32
 				service := resolutionFixture(t, "web", func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/login" {
+						logins.Add(1)
+						fmt.Fprint(w, "Sign in to TikTok")
+						return
+					}
 					cookie, err := r.Cookie("sessionid")
 					if err == http.ErrNoCookie {
 						anonymous.Add(1)
@@ -123,6 +129,10 @@ func TestWebAccountRejectionPreservesRestrictionWithoutRetries(t *testing.T) {
 					authenticated.Add(1)
 					if err != nil || cookie.Value != "web-login" {
 						t.Error("web fallback missing configured account cookie")
+					}
+					if accountResponse.status == http.StatusFound {
+						http.Redirect(w, r, "/login?redirect_url=video", http.StatusFound)
+						return
 					}
 					w.WriteHeader(accountResponse.status)
 					fmt.Fprint(w, http.StatusText(accountResponse.status))
@@ -136,6 +146,9 @@ func TestWebAccountRejectionPreservesRestrictionWithoutRetries(t *testing.T) {
 				}
 				if anonymous.Load() != int32(accountResponse.attempts) || authenticated.Load() != int32(accountResponse.attempts) {
 					t.Errorf("anonymous=%d authenticated=%d, want %d each", anonymous.Load(), authenticated.Load(), accountResponse.attempts)
+				}
+				if accountResponse.status == http.StatusFound && logins.Load() != 1 {
+					t.Errorf("login redirects=%d, want 1", logins.Load())
 				}
 			})
 		}

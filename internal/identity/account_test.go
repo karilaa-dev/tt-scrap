@@ -60,6 +60,7 @@ func TestDetailUsesAccountOnlyForContentRestrictions(t *testing.T) {
 		status, calls int
 		without       bool
 		persistent    bool
+		blocked       bool
 		wantError     bool
 	}{
 		{name: "public", body: `{"aweme_detail":{"aweme_id":"7695962883523464478"}}`, status: 200, calls: 1},
@@ -74,6 +75,9 @@ func TestDetailUsesAccountOnlyForContentRestrictions(t *testing.T) {
 		{name: "rate limited", body: `{"status_code":1}`, status: 429, calls: 1, wantError: true},
 		{name: "server failure", body: `{"status_code":1}`, status: 503, calls: 1, wantError: true},
 		{name: "challenge", body: `{"status_code":1,"status_msg":"challenge required"}`, status: 403, calls: 1, wantError: true},
+		{name: "blocked private post", body: `{"status_code":10216}`, status: 200, calls: 1, blocked: true, wantError: true},
+		{name: "blocked private account", body: `{"status_code":10222}`, status: 200, calls: 1, blocked: true, wantError: true},
+		{name: "blocked region", body: `{"status_code":10204}`, status: 200, calls: 1, blocked: true, wantError: true},
 		{name: "deleted", body: `{}`, status: 404, calls: 1, wantError: true},
 		{name: "empty unknown detail", body: `{"status_code":0}`, status: 200, calls: 1, wantError: true},
 	} {
@@ -99,7 +103,11 @@ func TestDetailUsesAccountOnlyForContentRestrictions(t *testing.T) {
 						if err == nil {
 							t.Error("first request was authenticated")
 						}
-						return fixtureResponse(tc.status, []byte(tc.body)), nil
+						response := fixtureResponse(tc.status, []byte(tc.body))
+						if tc.blocked {
+							response.Header.Set("tt_block", "1")
+						}
+						return response, nil
 					}
 					if err != nil || cookie.Value != "fallback-login" {
 						t.Error("fallback missing account")
@@ -115,6 +123,17 @@ func TestDetailUsesAccountOnlyForContentRestrictions(t *testing.T) {
 			_, err := p.Detail(context.Background(), "7695962883523464478")
 			if (err != nil) != tc.wantError || calls != tc.calls {
 				t.Fatalf("calls=%d want=%d error=%v", calls, tc.calls, err)
+			}
+			if tc.blocked {
+				var failure *core.Error
+				if !errors.As(err, &failure) || failure.Code != "upstream_extraction_error" {
+					t.Fatal("bot block was treated as a content restriction", err)
+				}
+				for _, entry := range p.entries {
+					if entry.health.Failures != 1 || entry.health.CooldownUntil == 0 {
+						t.Error("blocked identity did not enter cooldown")
+					}
+				}
 			}
 			var leaked bool
 			if err := db.QueryRow(context.Background(), "SELECT EXISTS(SELECT 1 FROM "+p.identitiesTable+" WHERE session::text LIKE '%fallback-login%' OR session::text LIKE '%account-response%')").Scan(&leaked); err != nil || leaked {
@@ -158,7 +177,14 @@ func TestRestrictedAppMediaFallbackIsIsolatedAcrossBatch(t *testing.T) {
 			if id == "restricted" && err != nil {
 				return fixtureResponse(403, []byte(`{"status_code":1,"status_msg":"Age restricted"}`)), nil
 			}
-			if id == "restricted" && cookie.Value != "media-login" {
+			if (id == "restricted-json" || id == "restricted-sniffed") && err != nil {
+				response := fixtureResponse(200, []byte(" \n"+`{"status_code":10216}`))
+				if id == "restricted-json" {
+					response.Header.Set("Content-Type", "application/json; charset=utf-8")
+				}
+				return response, nil
+			}
+			if strings.HasPrefix(id, "restricted") && (err != nil || cookie.Value != "media-login") {
 				t.Error("media fallback missing account")
 			}
 			return fixtureResponse(200, []byte("media bytes")), nil
@@ -170,7 +196,7 @@ func TestRestrictedAppMediaFallbackIsIsolatedAcrossBatch(t *testing.T) {
 	}
 	err = p.WithMedia(context.Background(), result.IdentityID, func(open core.OpenAppMedia) error {
 		var wg sync.WaitGroup
-		for _, id := range []string{"restricted", "public"} {
+		for _, id := range []string{"restricted", "restricted-json", "restricted-sniffed", "public"} {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -189,7 +215,7 @@ func TestRestrictedAppMediaFallbackIsIsolatedAcrossBatch(t *testing.T) {
 		wg.Wait()
 		return nil
 	})
-	if err != nil || attempts["restricted"] != 2 || attempts["public"] != 1 {
+	if err != nil || attempts["restricted"] != 2 || attempts["restricted-json"] != 2 || attempts["restricted-sniffed"] != 2 || attempts["public"] != 1 {
 		t.Fatal("incorrect media fallback attempts", err, attempts)
 	}
 }

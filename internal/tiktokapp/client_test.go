@@ -358,6 +358,91 @@ func TestMediaFailureRetainsReasonAndRetryAfter(t *testing.T) {
 	}
 }
 
+type trackedMediaBody struct {
+	io.ReadCloser
+	read   int
+	closed bool
+}
+
+func (b *trackedMediaBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.read += n
+	return n, err
+}
+
+func (b *trackedMediaBody) Close() error {
+	b.closed = true
+	return b.ReadCloser.Close()
+}
+
+func TestMediaHTTP200JSONFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, contentType, body, blocked, code string
+	}{
+		{"private", "application/json", `{"status_code":10216}`, "", "content_private"},
+		{"age", "application/json; charset=utf-8", `{"status_code":1,"status_msg":"Age restricted"}`, "", "content_restricted"},
+		{"region untyped", "", " \n" + `{"status_code":10204}`, "", "region_blocked"},
+		{"octet stream", "application/octet-stream", `{"status_code":10222}`, "", "content_private"},
+		{"json suffix", "application/problem+json", `{"status_code":10216}`, "", "content_private"},
+		{"no error status", "application/json", `{"status_code":0}`, "", "upstream_invalid_response"},
+		{"malformed", "application/json", `{`, "", "upstream_invalid_response"},
+		{"oversized", "application/json", `{"padding":"` + strings.Repeat("x", 300<<10) + `"}`, "", "upstream_invalid_response"},
+		{"blocked private post", "application/json", `{"status_code":10216}`, "1", "upstream_blocked"},
+		{"blocked private account", "application/json", `{"status_code":10222}`, "1", "upstream_blocked"},
+		{"blocked region", "application/json", `{"status_code":10204}`, "1", "upstream_blocked"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := &trackedMediaBody{ReadCloser: io.NopCloser(strings.NewReader(tc.body))}
+			client := NewClient(registeredTestSession(t), doerFunc(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {tc.contentType}, "Tt_block": {tc.blocked}}, Body: body}, nil
+			}))
+			response, err := client.MediaRequest(context.Background(), "https://api19-va.tiktokv.com/aweme/v1/play/", nil)
+			if response != nil {
+				defer response.Body.Close()
+			}
+			var failure *UpstreamError
+			if response != nil || !errors.As(err, &failure) || failure.Code != tc.code || failure.Recovery != RecoveryNone {
+				t.Errorf("media error=%v, want %s with no identity recovery", err, tc.code)
+			}
+			if !body.closed || body.read > (256<<10)+1 {
+				t.Errorf("JSON body closed=%t read=%d, want closed with bounded reads", body.closed, body.read)
+			}
+		})
+	}
+}
+
+func TestMediaDetectionPreservesStreamingBody(t *testing.T) {
+	for _, tc := range []struct {
+		name, contentType, prefix string
+		status                    int
+	}{
+		{"video", "video/mp4", "\x00\x00\x00\x18ftyp", 200},
+		{"untyped", "", "\x00\x00\x00\x18ftyp", 200},
+		{"octet stream", "application/octet-stream", "\x00\x00\x00\x18ftyp", 200},
+		{"partial", "application/octet-stream", `{"status_code":10216}`, 206},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := tc.prefix + strings.Repeat("media", 10000)
+			body := &trackedMediaBody{ReadCloser: io.NopCloser(strings.NewReader(payload))}
+			client := NewClient(registeredTestSession(t), doerFunc(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: tc.status, Header: http.Header{"Content-Type": {tc.contentType}}, Body: body}, nil
+			}))
+			response, err := client.MediaRequest(context.Background(), "https://api19-va.tiktokv.com/aweme/v1/play/", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if body.closed || body.read > 512 {
+				t.Errorf("media was closed or buffered beyond its prefix: closed=%t read=%d", body.closed, body.read)
+			}
+			got, err := io.ReadAll(response.Body)
+			closeErr := response.Body.Close()
+			if err != nil || closeErr != nil || string(got) != payload || !body.closed {
+				t.Fatal("media bytes or body lifecycle changed", err, closeErr)
+			}
+		})
+	}
+}
+
 func TestRegisteredSessionSerializesEmptyDeviceTokenForPythonCompatibility(t *testing.T) {
 	session := registeredTestSession(t)
 	session.Identity.DeviceToken = ""
