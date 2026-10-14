@@ -118,3 +118,22 @@ The next review's three code findings were also reproduced and fixed:
 | All URL routes enforce the original 2,083-byte input limit before parsing or caching | `TestURLLengthLimitAcrossPublicRoutes` |
 
 Slideshow assets still take separate exclusive leases; waiting for a lease no longer consumes the transfer budget. URL length behavior, including whitespace and UTF-8 input, was checked against the archived Python `HttpUrl` validator. The full clean-export `make check` passed again with disposable PostgreSQL 18, as did the production Docker build. The built container passed readiness, its built-in health check, unchanged OpenAPI, the 2,083/2,084-byte URL boundary, and graceful shutdown. These checks used fixtures and direct-ID resolution without contacting TikTok, Instagram, or Telegram.
+
+
+## Concurrency and operational review follow-up
+
+The follow-up fixes cover seven distinct issues across eight review threads:
+
+| Behavior | Regression check |
+| --- | --- |
+| A DB probe receives its full timeout after waiting for checkpoints; real connection failures still fail | `TestDatabaseProbeTimeoutExcludesCheckpointQueue` |
+| Preparation waits for identity/proxy cooldowns without burning immediate retries, and shutdown cancels the wait | `TestPreparationRetriesAfterIdentityCooldown`, `TestPreparationWaitsForProxyCooldownAndShutdownCancelsWait` |
+| Media retries double their delay, add jitter, and respect the total deadline | `TestMediaRetriesUseExponentialJitterAndHonorDeadline` |
+| Mixed platform traffic shares the configured total cache budget without reducing active request capacity | `TestMixedPlatformCachesRespectTotalEntryBudget`, `TestResponseCacheCapacityDoesNotLimitConcurrentFlights` |
+| Adaptive tracks respect the global transfer limit; one slot still completes both tracks and muxes | `TestAdaptiveTracksRespectGlobalDownloadConcurrency`, `TestSeparateAudioMuxPreservesBothStreamsAndRejectsOversize` |
+| A reused music response expires with its assets and triggers fresh metadata afterward | `TestMusicCacheNeverOutlivesReusedAssets` |
+| Successful, rejected, partial, and failed deliveries log safe outcomes and the appropriate severity | `TestDeliveryRequestEventsPreserveOutcomesWithoutPayloads`, `TestRequestLogLevelsReflectDeliveryOutcome` |
+
+Before the fixes, the mixed-cache fixture retained 707 entries against a total budget of 101. Adaptive downloads opened 2, 4, and 6 concurrent transfers with limits of 1, 2, and 3. A music response requested 50 seconds after extraction still returned expired asset URLs at second 61. These are correctness fixtures, not throughput measurements. Delivery tests preserve HTTP response bodies and exercise an interrupted second album batch as well as HTTP 200 `ok:false` and HTTP 207 responses, without sending Telegram messages.
+
+After these fixes, `make check` passed against isolated PostgreSQL 18, including all race tests, vet, formatting, module consistency, and the release build. The rebuilt dev server reused all 100 identities with three startup reads and zero writes, passed readiness and its built-in health check, and served byte-identical OpenAPI on port 8000. No new WAN performance measurements or real Telegram uploads were run.

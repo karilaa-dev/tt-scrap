@@ -321,7 +321,7 @@ func TestInstagramProviderCarouselAndCoalescing(t *testing.T) {
 }
 
 func TestCanceledMetadataWaiterDoesNotCancelLeader(t *testing.T) {
-	m := newMemo[int](time.Minute, 10)
+	m := newMemo[int](time.Minute, 10, 10)
 	entered := make(chan struct{})
 	finish := make(chan struct{})
 	done := make(chan int)
@@ -580,6 +580,14 @@ func TestSeparateAudioMuxPreservesBothStreamsAndRejectsOversize(t *testing.T) {
 	if file.Width != 32 || file.Height != 24 {
 		t.Fatal(file)
 	}
+	cfg.DownloadConcurrency = 1
+	serial := NewDownloader(cfg, nil, nil)
+	defer serial.Close()
+	serialized, err := serial.Download(context.Background(), asset, 0)
+	if err != nil {
+		t.Fatal("one transfer slot must serialize both tracks and still mux", err)
+	}
+	serialized.Cleanup()
 	_, err = downloader.Download(context.Background(), asset, int64(max(len(video), len(audio))))
 	var api *core.Error
 	if !errors.As(err, &api) || api.Code != "asset_too_large" {

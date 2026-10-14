@@ -234,14 +234,14 @@ func TestPreparationFailureIsRetryableAndCloseCancelsWorkers(t *testing.T) {
 func TestPreparationRetriesAfterIdentityCooldown(t *testing.T) {
 	cfg, _ := testDatabase(t)
 	p := openTestPool(t, cfg, "")
-	p.preparationDelay = 150 * time.Millisecond
+	p.preparationDelay = 10 * time.Millisecond
 	fixture := newProtocolFixture(t, "", 200)
 	failed := false
 	p.clientFactory = func(s *tiktokapp.Session, _ *http.Client) *tiktokapp.Client {
 		return tiktokapp.NewClient(s, fixtureDoer(func(r *http.Request) (*http.Response, error) {
 			if !failed {
 				failed = true
-				return nil, &tiktokapp.UpstreamError{Code: "upstream_rate_limited", RetryAfter: 100 * time.Millisecond}
+				return nil, &tiktokapp.UpstreamError{Code: "upstream_rate_limited", RetryAfter: 150 * time.Millisecond}
 			}
 			return fixture.do(r)
 		}))
@@ -251,5 +251,43 @@ func TestPreparationRetriesAfterIdentityCooldown(t *testing.T) {
 	}
 	if fixture.registrations != 10 {
 		t.Fatal("cooldown prevented preparation", fixture.registrations)
+	}
+}
+
+func TestPreparationWaitsForProxyCooldownAndShutdownCancelsWait(t *testing.T) {
+	cfg, _ := testDatabase(t)
+	p := openTestPool(t, cfg, "")
+	p.preparationDelay = time.Millisecond
+	fixture := newProtocolFixture(t, "", 200)
+	fixture.install(p)
+	if err := p.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	e := p.proxies[0].slots[0]
+	e.session.SDK, e.signedAt = nil, time.Time{}
+	e.proxy.health.CooldownUntil = time.Now().Add(time.Hour).UnixMilli()
+	p.mu.Unlock()
+	if _, err := p.StartPreparation(); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	done := p.preparation.done
+	p.mu.Unlock()
+	select {
+	case <-done:
+		t.Fatal("preparation consumed attempts during proxy cooldown")
+	case <-time.After(30 * time.Millisecond):
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not cancel cooldown wait")
+	}
+	if fixture.registrations != 10 || fixture.seeds != 10 {
+		t.Fatal("preparation contacted a cooling proxy", fixture.registrations, fixture.seeds)
 	}
 }

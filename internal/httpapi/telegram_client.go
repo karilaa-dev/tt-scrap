@@ -35,6 +35,7 @@ type deliveryResult struct {
 	Status      int
 	ContentType string
 	Body        []byte
+	Event       *DeliveryEvent
 }
 type telegramClient struct {
 	settings core.Config

@@ -19,19 +19,29 @@ type memo[T any] struct {
 	cache   *core.Cache[T]
 	flights map[string]*flight[T]
 	maximum int
+	ttl     time.Duration
+	expires func(T) time.Time
 }
 
-func newMemo[T any](ttl time.Duration, maximum int) *memo[T] {
+func newMemo[T any](ttl time.Duration, capacity, maximum int) *memo[T] {
 	if ttl <= 0 {
 		ttl = time.Minute
 	}
 	if maximum <= 0 {
 		maximum = 8192
 	}
-	return &memo[T]{cache: core.NewCache[T](ttl, maximum), flights: make(map[string]*flight[T]), maximum: maximum}
+	return &memo[T]{cache: core.NewCache[T](ttl, capacity), flights: make(map[string]*flight[T]), maximum: maximum, ttl: ttl}
 }
 func (m *memo[T]) get(key string) (T, bool) { return m.cache.Get(key) }
-func (m *memo[T]) put(key string, value T)  { m.cache.Set(key, value) }
+func (m *memo[T]) put(key string, value T) {
+	expires := time.Now().Add(m.ttl)
+	if m.expires != nil {
+		if deadline := m.expires(value); deadline.Before(expires) {
+			expires = deadline
+		}
+	}
+	m.cache.SetUntil(key, value, expires)
+}
 func (m *memo[T]) do(ctx context.Context, key string, refresh bool, fn func() (T, error)) (T, error) {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -71,7 +81,7 @@ func (m *memo[T]) do(ctx context.Context, key string, refresh bool, fn func() (T
 		f.canceled = f.err != nil && ctx.Err() != nil
 		m.mu.Lock()
 		if f.err == nil {
-			m.cache.Set(key, f.value)
+			m.put(key, f.value)
 		}
 		delete(m.flights, key)
 		close(f.done)

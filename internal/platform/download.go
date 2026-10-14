@@ -6,11 +6,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/karilaa-dev/tt-scrap/internal/core"
 	"github.com/karilaa-dev/tt-scrap/internal/media"
@@ -49,14 +51,10 @@ func (d *Downloader) Download(ctx context.Context, asset core.AssetContext, maxB
 	return d.downloadAsset(ctx, asset, maxBytes, nil)
 }
 func (d *Downloader) downloadAsset(ctx context.Context, asset core.AssetContext, maxBytes int64, open core.OpenAppMedia) (*core.Downloaded, error) {
-	var release func()
 	var cancel context.CancelFunc
 	defer func() {
 		if cancel != nil {
 			cancel()
-		}
-		if release != nil {
-			release()
 		}
 	}()
 	if d.cfg.MaxAssetBytes > 0 && (maxBytes <= 0 || d.cfg.MaxAssetBytes < maxBytes) {
@@ -65,12 +63,9 @@ func (d *Downloader) downloadAsset(ctx context.Context, asset core.AssetContext,
 	var video, audio *core.Downloaded
 	transfer := func(open core.OpenAppMedia) error {
 		// Acquire the identity first so its waiters cannot exhaust transfer capacity.
-		if release == nil {
-			var err error
-			release, err = d.gate.Acquire(ctx)
-			if err != nil {
-				return err
-			}
+		release, err := d.gate.Acquire(ctx)
+		if err != nil {
+			return err
 		}
 		// Queue time is outside the transfer budget; caller cancellation still applies.
 		if cancel == nil {
@@ -85,6 +80,7 @@ func (d *Downloader) downloadAsset(ctx context.Context, asset core.AssetContext,
 			budget.remaining.Store(maxBytes)
 		}
 		if asset.Audio == nil {
+			defer release()
 			var err error
 			video, err = d.download(ctx, asset, maxBytes, budget, open)
 			return err
@@ -109,7 +105,20 @@ func (d *Downloader) downloadAsset(ctx context.Context, asset core.AssetContext,
 		results := make(chan result, 2)
 		for i, track := range []core.AssetContext{asset, audioAsset} {
 			go func() {
+				// The first permit belongs to the video worker, never the parent.
+				// Audio queues independently, so a limit of one cannot deadlock.
+				trackRelease := release
+				if i != 0 {
+					var err error
+					trackRelease, err = d.gate.Acquire(tracks)
+					if err != nil {
+						results <- result{index: i, err: err}
+						cancelTracks()
+						return
+					}
+				}
 				file, err := d.download(tracks, track, maxBytes, budget, open)
+				trackRelease()
 				results <- result{i, file, err}
 				if err != nil {
 					cancelTracks()
@@ -151,6 +160,11 @@ func (d *Downloader) downloadAsset(ctx context.Context, asset core.AssetContext,
 	}
 	defer video.Cleanup()
 	defer audio.Cleanup()
+	release, e := d.gate.Acquire(ctx)
+	if e != nil {
+		return nil, e
+	}
+	defer release()
 	output, e := os.CreateTemp(d.cfg.TempDir, "tt-scrap-mux-*.mp4")
 	if e != nil {
 		return nil, e
@@ -220,12 +234,17 @@ func (d *Downloader) download(ctx context.Context, asset core.AssetContext, maxi
 			return nil, e
 		}
 		if attempt+1 < max(len(sources), d.cfg.DownloadRetries) {
-			if e = sleepContext(ctx, d.cfg.RetryDelay); e != nil {
+			if e = sleepContext(ctx, d.retryDelay(attempt)); e != nil {
 				return nil, networkError(ctx, e)
 			}
 		}
 	}
 	return nil, last
+}
+func (d *Downloader) retryDelay(attempt int) time.Duration {
+	// Configured retries stop before this cap; extra fallback URLs must not overflow.
+	delay := min(d.cfg.RetryDelay*time.Duration(1<<min(attempt, 10)), d.cfg.DownloadTimeout)
+	return min(delay+time.Duration(rand.Float64()*float64(delay)*0.1), d.cfg.DownloadTimeout)
 }
 func (d *Downloader) open(ctx context.Context, asset core.AssetContext, source string, appOpen core.OpenAppMedia) (*http.Response, error) {
 	headers := asset.Headers.Clone()

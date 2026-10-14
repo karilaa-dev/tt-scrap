@@ -33,7 +33,8 @@ func NewInstagram(cfg core.Config, assets *core.Assets) *Instagram {
 	if limit < 1 {
 		limit = 4
 	}
-	return &Instagram{cfg: cfg, assets: assets, transports: pool, client: &http.Client{Transport: transport, Timeout: cfg.InstagramTimeout}, posts: newMemo[core.InstagramExtraction](cfg.CacheTTL, cfg.CacheMaxEntries), extractions: newMemo[core.InstagramExtraction](cfg.CacheTTL, cfg.CacheMaxEntries), gate: core.NewLimiter(limit, cfg.MaxQueuedRequests)}
+	cacheCapacity := core.CacheBudget(cfg.CacheMaxEntries).Responses
+	return &Instagram{cfg: cfg, assets: assets, transports: pool, client: &http.Client{Transport: transport, Timeout: cfg.InstagramTimeout}, posts: newMemo[core.InstagramExtraction](cfg.CacheTTL, cacheCapacity, cfg.CacheMaxEntries), extractions: newMemo[core.InstagramExtraction](cfg.CacheTTL, cacheCapacity, cfg.CacheMaxEntries), gate: core.NewLimiter(limit, cfg.MaxQueuedRequests)}
 }
 func (i *Instagram) Close() { i.transports.close() }
 func normalizeInstagram(raw string) (string, string, error) {

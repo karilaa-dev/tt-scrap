@@ -132,7 +132,14 @@ func newTelegramService(settings core.Config, dependencies Dependencies) *telegr
 	return &telegramService{settings: settings, tiktok: dependencies.TikTok, instagram: dependencies.Instagram, assets: dependencies.Assets, downloader: dependencies.Downloader, client: newTelegramClient(settings, dependencies.HTTPClient), images: media.NewProcessor(settings.ImageConcurrency, settings.TempDir), pipelines: core.NewLimiter(settings.TelegramPipelineConcurrency, settings.MaxQueuedRequests)}
 }
 
-func (s *telegramService) deliver(ctx context.Context, request telegramRequest, instagram bool) (deliveryResult, error) {
+func (s *telegramService) deliver(ctx context.Context, request telegramRequest, instagram bool) (result deliveryResult, err error) {
+	event := &DeliveryEvent{FailedStage: "admission"}
+	defer func() {
+		if result.Event == nil {
+			event.finish(err)
+			result.Event = event
+		}
+	}()
 	if s.settings.TelegramBotToken == "" {
 		return deliveryResult{}, core.NewError("service_not_configured", "Telegram delivery is not configured", 503)
 	}
@@ -141,11 +148,11 @@ func (s *telegramService) deliver(ctx context.Context, request telegramRequest, 
 		return deliveryResult{}, acquireErr
 	}
 	defer release()
+	event.FailedStage = "extraction"
 	if instagram {
 		return s.deliverInstagram(ctx, request)
 	}
 	var extraction core.TikTokExtraction
-	var err error
 	if request.Selector == "extraction_id" {
 		extraction, err = s.tiktok.GetExtraction(ctx, request.ExtractionID)
 	} else if request.URL != "" {
@@ -359,7 +366,12 @@ func (s *telegramService) prepareItems(ctx context.Context, items []deliveryItem
 	return ctx.Err()
 }
 
-func (s *telegramService) send(ctx context.Context, items []deliveryItem, parameters fields, document, instagram bool) (deliveryResult, error) {
+func (s *telegramService) send(ctx context.Context, items []deliveryItem, parameters fields, document, instagram bool) (result deliveryResult, err error) {
+	event := &DeliveryEvent{FailedStage: "preparation", Batches: (len(items) + 9) / 10}
+	defer func() {
+		event.finish(err)
+		result.Event = event
+	}()
 	prepared := make([]preparedItem, len(items))
 	defer func() {
 		for i := range prepared {
@@ -403,6 +415,7 @@ func (s *telegramService) send(ctx context.Context, items []deliveryItem, parame
 	if len(prepared) == 0 {
 		return deliveryResult{}, core.NewError("upstream_extraction_error", "No media could be prepared", 502)
 	}
+	event.FailedStage = "upload"
 	if len(prepared) == 1 {
 		first := prepared[0]
 		field := first.Kind
@@ -421,10 +434,12 @@ func (s *telegramService) send(ctx context.Context, items []deliveryItem, parame
 			}
 			uploads = append(uploads, upload{Prepared: *first.Thumbnail, Field: "thumbnail_file"})
 		}
+		event.Attempts++
 		call, err := s.client.call(ctx, method, parameters, uploads)
 		if err != nil {
 			return deliveryResult{}, err
 		}
+		event.record(call)
 		return telegramResponse([]telegramCall{call})
 	}
 	firstFields := take(parameters, "caption", "caption_entities", "parse_mode", "show_caption_above_media")
@@ -474,10 +489,12 @@ func (s *telegramService) send(ctx context.Context, items []deliveryItem, parame
 			payload = append(payload, value)
 		}
 		batchFields["media"] = payload
+		event.Attempts++
 		call, err := s.client.call(ctx, "sendMediaGroup", batchFields, uploads)
 		if err != nil {
 			return deliveryResult{}, err
 		}
+		event.record(call)
 		calls = append(calls, call)
 		if !call.OK {
 			break

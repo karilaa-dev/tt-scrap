@@ -27,6 +27,7 @@ type RequestEvent struct {
 	Duration                time.Duration
 	DurationMS              float64
 	Bytes                   int64
+	Delivery                *DeliveryEvent
 }
 type Dependencies struct {
 	Config     core.Config
@@ -45,11 +46,12 @@ type handler struct {
 	telegram     *telegramService
 }
 type response struct {
-	status  int
-	headers http.Header
-	data    []byte
-	file    *os.File
-	cleanup func()
+	status   int
+	headers  http.Header
+	data     []byte
+	file     *os.File
+	cleanup  func()
+	delivery *DeliveryEvent
 }
 
 func NewHandler(dependencies Dependencies) http.Handler {
@@ -104,7 +106,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var err error
 	result, err = h.route(w, r)
 	if err != nil {
+		delivery := result.delivery
 		result = errorResponse(err, id)
+		result.delivery = delivery
 	}
 	if result.cleanup != nil {
 		defer result.cleanup()
@@ -138,7 +142,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(path, "/v1/assets/") {
 			path = "/v1/assets/{token}"
 		}
-		h.dependencies.OnRequest(RequestEvent{RequestID: id, Method: r.Method, Path: path, Status: result.status, Duration: total, DurationMS: float64(total) / float64(time.Millisecond), Bytes: size})
+		h.dependencies.OnRequest(RequestEvent{RequestID: id, Method: r.Method, Path: path, Status: result.status, Duration: total, DurationMS: float64(total) / float64(time.Millisecond), Bytes: size, Delivery: result.delivery})
 	}
 }
 
@@ -313,10 +317,7 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) (response, error
 			return response{}, err
 		}
 		output, err := h.telegram.deliver(r.Context(), request, instagram)
-		if err != nil {
-			return response{}, err
-		}
-		return response{status: output.Status, headers: http.Header{"Content-Type": []string{output.ContentType}}, data: output.Body}, nil
+		return response{status: output.Status, headers: http.Header{"Content-Type": []string{output.ContentType}}, data: output.Body, delivery: output.Event}, err
 	}
 	return jsonResponse(404, fields{"detail": "Not Found"})
 }

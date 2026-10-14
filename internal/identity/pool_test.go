@@ -379,3 +379,29 @@ func TestProxyAddressNormalizationAndCredentialPrivacy(t *testing.T) {
 		t.Fatal("direct endpoint changed")
 	}
 }
+
+func TestDatabaseProbeTimeoutExcludesCheckpointQueue(t *testing.T) {
+	cfg, _ := testDatabase(t)
+	p := openTestPool(t, cfg, "")
+	p.dbMu.Lock()
+	done := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		done <- p.probeDatabase(100 * time.Millisecond)
+	}()
+	<-started
+	time.Sleep(200 * time.Millisecond)
+	p.dbMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal("healthy database probe expired while waiting for a checkpoint", err)
+	}
+	p.dbMu.Lock()
+	if err := p.db.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	p.dbMu.Unlock()
+	if err := p.probeDatabase(time.Second); err == nil {
+		t.Fatal("closed database connection passed its health probe")
+	}
+}

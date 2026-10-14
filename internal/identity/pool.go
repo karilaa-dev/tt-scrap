@@ -289,11 +289,7 @@ func (p *Pool) monitor() {
 		case <-p.lifetime.Done():
 			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(p.lifetime, 5*time.Second)
-			p.dbMu.Lock()
-			err := p.db.Ping(ctx)
-			p.dbMu.Unlock()
-			cancel()
+			err := p.probeDatabase(5 * time.Second)
 			if err != nil {
 				p.fail()
 				return
@@ -301,6 +297,14 @@ func (p *Pool) monitor() {
 		}
 	}
 }
+func (p *Pool) probeDatabase(timeout time.Duration) error {
+	p.dbMu.Lock()
+	defer p.dbMu.Unlock()
+	ctx, cancel := context.WithTimeout(p.lifetime, timeout)
+	defer cancel()
+	return p.db.Ping(ctx)
+}
+
 func (p *Pool) Close() error {
 	p.closeOnce.Do(func() {
 		p.mu.Lock()

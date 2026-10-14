@@ -124,8 +124,17 @@ type Assets struct {
 	ttl   time.Duration
 }
 
-func NewAssets(ttl time.Duration, capacity int) *Assets {
-	return &Assets{cache: NewCache[AssetContext](ttl, capacity), ttl: ttl}
+type CacheLimits struct{ Assets, Responses int }
+
+// CacheBudget reserves at least half for asset references. Six independent
+// response caches share the remainder; their TTLs and locks stay separate.
+func CacheBudget(total int) CacheLimits {
+	responses := total / 12
+	return CacheLimits{Assets: total - 6*responses, Responses: responses}
+}
+
+func NewAssets(ttl time.Duration, totalCapacity int) *Assets {
+	return &Assets{cache: NewCache[AssetContext](ttl, CacheBudget(totalCapacity).Assets), ttl: ttl}
 }
 func (a *Assets) Register(value AssetContext, position int) AssetDescriptor {
 	return a.RegisterUntil(value, position, time.Now().Add(a.ttl))

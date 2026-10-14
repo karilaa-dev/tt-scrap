@@ -144,14 +144,29 @@ func (p *Pool) prepareSlot(proxy *proxyState, ordinal int) error {
 	// Start the next gap after completion: variable request setup must not
 	// consume it and allow the following registration to start too soon.
 	defer func() { proxy.preparationPace.next = time.Now().Add(p.preparationDelay) }()
-	l, err := p.acquire(p.lifetime, id)
-	if err != nil {
-		return err
+	ctx, cancel := context.WithTimeout(p.lifetime, p.preparationTimeout)
+	defer cancel()
+	var l *lease
+	for {
+		p.mu.Lock()
+		cooldown := max(e.health.CooldownUntil, proxy.health.CooldownUntil)
+		p.mu.Unlock()
+		if err := waitUntil(ctx, time.UnixMilli(cooldown)); err != nil {
+			return err
+		}
+		var err error
+		l, err = p.acquire(ctx, id)
+		if err == nil {
+			break
+		}
+		var api *core.Error
+		if !errors.As(err, &api) || api.Code != "upstream_rate_limited" {
+			return err
+		}
+		// A concurrent request may extend the cooldown while we wait.
 	}
 	client := l.client()
-	ctx, cancel := context.WithTimeout(l.ctx, p.preparationTimeout)
-	defer cancel()
-	err = client.Bootstrap(ctx)
+	err := client.Bootstrap(l.ctx)
 	client.SyncCookies()
 	if err != nil {
 		l.recover(err)
@@ -167,7 +182,15 @@ func (p *Pool) prepareSlot(proxy *proxyState, ordinal int) error {
 type preparationPacer struct{ next time.Time }
 
 func (p *preparationPacer) wait(ctx context.Context, interval time.Duration) error {
-	if delay := time.Until(p.next); delay > 0 {
+	if err := waitUntil(ctx, p.next); err != nil {
+		return err
+	}
+	p.next = time.Now().Add(interval)
+	return nil
+}
+
+func waitUntil(ctx context.Context, until time.Time) error {
+	if delay := time.Until(until); delay > 0 {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
 		select {
@@ -176,9 +199,5 @@ func (p *preparationPacer) wait(ctx context.Context, interval time.Duration) err
 		case <-timer.C:
 		}
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	p.next = time.Now().Add(interval)
-	return nil
+	return ctx.Err()
 }

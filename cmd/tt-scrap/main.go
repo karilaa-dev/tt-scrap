@@ -127,14 +127,7 @@ func run(logger *slog.Logger) error {
 	downloader := platform.NewDownloader(config, backend, proxies)
 	defer downloader.Close()
 	handler := httpapi.NewHandler(httpapi.Dependencies{Config: config, Assets: assets, TikTok: tiktok, Instagram: instagram, Downloader: downloader, Identities: identities, IsReady: ready, OpenAPI: ttscrap.OpenAPI, OnRequest: func(event httpapi.RequestEvent) {
-		logLevel := slog.LevelInfo
-		if strings.HasPrefix(event.Path, "/health/") {
-			logLevel = slog.LevelDebug
-		}
-		if event.Status >= 500 {
-			logLevel = slog.LevelError
-		}
-		logger.Log(context.Background(), logLevel, "request completed", "request_id", event.RequestID, "method", event.Method, "path", event.Path, "status", event.Status, "duration_ms", event.DurationMS, "bytes", event.Bytes)
+		logRequest(logger, event)
 	}})
 	server := &http.Server{Addr: net.JoinHostPort(config.Host, strconv.Itoa(config.Port)), Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 32 * 1024, BaseContext: func(net.Listener) context.Context { return lifetime }}
 	listener, err := net.Listen("tcp", server.Addr)
@@ -164,4 +157,22 @@ func run(logger *slog.Logger) error {
 	}
 	cancelLifetime()
 	return nil
+}
+
+func logRequest(logger *slog.Logger, event httpapi.RequestEvent) {
+	level := slog.LevelInfo
+	if strings.HasPrefix(event.Path, "/health/") {
+		level = slog.LevelDebug
+	}
+	if event.Delivery != nil && event.Delivery.Outcome != "succeeded" {
+		level = slog.LevelWarn
+	}
+	if event.Status >= 500 {
+		level = slog.LevelError
+	}
+	attributes := []any{"request_id", event.RequestID, "method", event.Method, "path", event.Path, "status", event.Status, "duration_ms", event.DurationMS, "bytes", event.Bytes}
+	if event.Delivery != nil {
+		attributes = append(attributes, "delivery", event.Delivery)
+	}
+	logger.Log(context.Background(), level, "request completed", attributes...)
 }

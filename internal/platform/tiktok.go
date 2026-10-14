@@ -36,7 +36,13 @@ func NewTikTok(cfg core.Config, assets *core.Assets, backend core.AppBackend, pr
 	if concurrency < 1 {
 		concurrency = 32
 	}
-	return &TikTok{cfg: cfg, assets: assets, app: backend, proxies: proxies, transports: newTransports(cfg.HTTPMaxConnections), resolveCache: newMemo[core.TikTokResolution](cfg.ResolutionTTL, cfg.CacheMaxEntries), posts: newMemo[core.TikTokExtraction](cfg.MetadataTTL, cfg.CacheMaxEntries), extractions: newMemo[core.TikTokExtraction](cfg.MetadataTTL, cfg.CacheMaxEntries), music: newMemo[core.TikTokMusic](cfg.MetadataTTL, cfg.CacheMaxEntries), gate: core.NewLimiter(concurrency, cfg.MaxQueuedRequests), resolveGate: core.NewLimiter(cfg.HTTPMaxConnections, cfg.MaxQueuedRequests)}
+	cacheCapacity := core.CacheBudget(cfg.CacheMaxEntries).Responses
+	t := &TikTok{cfg: cfg, assets: assets, app: backend, proxies: proxies, transports: newTransports(cfg.HTTPMaxConnections), resolveCache: newMemo[core.TikTokResolution](cfg.ResolutionTTL, cacheCapacity, cfg.CacheMaxEntries), posts: newMemo[core.TikTokExtraction](cfg.MetadataTTL, cacheCapacity, cfg.CacheMaxEntries), extractions: newMemo[core.TikTokExtraction](cfg.MetadataTTL, cacheCapacity, cfg.CacheMaxEntries), music: newMemo[core.TikTokMusic](cfg.MetadataTTL, cacheCapacity, cfg.CacheMaxEntries), gate: core.NewLimiter(concurrency, cfg.MaxQueuedRequests), resolveGate: core.NewLimiter(cfg.HTTPMaxConnections, cfg.MaxQueuedRequests)}
+	t.music.expires = func(value core.TikTokMusic) time.Time {
+		expires, _ := time.Parse(time.RFC3339Nano, value.ExpiresAt)
+		return expires
+	}
+	return t
 }
 func (t *TikTok) Close()        { t.transports.close() }
 func (t *TikTok) proxy() string { return t.proxies[(t.next.Add(1)-1)%uint64(len(t.proxies))] }
@@ -197,7 +203,9 @@ func (t *TikTok) ExtractMusic(ctx context.Context, id string, refresh bool) (cor
 	return t.music.do(ctx, id, refresh, func() (core.TikTokMusic, error) {
 		if !refresh {
 			if post, ok := t.posts.get(id); ok && post.Music != nil && post.Music.Audio != nil {
-				return musicResponse(post.ExtractionID, id, post.ExpiresAt, post.Music), nil
+				if expires, err := time.Parse(time.RFC3339Nano, post.ExpiresAt); err == nil && expires.After(time.Now()) {
+					return musicResponse(post.ExtractionID, id, post.ExpiresAt, post.Music), nil
+				}
 			}
 		}
 		release, e := t.gate.Acquire(ctx)
