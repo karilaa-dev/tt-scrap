@@ -238,7 +238,18 @@ func (t *TikTok) fetchWeb(ctx context.Context, raw, id string) (object, core.Ass
 		return nil, core.AssetContext{}, e
 	}
 	client := newWebClient(transport)
-	loadNetscapeCookies(client.Jar, t.cfg.CookiesFile)
+	detail, asset, err := t.fetchWebWithClient(ctx, client, proxy, raw, id)
+	var failure *core.Error
+	if errors.As(err, &failure) && (failure.Code == "content_private" || failure.Code == "content_restricted" || failure.Code == "region_blocked") && t.cfg.TikTokSessionID != "" {
+		u := &url.URL{Scheme: "https", Host: "www.tiktok.com", Path: "/"}
+		for _, name := range []string{"sid_tt", "sessionid", "sessionid_ss"} {
+			client.Jar.SetCookies(u, []*http.Cookie{{Name: name, Value: t.cfg.TikTokSessionID, Domain: ".tiktok.com", Path: "/", Secure: true, HttpOnly: true}})
+		}
+		return t.fetchWebWithClient(ctx, client, proxy, raw, id)
+	}
+	return detail, asset, err
+}
+func (t *TikTok) fetchWebWithClient(ctx context.Context, client *http.Client, proxy, raw, id string) (object, core.AssetContext, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
 		req.Header.Set("User-Agent", browserAgent)
@@ -259,6 +270,10 @@ func (t *TikTok) fetchWeb(ctx context.Context, raw, id string) (object, core.Ass
 			return nil, core.AssetContext{}, core.NewError("content_private", "TikTok requires login for this content", 403)
 		}
 		detail, status, parseErr := ParseWebDetail(body, id)
+		var restriction *core.Error
+		if errors.As(parseErr, &restriction) {
+			return nil, core.AssetContext{}, restriction
+		}
 		if status != 0 {
 			return nil, core.AssetContext{}, webStatus(status)
 		}

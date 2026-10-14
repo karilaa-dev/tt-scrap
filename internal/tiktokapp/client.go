@@ -51,6 +51,8 @@ func (e *UpstreamError) Error() string {
 		return "The upstream service rejected the device registration."
 	case "content_private":
 		return "The requested content is private."
+	case "content_restricted":
+		return "The requested content requires an account with access."
 	case "content_deleted":
 		return "The requested content is unavailable or deleted."
 	case "region_blocked":
@@ -62,6 +64,7 @@ func (e *UpstreamError) Error() string {
 var identityFailurePattern = regexp.MustCompile(`\b(?:invalid|expired|unregistered|revoked)[ _-]+(?:device(?:[ _-]?id)?|install[ _-]?id)\b|\b(?:device(?:[ _-]?id)?|install[ _-]?id)[ _-]+(?:is[ _-]+)?(?:invalid|expired|unregistered|revoked|not registered)\b`)
 var signatureFailurePattern = regexp.MustCompile(`\b(?:invalid|expired)[ _-]+(?:signature|seed|sdk[ _-]?token|x[ _-]argus)\b|\b(?:signature|seed|sdk[ _-]?token|x[ _-]argus)[ _-]+(?:is[ _-]+)?(?:invalid|expired|error|rejected)\b`)
 var rateFailurePattern = regexp.MustCompile(`rate[ _-]?limit|too many requests`)
+var contentRestrictionPattern = regexp.MustCompile(`age[ _-]?(?:restrict|limit|verif)|(?:content|video|post)[ _-]+(?:is[ _-]+)?(?:restricted|private)|(?:log[ _-]?in|sign[ _-]?in|authentication)[ _-]+(?:is[ _-]+)?required|(?:requires?|must)[ _-]+(?:log[ _-]?in|sign[ _-]?in)|(?:log[ _-]?in|sign[ _-]?in) to (?:view|watch|access|see)|not (?:authorized|allowed|permitted) to (?:view|watch)|not available (?:in your|for your) (?:country|region)`)
 
 func ClassifyFailure(status, appStatus int, message string, blocked bool, retry time.Duration) *UpstreamError {
 	message = strings.ToLower(message)
@@ -83,6 +86,8 @@ func ClassifyFailure(status, appStatus int, message string, blocked bool, retry 
 	case signatureFailurePattern.MatchString(message):
 		e.Code = "signature_rejected"
 		e.Recovery = RecoveryRefresh
+	case !blocked && contentRestrictionPattern.MatchString(message):
+		e.Code = "content_restricted"
 	case blocked || status == 401 || status == 403:
 		e.Code = "upstream_blocked"
 	}
@@ -128,11 +133,15 @@ func (c *Client) SyncCookies() {
 	c.Session.Cookies = c.jar.serialize()
 }
 func (c *Client) request(ctx context.Context, original *url.URL, method string, body []byte, headers http.Header) (*http.Response, error) {
-	return c.requestWithMedia(ctx, original, method, body, headers, false)
+	return c.requestWithAccount(ctx, original, method, body, headers, false, Account{})
 }
-func (c *Client) requestWithMedia(ctx context.Context, original *url.URL, method string, body []byte, headers http.Header, media bool) (*http.Response, error) {
+func (c *Client) requestWithAccount(ctx context.Context, original *url.URL, method string, body []byte, headers http.Header, media bool, account Account) (*http.Response, error) {
 	c.mu.Lock()
 	u := routeURL(original, c.Session.RoutingRules)
+	jar := c.jar
+	if account.Valid() {
+		jar = newPersistentJar(c.jar.serialize())
+	}
 	c.mu.Unlock()
 	for hop := 0; hop < 6; hop++ {
 		if e := ctx.Err(); e != nil {
@@ -150,7 +159,7 @@ func (c *Client) requestWithMedia(ctx context.Context, original *url.URL, method
 		}
 		c.mu.Lock()
 		out.Set("User-Agent", UserAgent(c.Session.Profile))
-		cookies := c.jar.jar.Cookies(u)
+		cookies := jar.jar.Cookies(u)
 		region := c.Session.StoreRegion
 		c.mu.Unlock()
 		appHost := IsAppHost(u)
@@ -181,6 +190,11 @@ func (c *Client) requestWithMedia(ctx context.Context, original *url.URL, method
 		}
 		req.Header = out
 		for _, cookie := range cookies {
+			if !isAccountCookie(cookie.Name) {
+				req.AddCookie(cookie)
+			}
+		}
+		for _, cookie := range account.cookies(u) {
 			req.AddCookie(cookie)
 		}
 		doer := c.transport
@@ -192,7 +206,7 @@ func (c *Client) requestWithMedia(ctx context.Context, original *url.URL, method
 			return nil, e
 		}
 		c.mu.Lock()
-		c.jar.accept(u, response.Cookies())
+		jar.accept(u, response.Cookies())
 		c.Session.Cookies = c.jar.serialize()
 		c.mu.Unlock()
 		switch response.StatusCode {
@@ -428,6 +442,9 @@ func (c *Client) Bootstrap(ctx context.Context) error {
 	return nil
 }
 func (c *Client) Detail(ctx context.Context, input string) (map[string]any, error) {
+	return c.DetailWithAccount(ctx, input, Account{})
+}
+func (c *Client) DetailWithAccount(ctx context.Context, input string, account Account) (map[string]any, error) {
 	id, e := c.ResolveVideo(ctx, input)
 	if e != nil {
 		return nil, e
@@ -448,7 +465,7 @@ func (c *Client) Detail(ctx context.Context, input string) (map[string]any, erro
 	q.Set("request_source", "0")
 	q.Set("share_scene", "1")
 	u.RawQuery = q.Encode()
-	response, e := c.request(ctx, u, "GET", nil, nil)
+	response, e := c.requestWithAccount(ctx, u, "GET", nil, nil, false, account)
 	if e != nil {
 		return nil, e
 	}
@@ -471,6 +488,13 @@ func DetailItem(data map[string]any, id string) (map[string]any, error) {
 				return item, nil
 			}
 		}
+	}
+	message := String(data["status_msg"])
+	if message == "" {
+		message = String(data["message"])
+	}
+	if failure := ClassifyFailure(http.StatusOK, int(Number(data["status_code"])), message, false, 0); IsContentRestricted(failure) {
+		return nil, failure
 	}
 	return nil, &UpstreamError{Code: "content_deleted", Recovery: RecoveryNone, HTTPStatus: 200}
 }
@@ -553,6 +577,9 @@ func (c *Client) ResolveVideo(ctx context.Context, input string) (string, error)
 	return "", errors.New("too many TikTok share redirects")
 }
 func (c *Client) MediaRequest(ctx context.Context, address string, headers http.Header) (*http.Response, error) {
+	return c.MediaRequestWithAccount(ctx, address, headers, Account{})
+}
+func (c *Client) MediaRequestWithAccount(ctx context.Context, address string, headers http.Header, account Account) (*http.Response, error) {
 	u, e := url.Parse(address)
 	if e != nil {
 		return nil, e
@@ -577,7 +604,7 @@ func (c *Client) MediaRequest(ctx context.Context, address string, headers http.
 		headers = make(http.Header)
 	}
 	headers.Set("Accept-Encoding", "identity")
-	response, err := c.requestWithMedia(ctx, u, "GET", nil, headers, true)
+	response, err := c.requestWithAccount(ctx, u, "GET", nil, headers, true, account)
 	if err != nil {
 		return nil, err
 	}

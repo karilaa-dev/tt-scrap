@@ -1,9 +1,59 @@
 package core
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
+
+func TestTikTokSessionIDConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+		invalid     bool
+	}{
+		{"disabled", "", false},
+		{"session", "fixture-session", false},
+		{"cookie header", "sessionid=secret; sid_tt=secret", true},
+		{"newline", "secret\r\nX-Header: injected", true},
+		{"control character", "secret\x00value", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := ParseConfig(map[string]string{
+				"TT_SCRAP_API_KEY": "test-key-sixteen-characters",
+				"TIKTOK_METHOD":    "web", "TIKTOK_SESSION_ID": tc.value,
+			})
+			if tc.invalid {
+				if err == nil || err.Error() != "invalid configuration: TIKTOK_SESSION_ID" {
+					t.Fatal("invalid session must fail without exposing its value")
+				}
+			} else if err != nil || cfg.TikTokSessionID != tc.value {
+				t.Fatal("session configuration was not preserved", err)
+			}
+		})
+	}
+	if DefaultConfig().TikTokSessionID != "" {
+		t.Fatal("account fallback must be disabled by default")
+	}
+}
+
+func TestTikTokSessionIDEnvironmentOverridesDotEnv(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("TT_SCRAP_API_KEY", "test-key-sixteen-characters")
+	t.Setenv("TIKTOK_METHOD", "web")
+	t.Setenv("TIKTOK_SESSION_ID", "environment-session")
+	if err := os.WriteFile(".env", []byte("TIKTOK_SESSION_ID=file-session\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig()
+	if err != nil || cfg.TikTokSessionID != "environment-session" {
+		t.Fatal("environment did not override .env session", err)
+	}
+	t.Setenv("TIKTOK_SESSION_ID", "")
+	cfg, err = LoadConfig()
+	if err != nil || cfg.TikTokSessionID != "" {
+		t.Fatal("empty environment value did not disable account fallback", err)
+	}
+}
 
 func TestTelegramBaseURLValidationAndNormalization(t *testing.T) {
 	for _, test := range []struct{ input, want string }{
