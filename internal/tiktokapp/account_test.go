@@ -169,3 +169,65 @@ func TestAuthenticatedRedirectUsesRotatedCookies(t *testing.T) {
 		})
 	}
 }
+
+func TestAuthenticatedRedirectHonorsAccountCookieDeletion(t *testing.T) {
+	for _, name := range []string{"sid_tt", "sessionid", "sessionid_ss"} {
+		for _, tc := range []struct {
+			name       string
+			attributes string
+			deleted    bool
+		}{
+			{"max-age", "Max-Age=0; Path=/", true},
+			{"expires", "Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/", true},
+			{"parent-domain", "Max-Age=0; Domain=.tiktokv.com; Path=/", true},
+			{"default-path", "Max-Age=0", true},
+			{"different-path", "Max-Age=0; Path=/aweme/v1/play/", false},
+			{"unrelated-domain", "Max-Age=0; Domain=example.org; Path=/", false},
+			{"public-suffix", "Max-Age=0; Domain=com; Path=/", false},
+		} {
+			t.Run(name+"/"+tc.name, func(t *testing.T) {
+				session := registeredTestSession(t)
+				calls := 0
+				client := NewClient(session, doerFunc(func(r *http.Request) (*http.Response, error) {
+					calls++
+					for _, cookieName := range []string{"sid_tt", "sessionid", "sessionid_ss"} {
+						cookie, err := r.Cookie(cookieName)
+						wantAbsent := calls == 4 || (tc.deleted && cookieName == name && (calls == 2 || calls == 3))
+						if wantAbsent {
+							if err != http.ErrNoCookie {
+								t.Errorf("request %d sent cookie %s after deletion or during anonymous access", calls, cookieName)
+							}
+						} else if err != nil || cookie.Value != "initial-login" {
+							t.Errorf("request %d missing configured cookie %s", calls, cookieName)
+						}
+					}
+					switch calls {
+					case 1:
+						return testResponse(302, nil, http.Header{
+							"Location":   {"/aweme/v1/aweme/detail/?redirect=1"},
+							"Set-Cookie": {name + "=; Secure; " + tc.attributes},
+						}), nil
+					case 2:
+						return testResponse(302, nil, http.Header{"Location": {"/aweme/v1/aweme/detail/?redirect=2"}}), nil
+					}
+					return testResponse(200, []byte(`{"aweme_detail":{"aweme_id":"1234567890123456789"}}`), nil), nil
+				}))
+				ctx := context.Background()
+				account := Account{SessionID: "initial-login"}
+				if _, err := client.DetailWithAccount(ctx, "1234567890123456789", account); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := client.Detail(ctx, "1234567890123456789"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := client.DetailWithAccount(ctx, "1234567890123456789", account); err != nil {
+					t.Fatal(err)
+				}
+				client.SyncCookies()
+				if calls != 5 || strings.Contains(session.Cookies, "login") {
+					t.Fatal("account cookie deletion changed anonymous session state")
+				}
+			})
+		}
+	}
+}

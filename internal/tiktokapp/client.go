@@ -139,10 +139,10 @@ func (c *Client) requestWithAccount(ctx context.Context, original *url.URL, meth
 	c.mu.Lock()
 	u := routeURL(original, c.Session.RoutingRules)
 	jar := c.jar
-	var accountUpdates *persistentJar
+	var accountCookies *accountCookieJar
 	if account.Valid() {
 		jar = newPersistentJar(c.jar.serialize())
-		accountUpdates = newPersistentJar("")
+		accountCookies = newAccountCookieJar(account)
 	}
 	c.mu.Unlock()
 	for hop := 0; hop < 6; hop++ {
@@ -196,8 +196,8 @@ func (c *Client) requestWithAccount(ctx context.Context, original *url.URL, meth
 				req.AddCookie(cookie)
 			}
 		}
-		if accountUpdates != nil {
-			for _, cookie := range account.cookies(u, accountUpdates.jar) {
+		if accountCookies != nil {
+			for _, cookie := range accountCookies.Cookies(u) {
 				req.AddCookie(cookie)
 			}
 		}
@@ -211,8 +211,8 @@ func (c *Client) requestWithAccount(ctx context.Context, original *url.URL, meth
 		}
 		c.mu.Lock()
 		jar.accept(u, response.Cookies())
-		if accountUpdates != nil {
-			accountUpdates.accept(u, response.Cookies())
+		if accountCookies != nil {
+			accountCookies.SetCookies(u, response.Cookies())
 		}
 		c.Session.Cookies = c.jar.serialize()
 		c.mu.Unlock()
