@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/joho/godotenv"
 	"github.com/karilaa-dev/tt-scrap/internal/core"
 )
@@ -71,7 +72,11 @@ func testDatabase(t testing.TB) (core.Config, *pgx.Conn) {
 }
 func openTestPool(t testing.TB, cfg core.Config, addresses ...string) *Pool {
 	t.Helper()
-	p, e := Open(context.Background(), cfg, addresses)
+	return openTestPoolTiming(t, cfg, defaultPersistTiming, addresses...)
+}
+func openTestPoolTiming(t testing.TB, cfg core.Config, timing persistTiming, addresses ...string) *Pool {
+	t.Helper()
+	p, e := open(context.Background(), cfg, addresses, timing)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -92,10 +97,14 @@ func mustAcquire(t *testing.T, p *Pool, id string) *lease {
 	}
 	return l
 }
-func finishLease(t *testing.T, l *lease, e error) {
+
+// persisted waits until the pool saves every finished operation.
+func persisted(t testing.TB, p *Pool) {
 	t.Helper()
-	if err := l.finish(e); err != nil {
-		t.Fatal(err)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if e := p.flush(ctx); e != nil {
+		t.Fatal(e)
 	}
 }
 func waitStats(t *testing.T, p *Pool, predicate func(Stats) bool) {
@@ -135,17 +144,18 @@ func TestPoolLazyBalancedTenPerProxyAndMemoryReads(t *testing.T) {
 		if len(l.entry.session.Identity.OpenUDID) < 13 {
 			t.Fatal("lazy identity missing local device state")
 		}
-		finishLease(t, l, nil)
+		l.finish(nil)
 	}
+	persisted(t, p)
 	stats := p.Stats()
-	if stats.Identities != 20 || stats.Busy != 0 || stats.Registered != 0 {
+	if stats.Identities != 20 || stats.Busy != 0 || stats.Registered != 0 || stats.Unsaved != 0 {
 		t.Fatalf("wrong lazily filled pool:%+v", stats)
 	}
 	if stats.Reads != initial.Reads {
 		t.Fatalf("selection queried database: startup%d after%d", initial.Reads, stats.Reads)
 	}
-	if stats.Writes != 43 {
-		t.Fatalf("expected one identity write after each operation, got%d", stats.Writes)
+	if stats.Checkpoints != 43 || stats.Writes < 20 || stats.Writes > 43 {
+		t.Fatalf("expected one checkpoint per operation and at most one write each:%+v", stats)
 	}
 	low, high := 1000, 0
 	for _, e := range p.entries {
@@ -194,7 +204,7 @@ func TestPoolPersistOnlyAfterOperationAndRestart(t *testing.T) {
 	if e := db.QueryRow(context.Background(), "SELECT count(*) FROM "+p.identitiesTable).Scan(&rows); e != nil || rows != 0 {
 		t.Fatal("identity was persisted before operation finished")
 	}
-	finishLease(t, l, nil)
+	l.finish(nil)
 	if e := p.Close(); e != nil {
 		t.Fatal(e)
 	}
@@ -206,7 +216,7 @@ func TestPoolPersistOnlyAfterOperationAndRestart(t *testing.T) {
 	if next.entry.session.Identity.ClientUDID != udid || next.entry.session.StoreRegion != "fixture" || next.entry.proxy.key != "direct" {
 		t.Fatal("restart lost identity/proxy/session state")
 	}
-	finishLease(t, next, nil)
+	next.finish(nil)
 }
 func TestPoolRejectsSecondOwnerAndReleasesLockOnClose(t *testing.T) {
 	cfg, _ := testDatabase(t)
@@ -248,7 +258,7 @@ func TestPoolConcurrentCapacityQueueLimitAndCancellation(t *testing.T) {
 	go func() {
 		l, e := p.acquire(ctx, "")
 		if e == nil {
-			e = l.finish(nil)
+			l.finish(nil)
 		}
 		result <- e
 	}()
@@ -270,7 +280,7 @@ func TestPoolConcurrentCapacityQueueLimitAndCancellation(t *testing.T) {
 	}
 	waitStats(t, p, func(s Stats) bool { return s.Queued == 0 })
 	for _, l := range held {
-		finishLease(t, l, nil)
+		l.finish(nil)
 	}
 	if stats := p.Stats(); stats.Busy != 0 || stats.Identities != 10 {
 		t.Fatalf("released capacity leaked:%+v", stats)
@@ -303,42 +313,55 @@ func TestPoolConcurrentLeasesSerializeOnlyFinishedWrites(t *testing.T) {
 			mu.Lock()
 			delete(active, l.entry.id)
 			mu.Unlock()
-			if e = l.finish(nil); e != nil {
-				t.Error(e)
-			}
+			l.finish(nil)
 		})
 	}
 	wg.Wait()
+	persisted(t, p)
 	stats := p.Stats()
-	if stats.Busy != 0 || stats.Writes != 20 || stats.Reads != initialReads {
+	if stats.Busy != 0 || stats.Checkpoints != 20 || stats.Unsaved != 0 || stats.Reads != initialReads {
 		t.Fatalf("concurrent completion did not persist once:%+v", stats)
 	}
 }
-func TestPoolRevisionConflictFailsClosed(t *testing.T) {
+func TestPoolRAMStateOverwritesExternalRowChanges(t *testing.T) {
 	cfg, db := testDatabase(t)
 	p := openTestPool(t, cfg, "")
 	first := mustAcquire(t, p, "")
 	id := first.entry.id
 	first.entry.session.StoreRegion = "saved"
-	finishLease(t, first, nil)
-	if _, e := db.Exec(context.Background(), "UPDATE "+p.identitiesTable+" SET revision=revision+1 WHERE id=$1", id); e != nil {
+	first.finish(nil)
+	persisted(t, p)
+	if _, e := db.Exec(context.Background(), "UPDATE "+p.identitiesTable+" SET revision=revision+5,session=jsonb_set(session,'{storeRegion}','\"external\"') WHERE id=$1", id); e != nil {
 		t.Fatal(e)
 	}
 	next := mustAcquire(t, p, id)
-	next.entry.session.StoreRegion = "stale"
-	if e := next.finish(nil); e == nil {
-		t.Fatal("stale RAM snapshot overwrote changed row")
-	}
-	if p.Ready() {
-		t.Fatal("pool remained available after revision conflict")
-	}
-	if l, e := p.acquire(context.Background(), ""); e == nil {
-		l.finish(nil)
-		t.Fatal("failed pool granted another identity")
+	next.entry.session.StoreRegion = "ram"
+	next.finish(nil)
+	persisted(t, p)
+	if !p.Ready() {
+		t.Fatal("an external row change stopped the pool")
 	}
 	var region string
-	if e := db.QueryRow(context.Background(), "SELECT session->>'storeRegion' FROM "+p.identitiesTable+" WHERE id=$1", id).Scan(&region); e != nil || region != "saved" {
-		t.Fatalf("stale session changed database:%s %v", region, e)
+	if e := db.QueryRow(context.Background(), "SELECT session->>'storeRegion' FROM "+p.identitiesTable+" WHERE id=$1", id).Scan(&region); e != nil || region != "ram" {
+		t.Fatalf("RAM state was not saved over the row:%s %v", region, e)
+	}
+}
+func TestPoolStopsWhenAnotherWriterTakesItsSlot(t *testing.T) {
+	cfg, db := testDatabase(t)
+	p := openTestPool(t, cfg, "")
+	l := mustAcquire(t, p, "")
+	if _, e := db.Exec(context.Background(), "INSERT INTO "+p.identitiesTable+"(id,proxy_id,ordinal,session) VALUES(gen_random_uuid(),$1,$2,'{}')", l.entry.proxy.id, l.entry.ordinal); e != nil {
+		t.Fatal(e)
+	}
+	l.finish(nil)
+	select {
+	case <-p.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("pool kept running after another writer took its slot")
+	}
+	var pg *pgconn.PgError
+	if !errors.As(p.Err(), &pg) || pg.Code != "23505" || p.Ready() {
+		t.Fatal("slot conflict was not reported as an ownership failure", p.Err())
 	}
 }
 func TestPoolFailedOperationStillFlushesSession(t *testing.T) {
@@ -347,11 +370,8 @@ func TestPoolFailedOperationStillFlushesSession(t *testing.T) {
 	l := mustAcquire(t, p, "")
 	l.entry.session.StoreRegion = "before-failure"
 	id := l.entry.id
-	operationError := errors.New("fixture operation failed")
-	e := l.finish(operationError)
-	if e != nil && !errors.Is(e, operationError) {
-		t.Fatal(e)
-	}
+	l.finish(errors.New("fixture operation failed"))
+	persisted(t, p)
 	var region string
 	if err := db.QueryRow(context.Background(), "SELECT session->>'storeRegion' FROM "+p.identitiesTable+" WHERE id=$1", id).Scan(&region); err != nil || region != "before-failure" {
 		t.Fatal("failure discarded changed session")
@@ -377,32 +397,6 @@ func TestProxyAddressNormalizationAndCredentialPrivacy(t *testing.T) {
 	}
 	if key, address, e := Endpoint(""); e != nil || key != "direct" || address != "" {
 		t.Fatal("direct endpoint changed")
-	}
-}
-
-func TestDatabaseProbeTimeoutExcludesCheckpointQueue(t *testing.T) {
-	cfg, _ := testDatabase(t)
-	p := openTestPool(t, cfg, "")
-	p.dbMu.Lock()
-	done := make(chan error, 1)
-	started := make(chan struct{})
-	go func() {
-		close(started)
-		done <- p.probeDatabase(100 * time.Millisecond)
-	}()
-	<-started
-	time.Sleep(200 * time.Millisecond)
-	p.dbMu.Unlock()
-	if err := <-done; err != nil {
-		t.Fatal("healthy database probe expired while waiting for a checkpoint", err)
-	}
-	p.dbMu.Lock()
-	if err := p.db.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	p.dbMu.Unlock()
-	if err := p.probeDatabase(time.Second); err == nil {
-		t.Fatal("closed database connection passed its health probe")
 	}
 }
 
@@ -462,7 +456,7 @@ func TestPinnedWaiterRunsBeforeNewWorkAndReleasesReservation(t *testing.T) {
 	p.mu.Unlock()
 	unpinned := acquire(ctx, "")
 	waitStats(t, p, func(s Stats) bool { return s.Queued == 2 })
-	finishLease(t, held[0], nil)
+	held[0].finish(nil)
 	var l *lease
 	select {
 	case l = <-media:
@@ -480,7 +474,7 @@ func TestPinnedWaiterRunsBeforeNewWorkAndReleasesReservation(t *testing.T) {
 	if <-abandoned != nil {
 		t.Fatal("cancelled waiter acquired an identity")
 	}
-	finishLease(t, l, nil)
+	l.finish(nil)
 	select {
 	case l = <-unpinned:
 	case <-time.After(2 * time.Second):
@@ -489,9 +483,9 @@ func TestPinnedWaiterRunsBeforeNewWorkAndReleasesReservation(t *testing.T) {
 	if l == nil || l.entry.id != pinned {
 		t.Fatal("queued work did not take the released identity")
 	}
-	finishLease(t, l, nil)
+	l.finish(nil)
 	for _, l := range held[1:] {
-		finishLease(t, l, nil)
+		l.finish(nil)
 	}
 	if stats := p.Stats(); stats.Busy != 0 || stats.Queued != 0 {
 		t.Fatalf("leases leaked: %+v", stats)

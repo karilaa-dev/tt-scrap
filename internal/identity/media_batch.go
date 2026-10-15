@@ -11,7 +11,7 @@ import (
 )
 
 // WithMedia owns one identity until all related requests and bodies finish.
-// Signing and cookie changes remain in RAM; completion saves one checkpoint.
+// Signing and cookie changes remain in RAM; completion records one checkpoint.
 func (p *Pool) WithMedia(ctx context.Context, id string, run func(core.OpenAppMedia) error) (err error) {
 	l, err := p.acquire(ctx, id)
 	if err != nil {
@@ -19,9 +19,7 @@ func (p *Pool) WithMedia(ctx context.Context, id string, run func(core.OpenAppMe
 	}
 	var operationErr error
 	defer func() {
-		if saved := l.finish(operationErr); saved != nil {
-			err = saved
-		}
+		l.finish(operationErr)
 		err = publicError(err)
 	}()
 	for attempt := 0; attempt < 2; attempt++ {
@@ -89,7 +87,7 @@ func (b *mediaBatch) open(ctx context.Context, address string, headers http.Head
 		return nil, publicError(err)
 	}
 	body := &leasedBody{ReadCloser: response.Body}
-	body.finish = func(err error) error {
+	body.finish = func(err error) {
 		completed := err == nil && requestCtx.Err() == nil
 		unlink()
 		cancel()
@@ -100,7 +98,6 @@ func (b *mediaBatch) open(ctx context.Context, address string, headers http.Head
 		delete(b.bodies, body)
 		b.recordLocked(err)
 		b.mu.Unlock()
-		return nil
 	}
 	b.mu.Lock()
 	b.bodies[body] = struct{}{}

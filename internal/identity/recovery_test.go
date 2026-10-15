@@ -82,12 +82,13 @@ func TestBackendRefreshesSeedOnlyForExplicitSignatureFailure(t *testing.T) {
 	if entry == nil || entry.session.SDK.RequestCount != 1 || entry.health.LastRecovery == nil || *entry.health.LastRecovery != "refresh" {
 		t.Fatal("signature recovery state missing")
 	}
+	persisted(t, p)
 	var recovery string
 	if e = db.QueryRow(context.Background(), "SELECT health->>'lastRecovery' FROM "+p.identitiesTable+" WHERE id=$1", result.IdentityID).Scan(&recovery); e != nil || recovery != "refresh" {
 		t.Fatalf("recovery was not persisted:%s %v", recovery, e)
 	}
-	if p.Stats().Writes != 1 {
-		t.Fatal("bootstrap/retry wrote intermediate database state")
+	if stats := p.Stats(); stats.Checkpoints != 1 || stats.Writes != 1 {
+		t.Fatal("bootstrap/retry wrote intermediate database state", stats)
 	}
 }
 func TestBackendRecreatesDeviceInSameProxySlotOnlyWhenRejected(t *testing.T) {
@@ -106,7 +107,7 @@ func TestBackendRecreatesDeviceInSameProxySlotOnlyWhenRejected(t *testing.T) {
 	if entry == nil || entry.ordinal != 0 || entry.proxy.key != "one.example:8080" || entry.health.LastRecovery == nil || *entry.health.LastRecovery != "recreate" {
 		t.Fatal("device recreation changed permanent proxy slot")
 	}
-	if stats := p.Stats(); stats.Identities != 1 || stats.Registered != 1 || stats.Writes != 1 {
+	if stats := p.Stats(); stats.Identities != 1 || stats.Registered != 1 || stats.Checkpoints != 1 {
 		t.Fatalf("device recreation duplicated pool rows:%+v", stats)
 	}
 }
@@ -154,12 +155,13 @@ func TestProxyNetworkCooldownSurvivesOlderConcurrentSuccess(t *testing.T) {
 	p := openTestPool(t, cfg, "")
 	first, second := mustAcquire(t, p, ""), mustAcquire(t, p, "")
 	network := &net.DNSError{Err: "fixture network timeout", Name: "example.invalid", IsTimeout: true}
-	finishLease(t, first, network)
-	finishLease(t, second, nil)
+	first.finish(network)
+	second.finish(nil)
 	proxy := first.entry.proxy
 	if proxy.health.Failures != 1 || proxy.health.CooldownUntil <= time.Now().UnixMilli() {
 		t.Fatal("older success erased a newer proxy failure")
 	}
+	persisted(t, p)
 	var failures int
 	if e := db.QueryRow(context.Background(), "SELECT (health->>'failures')::int FROM "+p.proxiesTable+" WHERE id=$1", proxy.id).Scan(&failures); e != nil || failures != 1 {
 		t.Fatal("proxy cooldown persistence was overwritten")
@@ -172,7 +174,7 @@ func TestProxyNetworkCooldownSurvivesOlderConcurrentSuccess(t *testing.T) {
 	proxy.health.CooldownUntil = 0
 	p.mu.Unlock()
 	recovered := mustAcquire(t, p, first.entry.id)
-	finishLease(t, recovered, nil)
+	recovered.finish(nil)
 	if proxy.health.Failures != 0 || proxy.health.CooldownUntil != 0 {
 		t.Fatal("fresh success failed to restore proxy")
 	}
@@ -182,7 +184,7 @@ func TestOpenMediaKeepsLeaseUntilBodyCloseThenPersistsCookies(t *testing.T) {
 	p := openTestPool(t, cfg, "")
 	l := mustAcquire(t, p, "")
 	id := l.entry.id
-	finishLease(t, l, nil)
+	l.finish(nil)
 	p.clientFactory = func(s *tiktokapp.Session, _ *http.Client) *tiktokapp.Client {
 		return tiktokapp.NewClient(s, fixtureDoer(func(r *http.Request) (*http.Response, error) {
 			response := fixtureResponse(200, []byte("video fixture"))
@@ -190,12 +192,12 @@ func TestOpenMediaKeepsLeaseUntilBodyCloseThenPersistsCookies(t *testing.T) {
 			return response, nil
 		}))
 	}
-	initial := p.Stats().Writes
+	initial := p.Stats().Checkpoints
 	response, e := p.OpenMedia(context.Background(), id, "https://video.example.org/file.mp4", nil)
 	if e != nil {
 		t.Fatal(e)
 	}
-	if stats := p.Stats(); stats.Busy != 1 || stats.Writes != initial {
+	if stats := p.Stats(); stats.Busy != 1 || stats.Checkpoints != initial {
 		t.Fatal("media operation finished before body")
 	}
 	body, e := io.ReadAll(response.Body)
@@ -211,39 +213,13 @@ func TestOpenMediaKeepsLeaseUntilBodyCloseThenPersistsCookies(t *testing.T) {
 	if e = response.Body.Close(); e != nil {
 		t.Fatal(e)
 	}
-	if stats := p.Stats(); stats.Busy != 0 || stats.Writes != initial+1 {
+	if stats := p.Stats(); stats.Busy != 0 || stats.Checkpoints != initial+1 {
 		t.Fatal("media completion did not flush exactly once")
 	}
+	persisted(t, p)
 	var cookies string
 	if e = db.QueryRow(context.Background(), "SELECT session->>'cookies' FROM "+p.identitiesTable+" WHERE id=$1", id).Scan(&cookies); e != nil || !bytes.Contains([]byte(cookies), []byte("downloaded")) {
 		t.Fatal("media response cookie was not persisted")
-	}
-}
-
-func TestDatabaseOwnerLossFailsClosedAndCancelsActiveLease(t *testing.T) {
-	cfg, db := testDatabase(t)
-	p := openTestPool(t, cfg, "")
-	first, second := mustAcquire(t, p, ""), mustAcquire(t, p, "")
-	var terminated bool
-	if e := db.QueryRow(context.Background(), "SELECT pg_terminate_backend($1)", p.db.PgConn().PID()).Scan(&terminated); e != nil || !terminated {
-		t.Fatal("could not terminate isolated identity owner")
-	}
-	if e := first.finish(nil); e == nil {
-		t.Fatal("operation succeeded after losing identity ownership connection")
-	}
-	if p.Ready() {
-		t.Fatal("identity pool stayed ready after database owner loss")
-	}
-	select {
-	case <-second.ctx.Done():
-	case <-time.After(time.Second):
-		t.Fatal("owner loss failed to cancel active identity operation")
-	}
-	if e := second.finish(context.Canceled); e == nil {
-		t.Fatal("cancelled operation silently lost state after owner loss")
-	}
-	if stats := p.Stats(); stats.Busy != 0 {
-		t.Fatal("owner loss leaked identity leases")
 	}
 }
 
@@ -275,7 +251,7 @@ func TestPoolCloseCancelsQueuedAcquisitionAndActiveOperation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("closing pool did not cancel queue")
 	}
-	finishLease(t, active, context.Canceled)
+	active.finish(context.Canceled)
 	select {
 	case e := <-closed:
 		if e != nil {

@@ -21,7 +21,6 @@ type lease struct {
 	unlink       func() bool
 	proxyVersion uint64
 	once         sync.Once
-	finishErr    error
 }
 
 func (l *lease) client() *tiktokapp.Client {
@@ -129,7 +128,7 @@ func (p *Pool) acquire(ctx context.Context, id string) (*lease, error) {
 					p.mu.Unlock()
 					return nil, err
 				}
-				selected = &entry{id: core.NewID(), proxy: selectedProxy, ordinal: ordinal, session: session, revision: -1}
+				selected = &entry{id: core.NewID(), proxy: selectedProxy, ordinal: ordinal, session: session}
 				p.entries[selected.id] = selected
 				selectedProxy.slots[ordinal] = selected
 			}
@@ -169,24 +168,25 @@ func (p *Pool) acquire(ctx context.Context, id string) (*lease, error) {
 		p.mu.Unlock()
 	}
 }
-func (l *lease) finish(operationErr error) error {
+
+// finish releases the identity and records its state in RAM. PostgreSQL saves
+// the checkpoint later, so database problems never fail the operation.
+func (l *lease) finish(operationErr error) {
 	l.once.Do(func() {
 		p, e := l.pool, l.entry
+		// Cancellation is not an identity failure; check before ending the context.
+		cancelled := l.ctx.Err() != nil
+		l.unlink()
+		l.cancel()
+		// The lease still owns the session, so it cannot change while encoding.
+		session, err := json.Marshal(e.session)
+		p.mu.Lock()
 		defer func() {
-			l.unlink()
-			l.cancel()
-			p.mu.Lock()
-			e.registered = e.session.Identity.Kind == "registered"
-			e.signedAt = time.Time{}
-			if e.session.SDK != nil {
-				e.signedAt = e.session.SDK.FetchedAt
-			}
 			e.busy = false
 			p.wakeLocked()
 			p.mu.Unlock()
 			p.workers.Done()
 		}()
-		p.mu.Lock()
 		if operationErr == nil {
 			e.health.Failures = 0
 			e.health.CooldownUntil = 0
@@ -195,16 +195,16 @@ func (l *lease) finish(operationErr error) error {
 				e.proxy.health.CooldownUntil = 0
 				e.proxy.healthVersion++
 			}
-		} else if l.ctx.Err() == nil {
+		} else if !cancelled {
 			p.failedLocked(e, operationErr)
 		}
-		p.mu.Unlock()
-		if err := p.save(e); err != nil {
-			p.fail()
-			l.finishErr = core.NewError("service_not_configured", "Identity state could not be saved.", 503)
+		e.registered = e.session.Identity.Kind == "registered"
+		if err != nil {
+			p.log.Error("identity checkpoint skipped", "identity_id", e.id, "error", err)
+			return
 		}
+		p.checkpointLocked(e, session)
 	})
-	return l.finishErr
 }
 func (p *Pool) failedLocked(e *entry, err error) {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -243,64 +243,6 @@ func (p *Pool) failedLocked(e *entry, err error) {
 	}
 	h.CooldownUntil = max(h.CooldownUntil, now.Add(delay).UnixMilli())
 }
-func (p *Pool) save(e *entry) error {
-	raw, err := json.Marshal(e.session)
-	if err != nil {
-		return err
-	}
-	p.mu.Lock()
-	rawHealth, err := json.Marshal(e.health)
-	proxyVersion := e.proxy.healthVersion
-	dirtyProxy := proxyVersion > e.proxy.savedHealthVersion
-	rawProxy, proxyErr := json.Marshal(e.proxy.health)
-	p.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	if proxyErr != nil {
-		return proxyErr
-	}
-	p.dbMu.Lock()
-	defer p.dbMu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-	defer cancel()
-	next := e.revision + 1
-	var changed int64
-	if e.revision < 0 {
-		tag, err := p.db.Exec(ctx, `INSERT INTO `+p.identitiesTable+`(id,proxy_id,ordinal,session,assignment_count,revision,health,last_used_at) VALUES($1,$2,$3,$4::jsonb,$5,$6,$7::jsonb,clock_timestamp()) ON CONFLICT DO NOTHING`, e.id, e.proxy.id, e.ordinal, raw, e.assignments, next, rawHealth)
-		if err != nil {
-			return err
-		}
-		changed = tag.RowsAffected()
-	} else {
-		tag, err := p.db.Exec(ctx, `UPDATE `+p.identitiesTable+` SET session=$2::jsonb,assignment_count=$3,revision=$4,last_used_at=clock_timestamp(),updated_at=clock_timestamp(),health=$8::jsonb WHERE id=$1 AND revision=$5 AND proxy_id=$6 AND ordinal=$7`, e.id, raw, e.assignments, next, e.revision, e.proxy.id, e.ordinal, rawHealth)
-		if err != nil {
-			return err
-		}
-		changed = tag.RowsAffected()
-	}
-	p.writes.Add(1)
-	if changed != 1 {
-		return errors.New("identity revision conflict")
-	}
-	e.revision = next
-	if dirtyProxy {
-		// A previous writer may already have persisted a newer proxy version.
-		p.mu.Lock()
-		stale := proxyVersion <= e.proxy.savedHealthVersion
-		p.mu.Unlock()
-		if !stale {
-			if _, err = p.db.Exec(ctx, `UPDATE `+p.proxiesTable+` SET health=$2::jsonb,updated_at=clock_timestamp() WHERE id=$1`, e.proxy.id, rawProxy); err != nil {
-				return err
-			}
-			p.writes.Add(1)
-			p.mu.Lock()
-			e.proxy.savedHealthVersion = max(e.proxy.savedHealthVersion, proxyVersion)
-			p.mu.Unlock()
-		}
-	}
-	return nil
-}
 func (l *lease) recover(err error) bool {
 	var failure *tiktokapp.UpstreamError
 	if l.ctx.Err() != nil || !errors.As(err, &failure) || failure.Recovery == tiktokapp.RecoveryNone {
@@ -332,6 +274,5 @@ func (l *lease) recover(err error) bool {
 	} else {
 		e.session.SDK = nil
 	}
-	e.signedAt = time.Time{}
 	return true
 }

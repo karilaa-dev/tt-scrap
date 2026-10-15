@@ -58,9 +58,7 @@ func (p *Pool) Detail(ctx context.Context, id string) (result core.AppDetail, er
 		return result, err
 	}
 	defer func() {
-		if saved := l.finish(err); saved != nil {
-			err = saved
-		}
+		l.finish(err)
 		err = publicError(err)
 	}()
 	account := tiktokapp.Account{}
@@ -92,9 +90,7 @@ func (p *Pool) Feed(ctx context.Context) (result map[string]any, err error) {
 		return nil, err
 	}
 	defer func() {
-		if saved := l.finish(err); saved != nil {
-			err = saved
-		}
+		l.finish(err)
 		err = publicError(err)
 	}()
 	for attempt := 0; attempt < 2; attempt++ {
@@ -128,9 +124,7 @@ func (p *Pool) OpenMedia(ctx context.Context, identityID, address string, header
 			return response, nil
 		}
 		if attempt > 0 || !l.recover(err) {
-			if saved := l.finish(err); saved != nil {
-				return nil, saved
-			}
+			l.finish(err)
 			return nil, publicError(err)
 		}
 	}
@@ -139,7 +133,7 @@ func (p *Pool) OpenMedia(ctx context.Context, identityID, address string, header
 
 type leasedBody struct {
 	io.ReadCloser
-	finish   func(error) error
+	finish   func(error)
 	once     sync.Once
 	mu       sync.Mutex
 	readErr  error
@@ -164,9 +158,7 @@ func (b *leasedBody) Close() error {
 		if err == nil {
 			err = b.closeErr
 		}
-		if saved := b.finish(err); saved != nil {
-			b.closeErr = saved
-		}
+		b.finish(err)
 	})
 	return b.closeErr
 }

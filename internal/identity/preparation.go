@@ -49,20 +49,16 @@ func (p *Pool) preparationStatusLocked() core.IdentityPreparation {
 		status = p.preparation.status
 	}
 	status.Proxies, status.Target = len(p.proxies), len(p.proxies)*10
-	now := time.Now()
 	for _, e := range p.entries {
-		if e.prepared(now) {
+		if e.registered {
 			status.Ready++
 		}
 	}
 	return status
 }
 
-func (e *entry) prepared(now time.Time) bool {
-	return e.registered && !e.signedAt.IsZero() && !e.signedAt.After(now) && now.Sub(e.signedAt) < tiktokapp.SigningTTL
-}
-
-// Prepare blocks startup until every slot has durable registration and a fresh seed.
+// Prepare blocks startup until every slot has a registered device. Signing
+// seeds are fetched on demand, before the request that needs one.
 func (p *Pool) Prepare(ctx context.Context) error {
 	if _, err := p.StartPreparation(); err != nil {
 		return err
@@ -123,7 +119,7 @@ func (p *Pool) prepareSlot(proxy *proxyState, ordinal int) error {
 		return context.Canceled
 	}
 	e := proxy.slots[ordinal]
-	if e != nil && e.prepared(time.Now()) {
+	if e != nil && e.registered {
 		p.mu.Unlock()
 		return nil
 	}
@@ -133,7 +129,7 @@ func (p *Pool) prepareSlot(proxy *proxyState, ordinal int) error {
 			p.mu.Unlock()
 			return err
 		}
-		e = &entry{id: core.NewID(), proxy: proxy, ordinal: ordinal, session: session, revision: -1}
+		e = &entry{id: core.NewID(), proxy: proxy, ordinal: ordinal, session: session}
 		proxy.slots[ordinal], p.entries[e.id] = e, e
 	}
 	id := e.id
@@ -166,14 +162,12 @@ func (p *Pool) prepareSlot(proxy *proxyState, ordinal int) error {
 		// A concurrent request may extend the cooldown while we wait.
 	}
 	client := l.client()
-	err := client.Bootstrap(l.ctx)
+	err := client.Register(l.ctx)
 	client.SyncCookies()
 	if err != nil {
 		l.recover(err)
 	}
-	if saved := l.finish(err); saved != nil {
-		return saved
-	}
+	l.finish(err)
 	return err
 }
 

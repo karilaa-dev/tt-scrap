@@ -77,6 +77,7 @@ func TestPreparationFillsEachProxyInParallelAndReusesPersistedIdentities(t *test
 				mu.Lock()
 				seeds++
 				mu.Unlock()
+				t.Error("preparation fetched a signing seed")
 				return fixtureResponse(200, seed), nil
 			default:
 				t.Errorf("preparation fetched media or metadata: %s", r.URL.Path)
@@ -103,7 +104,7 @@ func TestPreparationFillsEachProxyInParallelAndReusesPersistedIdentities(t *test
 		t.Fatal(status)
 	}
 	mu.Lock()
-	if registrations != 30 || seeds != 30 || len(starts) != 3 {
+	if registrations != 30 || seeds != 0 || len(starts) != 3 {
 		t.Fatal(registrations, seeds, len(starts))
 	}
 	for _, times := range starts {
@@ -117,13 +118,14 @@ func TestPreparationFillsEachProxyInParallelAndReusesPersistedIdentities(t *test
 		}
 	}
 	mu.Unlock()
-	initialWrites := p.Stats().Writes
+	initial := p.Stats().Checkpoints
 	if err := p.Prepare(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if p.Stats().Writes != initialWrites {
+	if p.Stats().Checkpoints != initial {
 		t.Fatal("prepared identities were rewritten")
 	}
+	persisted(t, p)
 	var count, assignments int
 	if err := db.QueryRow(ctx, "SELECT count(*),sum(assignment_count) FROM "+p.identitiesTable).Scan(&count, &assignments); err != nil || count != 30 || assignments != 0 {
 		t.Fatal("preparation changed request balancing", count, assignments, err)
@@ -144,39 +146,47 @@ func TestPreparationFillsEachProxyInParallelAndReusesPersistedIdentities(t *test
 	}
 }
 
-func TestPreparationRefreshesExpiredSeedsWithoutRecreatingDevices(t *testing.T) {
+func TestPreparationRegistersWithoutSigningAndRequestsSignOnDemand(t *testing.T) {
 	cfg, _ := testDatabase(t)
 	p := openTestPool(t, cfg, "")
 	p.preparationDelay = time.Millisecond
 	fixture := newProtocolFixture(t, "", 200)
 	fixture.install(p)
-	if err := p.Prepare(context.Background()); err != nil {
+	ctx := context.Background()
+	if err := p.Prepare(ctx); err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range p.entries {
-		e.session.SDK.FetchedAt = time.Now().Add(-4 * time.Hour)
-		e.signedAt = e.session.SDK.FetchedAt
-		e.client = nil
+	if fixture.registrations != 10 || fixture.seeds != 0 {
+		t.Fatal("startup preparation fetched signing seeds", fixture)
 	}
-	if err := p.Prepare(context.Background()); err != nil {
-		t.Fatal(err)
+	const video = "7695962883523464478"
+	result, err := p.Detail(ctx, video)
+	if err != nil || fixture.seeds != 1 || fixture.details != 1 {
+		t.Fatal("first request did not sign on demand", err, fixture)
 	}
-	if fixture.registrations != 10 || fixture.seeds != 20 {
-		t.Fatal("expired seeds recreated devices", fixture)
+	l := mustAcquire(t, p, result.IdentityID)
+	l.entry.session.SDK.FetchedAt = time.Now().Add(-tiktokapp.SigningTTL + time.Minute)
+	if _, err = l.client().Detail(l.ctx, video); err != nil || fixture.seeds != 1 {
+		t.Fatal("seed younger than one hour was refreshed", err, fixture)
 	}
-	l := mustAcquire(t, p, "")
+	l.entry.session.SDK.FetchedAt = time.Now().Add(-tiktokapp.SigningTTL - time.Minute)
+	if _, err = l.client().Detail(l.ctx, video); err != nil || fixture.seeds != 2 || fixture.details != 3 {
+		t.Fatal("expired seed was not refreshed before the request", err, fixture)
+	}
 	if !l.recover(&tiktokapp.UpstreamError{Code: "signature_expired", Recovery: tiktokapp.RecoveryRefresh}) {
 		t.Fatal("signature recovery was not accepted")
 	}
-	if status := p.PreparationStatus(); status.Ready != 9 {
-		t.Fatal("preparation still counts invalidated signing state as ready", status)
+	l.finish(nil)
+	for _, e := range p.entries {
+		if e.session.SDK != nil {
+			e.session.SDK.FetchedAt = time.Now().Add(-2 * tiktokapp.SigningTTL)
+		}
 	}
-	finishLease(t, l, nil)
-	if err := p.Prepare(context.Background()); err != nil {
+	if err = p.Prepare(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if fixture.registrations != 10 || fixture.seeds != 21 {
-		t.Fatal("recovery did not retain and prepare the existing device", fixture)
+	if status := p.PreparationStatus(); status.Ready != 10 || fixture.registrations != 10 || fixture.seeds != 2 {
+		t.Fatal("preparation refreshed signing or lost registered devices", status, fixture)
 	}
 }
 
@@ -206,9 +216,8 @@ func TestPreparationFailureIsRetryableAndCloseCancelsWorkers(t *testing.T) {
 	if p.Stats().Identities != 10 || p.PreparationStatus().Ready != 10 {
 		t.Fatal("retry duplicated identities")
 	}
-	for _, e := range p.entries {
-		e.session.SDK = nil
-		e.signedAt = time.Time{}
+	for _, e := range p.proxies[0].slots[:1] {
+		e.session.Identity.Kind, e.registered = "local", false
 		e.client = nil
 	}
 	started := make(chan struct{})
@@ -265,7 +274,7 @@ func TestPreparationWaitsForProxyCooldownAndShutdownCancelsWait(t *testing.T) {
 	}
 	p.mu.Lock()
 	e := p.proxies[0].slots[0]
-	e.session.SDK, e.signedAt = nil, time.Time{}
+	e.session.Identity.Kind, e.registered = "local", false
 	e.proxy.health.CooldownUntil = time.Now().Add(time.Hour).UnixMilli()
 	p.mu.Unlock()
 	if _, err := p.StartPreparation(); err != nil {
@@ -287,7 +296,7 @@ func TestPreparationWaitsForProxyCooldownAndShutdownCancelsWait(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("shutdown did not cancel cooldown wait")
 	}
-	if fixture.registrations != 10 || fixture.seeds != 10 {
+	if fixture.registrations != 10 || fixture.seeds != 0 {
 		t.Fatal("preparation contacted a cooling proxy", fixture.registrations, fixture.seeds)
 	}
 }

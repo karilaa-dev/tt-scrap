@@ -92,9 +92,7 @@ func BenchmarkAppDelivery(b *testing.B) {
 						b.Fatal(err)
 					}
 					id := l.entry.id
-					if err = l.finish(nil); err != nil {
-						b.Fatal(err)
-					}
+					l.finish(nil)
 					register := func(kind string) core.AssetDescriptor {
 						return assets.Register(core.AssetContext{IdentityID: id, Platform: "tiktok", Kind: kind, Filename: kind, UpstreamURL: "https://cdn.example/" + kind}, 0)
 					}
@@ -176,6 +174,9 @@ func BenchmarkAppDelivery(b *testing.B) {
 				}
 				if failures.Load() != 0 || badBytes.Load() != 0 || requests.Load() != parts*int64(b.N) || uploaded.Load() != parts*int64(b.N) {
 					b.Fatalf("failures=%d corrupt=%d requests=%d uploads=%d", failures.Load(), badBytes.Load(), requests.Load(), uploaded.Load())
+				}
+				if err := p.flush(context.Background()); err != nil {
+					b.Fatal(err)
 				}
 				b.ReportMetric(float64(p.Stats().Writes-before.Writes)/float64(b.N), "writes/op")
 				b.ReportMetric(float64(requests.Load())/float64(b.N), "media/op")

@@ -283,6 +283,7 @@ func TestAccountFallbackDistinguishesRejectionFromUpstreamFailure(t *testing.T) 
 				if anonymous != 1 || authenticated != 1 {
 					t.Fatal("account rejection retried unexpectedly", anonymous, authenticated)
 				}
+				persisted(t, p)
 				for _, entry := range p.entries {
 					if entry.health.Failures != tc.failures || (entry.health.CooldownUntil == 0) != (tc.failures == 0) || entry.proxy.health.Failures != 0 {
 						t.Error("account fallback updated identity health incorrectly")

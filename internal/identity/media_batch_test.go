@@ -23,7 +23,7 @@ func TestMediaBatchRunsConcurrentlyAndPersistsOnce(t *testing.T) {
 	p := openTestPool(t, cfg, "")
 	l := mustAcquire(t, p, "")
 	id := l.entry.id
-	finishLease(t, l, nil)
+	l.finish(nil)
 	started, release := make(chan struct{}, 3), make(chan struct{})
 	var clients atomic.Int32
 	p.clientFactory = func(s *tiktokapp.Session, _ *http.Client) *tiktokapp.Client {
@@ -73,7 +73,7 @@ func TestMediaBatchRunsConcurrentlyAndPersistsOnce(t *testing.T) {
 			t.Fatal("media probes were serialized")
 		}
 	}
-	if stats := p.Stats(); stats.Busy != 1 || stats.Writes != before.Writes {
+	if stats := p.Stats(); stats.Busy != 1 || stats.Checkpoints != before.Checkpoints {
 		t.Fatal("batch released or saved before completion", stats)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
@@ -88,9 +88,10 @@ func TestMediaBatchRunsConcurrentlyAndPersistsOnce(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if stats := p.Stats(); stats.Busy != 0 || stats.Queued != 0 || stats.Writes != before.Writes+1 || stats.Reads != before.Reads {
+	if stats := p.Stats(); stats.Busy != 0 || stats.Queued != 0 || stats.Checkpoints != before.Checkpoints+1 || stats.Reads != before.Reads {
 		t.Fatal("batch did not save exactly once", stats)
 	}
+	persisted(t, p)
 	var cookies string
 	if err := db.QueryRow(context.Background(), "SELECT session->>'cookies' FROM "+p.identitiesTable+" WHERE id=$1", id).Scan(&cookies); err != nil {
 		t.Fatal(err)
@@ -121,12 +122,12 @@ type trackedMediaBody struct {
 
 func (b trackedMediaBody) Close() error { b.closed.Store(true); return nil }
 
-func TestMediaBatchClosesBodiesAndRejectsCheckpointFailure(t *testing.T) {
-	cfg, db := testDatabase(t)
+func TestMediaBatchClosesBodiesAndRejectsLateRequests(t *testing.T) {
+	cfg, _ := testDatabase(t)
 	p := openTestPool(t, cfg, "")
 	l := mustAcquire(t, p, "")
 	id := l.entry.id
-	finishLease(t, l, nil)
+	l.finish(nil)
 	var closed atomic.Bool
 	p.clientFactory = func(s *tiktokapp.Session, _ *http.Client) *tiktokapp.Client {
 		return tiktokapp.NewClient(s, fixtureDoer(func(*http.Request) (*http.Response, error) {
@@ -136,15 +137,11 @@ func TestMediaBatchClosesBodiesAndRejectsCheckpointFailure(t *testing.T) {
 	var after core.OpenAppMedia
 	err := p.WithMedia(context.Background(), id, func(open core.OpenAppMedia) error {
 		after = open
-		if _, err := open(context.Background(), "https://cdn.example/video", nil); err != nil {
-			return err
-		}
-		_, err := db.Exec(context.Background(), "UPDATE "+p.identitiesTable+" SET revision=revision+1 WHERE id=$1", id)
+		_, err := open(context.Background(), "https://cdn.example/video", nil)
 		return err
 	})
-	var api *core.Error
-	if !errors.As(err, &api) || api.Code != "service_not_configured" || p.Ready() || !closed.Load() {
-		t.Fatal("checkpoint failure or open body was lost", err, p.Stats(), closed.Load())
+	if err != nil || !p.Ready() || !closed.Load() {
+		t.Fatal("open body was lost", err, p.Stats(), closed.Load())
 	}
 	if _, err = after(context.Background(), "https://cdn.example/late", nil); !errors.Is(err, context.Canceled) {
 		t.Fatal("finished batch accepted work", err)
@@ -158,7 +155,7 @@ func TestMediaBatchRecoversSigningAfterAllProbesFinish(t *testing.T) {
 			p := openTestPool(t, cfg, "")
 			l := mustAcquire(t, p, "")
 			id := l.entry.id
-			finishLease(t, l, nil)
+			l.finish(nil)
 			fixture := newProtocolFixture(t, "", 0)
 			plays, attempts := 0, 0
 			p.clientFactory = func(s *tiktokapp.Session, _ *http.Client) *tiktokapp.Client {
@@ -173,7 +170,7 @@ func TestMediaBatchRecoversSigningAfterAllProbesFinish(t *testing.T) {
 					return fixture.do(r)
 				}))
 			}
-			before := p.Stats().Writes
+			before := p.Stats().Checkpoints
 			err := p.WithMedia(context.Background(), id, func(open core.OpenAppMedia) error {
 				attempts++
 				res, err := open(context.Background(), "https://api19-va.tiktokv.com/aweme/v1/play/", nil)
@@ -186,7 +183,7 @@ func TestMediaBatchRecoversSigningAfterAllProbesFinish(t *testing.T) {
 			if failure == "invalid device_id" {
 				registered = 2
 			}
-			if err != nil || plays != 2 || attempts != 2 || fixture.registrations != registered || fixture.seeds != 2 || p.Stats().Writes != before+1 {
+			if err != nil || plays != 2 || attempts != 2 || fixture.registrations != registered || fixture.seeds != 2 || p.Stats().Checkpoints != before+1 {
 				t.Fatal("incorrect grouped recovery", err, plays, attempts, fixture, p.Stats())
 			}
 		})
@@ -198,7 +195,7 @@ func TestMediaBatchCancellationStopsAllRequestsAndReleasesIdentity(t *testing.T)
 	p := openTestPool(t, cfg, "")
 	l := mustAcquire(t, p, "")
 	id := l.entry.id
-	finishLease(t, l, nil)
+	l.finish(nil)
 	started := make(chan struct{}, 3)
 	var stopped atomic.Int32
 	p.clientFactory = func(s *tiktokapp.Session, _ *http.Client) *tiktokapp.Client {
@@ -211,7 +208,7 @@ func TestMediaBatchCancellationStopsAllRequestsAndReleasesIdentity(t *testing.T)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	before := p.Stats().Writes
+	before := p.Stats().Checkpoints
 	done := make(chan error, 1)
 	go func() {
 		done <- p.WithMedia(ctx, id, func(open core.OpenAppMedia) error {
@@ -241,7 +238,7 @@ func TestMediaBatchCancellationStopsAllRequestsAndReleasesIdentity(t *testing.T)
 	case <-time.After(3 * time.Second):
 		t.Fatal("cancelled batch did not finish")
 	}
-	if stats := p.Stats(); stopped.Load() != 3 || stats.Busy != 0 || stats.Queued != 0 || stats.Writes != before+1 || !stats.Ready {
+	if stats := p.Stats(); stopped.Load() != 3 || stats.Busy != 0 || stats.Queued != 0 || stats.Checkpoints != before+1 || !stats.Ready {
 		t.Fatal("cancelled work leaked or invalidated the pool", stopped.Load(), stats)
 	}
 }
@@ -253,7 +250,7 @@ func TestDownloadFallbackRetainsPinnedIdentity(t *testing.T) {
 	p := openTestPool(t, cfg, "http://proxy.example:8080")
 	l := mustAcquire(t, p, "")
 	id := l.entry.id
-	finishLease(t, l, nil)
+	l.finish(nil)
 	var bad, good atomic.Int32
 	p.clientFactory = func(s *tiktokapp.Session, _ *http.Client) *tiktokapp.Client {
 		return tiktokapp.NewClient(s, fixtureDoer(func(r *http.Request) (*http.Response, error) {
@@ -273,14 +270,14 @@ func TestDownloadFallbackRetainsPinnedIdentity(t *testing.T) {
 	}
 	d := platform.NewDownloader(cfg, p)
 	defer d.Close()
-	before := p.Stats().Writes
+	before := p.Stats().Checkpoints
 	asset := core.AssetContext{Platform: "tiktok", Kind: "image", Filename: "x.jpg", IdentityID: id, UpstreamURL: "https://cdn.example/bad", AlternateURLs: []string{"https://cdn.example/good"}}
 	file, err := d.Download(context.Background(), asset, 0)
 	if err != nil {
 		t.Fatal("backup URL was not usable", err)
 	}
 	file.Cleanup()
-	if bad.Load() != 1 || good.Load() != 1 || p.Stats().Writes != before+1 {
+	if bad.Load() != 1 || good.Load() != 1 || p.Stats().Checkpoints != before+1 {
 		t.Fatal("fallback was not one operation", bad.Load(), good.Load(), p.Stats())
 	}
 	asset.UpstreamURL = "https://cdn.example/good"
@@ -308,7 +305,7 @@ func TestAppDataOnlyUsesDirectCDNWithPinnedPlayRequest(t *testing.T) {
 	p := openTestPool(t, cfg, "http://proxy.example:8080")
 	l := mustAcquire(t, p, "")
 	id := l.entry.id
-	finishLease(t, l, nil)
+	l.finish(nil)
 	fixture := newProtocolFixture(t, "", 0)
 	var plays atomic.Int32
 	p.clientFactory = func(s *tiktokapp.Session, _ *http.Client) *tiktokapp.Client {
@@ -370,7 +367,7 @@ func TestPinnedDownloadWaitDoesNotConsumeTransferTimeout(t *testing.T) {
 	}()
 	waitStats(t, p, func(s Stats) bool { return s.Queued == 1 })
 	time.Sleep(2 * cfg.DownloadTimeout)
-	finishLease(t, active, nil)
+	active.finish(nil)
 	if err := <-done; err != nil {
 		t.Fatal("queued slide used up its transfer timeout", err)
 	}
@@ -391,7 +388,7 @@ func TestPinnedDownloadWaitDoesNotConsumeTransferTimeout(t *testing.T) {
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatal("caller cancellation was lost while queued", err)
 	}
-	finishLease(t, active, nil)
+	active.finish(nil)
 	if calls.Load() != 1 {
 		t.Fatal("canceled queued slide contacted upstream")
 	}
@@ -404,7 +401,7 @@ func TestPinnedDownloadTransferTimeoutRemainsEnforced(t *testing.T) {
 	p := openTestPool(t, cfg, "")
 	active := mustAcquire(t, p, "")
 	id := active.entry.id
-	finishLease(t, active, nil)
+	active.finish(nil)
 	p.clientFactory = func(s *tiktokapp.Session, _ *http.Client) *tiktokapp.Client {
 		return tiktokapp.NewClient(s, fixtureDoer(func(r *http.Request) (*http.Response, error) {
 			<-r.Context().Done()

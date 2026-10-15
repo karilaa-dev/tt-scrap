@@ -77,6 +77,7 @@ func run() error {
 		return err
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel(config.LogLevel)}))
+	slog.SetDefault(logger)
 	if config.TempDir != "" {
 		if err := os.MkdirAll(config.TempDir, 0700); err != nil {
 			return errors.New("cannot create TEMP_DIR")
@@ -128,12 +129,17 @@ func run() error {
 	go func() { failures <- server.Serve(listener) }()
 	logger.Info("service started", "address", listener.Addr().String(), "proxies", len(proxies))
 	logger.Info("identity pool loaded", "stats", pool.Stats())
+	var stopped error
 	select {
 	case err = <-failures:
 		if !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}
 		return nil
+	case <-pool.Done():
+		// Only lost schema ownership stops the pool; database outages do not.
+		// Exit so the supervisor restarts with state reloaded from PostgreSQL.
+		stopped = pool.Err()
 	case <-shutdownSignal.Done():
 	}
 	logger.Info("service stopping")
@@ -144,7 +150,7 @@ func run() error {
 		_ = server.Close()
 	}
 	cancelLifetime()
-	return nil
+	return stopped
 }
 
 func logRequest(logger *slog.Logger, event httpapi.RequestEvent) {

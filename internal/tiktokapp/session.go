@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const SigningTTL = 3 * time.Hour
+const SigningTTL = time.Hour
 const APKVersion = "47.1.4"
 const APKPackage = "com.zhiliaoapp.musically"
 const APKAID = 1233
