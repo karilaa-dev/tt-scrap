@@ -30,6 +30,24 @@ type persistTiming struct {
 
 var defaultPersistTiming = persistTiming{probe: 5 * time.Second, probeTimeout: 5 * time.Second, connect: 15 * time.Second, write: 15 * time.Second, shutdown: 10 * time.Second, minBackoff: time.Second, maxBackoff: 30 * time.Second}
 
+// statementCancel handles an expired context by cancelling only the running
+// statement, so the connection keeps the ownership lock. If the server does
+// not answer within delay, the connection closes; during shutdown it closes
+// no later than the shutdown deadline.
+type statementCancel struct {
+	pgconn.CancelRequestContextWatcherHandler
+	delay time.Duration
+	pool  *Pool
+}
+
+func (h *statementCancel) HandleCancel(ctx context.Context) {
+	h.DeadlineDelay = h.delay
+	if by := h.pool.persistDeadline.Load(); by != nil {
+		h.DeadlineDelay = min(h.delay, time.Until(*by))
+	}
+	h.CancelRequestContextWatcherHandler.HandleCancel(ctx)
+}
+
 // checkpoint is an identity's complete state when its lease finished.
 type checkpoint struct {
 	session, health []byte
@@ -100,7 +118,7 @@ func (p *Pool) write(ctx context.Context, b saveBatch) error {
 	defer func() {
 		// ctx may have expired; a failed rollback would close the connection
 		// and release ownership.
-		rollback, cancel := context.WithTimeout(context.Background(), p.timing.probeTimeout)
+		rollback, cancel := context.WithTimeout(p.persistCtx, p.timing.probeTimeout)
 		defer cancel()
 		_ = tx.Rollback(rollback)
 	}()
@@ -239,7 +257,7 @@ func (p *Pool) dropIfClosed() bool {
 }
 
 func (p *Pool) closeConn(conn *pgx.Conn) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(p.persistCtx, time.Second)
 	defer cancel()
 	conn.Close(ctx)
 }

@@ -1,10 +1,10 @@
 package identity
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/url"
 	"sync"
@@ -476,13 +476,84 @@ func TestOnlySchemaAndPrivilegeErrorsPauseNewWork(t *testing.T) {
 	}
 }
 
+// An unresponsive database must not stretch shutdown past its save deadline:
+// the save or reconnect in flight, an unanswered cancel request, the rollback
+// and the connection close all end within it, and the unsaved state is
+// reported.
+func TestCloseBoundsSaveOnUnresponsiveDatabase(t *testing.T) {
+	for _, stuck := range []string{"save", "rollback", "reconnect"} {
+		t.Run(stuck, func(t *testing.T) {
+			cfg, db := testDatabase(t)
+			proxy := proxyDatabase(t, &cfg)
+			timing := fastPersistTiming
+			// As in production, a write or connect may outlast the shutdown
+			// deadline, and an unanswered cancel request may wait
+			// probeTimeout more.
+			timing.probe, timing.write, timing.connect, timing.probeTimeout, timing.shutdown = time.Hour, 10*time.Second, 10*time.Second, 2*time.Second, time.Second
+			if stuck == "rollback" {
+				// The save times out and is cancelled before the deadline.
+				timing.write = 500 * time.Millisecond
+			}
+			p, err := open(context.Background(), cfg, []string{""}, timing)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { p.Close() })
+			l := mustAcquire(t, p, "")
+			l.finish(nil)
+			persisted(t, p)
+			switch stuck {
+			case "save":
+				proxy.stall()
+			case "rollback":
+				lockIdentityRow(t, db, p, l.entry.id)
+				proxy.stallOn([]byte("rollback"))
+			case "reconnect":
+				proxy.stall()
+				proxy.cut()
+			}
+			mustAcquire(t, p, l.entry.id).finish(nil)
+			if stuck == "rollback" {
+				waitBlockedSave(t, db, ownerPID(p))
+			} else {
+				select {
+				case <-proxy.swallowed:
+				case <-time.After(5 * time.Second):
+					t.Fatal("save did not reach the database")
+				}
+			}
+			started := time.Now()
+			err = p.Close()
+			elapsed := time.Since(started)
+			if err == nil {
+				t.Fatal("shutdown reported unsaved state as saved")
+			}
+			if elapsed < timing.shutdown || elapsed > timing.shutdown+500*time.Millisecond {
+				t.Fatal("shutdown did not end at its save deadline", elapsed)
+			}
+			select {
+			case <-proxy.swallowed:
+			default:
+				t.Fatal("the database never stopped responding")
+			}
+		})
+	}
+}
+
 // cutProxy forwards database connections. cut drops the client sides as a
-// network failure would, while the server sides stay open.
+// network failure would, while the server sides stay open. stall makes the
+// database unresponsive: bytes sent to it, including cancel requests, are
+// read and discarded.
 type cutProxy struct {
-	mu      sync.Mutex
-	blocked bool
+	mu               sync.Mutex
+	blocked, stalled bool
+	// trigger stalls the proxy once a client sends it.
+	trigger []byte
 	clients []net.Conn
 	servers []net.Conn
+	// swallowed closes once client bytes are discarded.
+	swallowed   chan struct{}
+	swallowOnce sync.Once
 }
 
 func proxyDatabase(t *testing.T, cfg *core.Config) *cutProxy {
@@ -499,7 +570,7 @@ func proxyDatabase(t *testing.T, cfg *core.Config) *cutProxy {
 	if err != nil {
 		t.Fatal(err)
 	}
-	x := &cutProxy{}
+	x := &cutProxy{swallowed: make(chan struct{})}
 	t.Cleanup(func() {
 		listener.Close()
 		x.mu.Lock()
@@ -515,10 +586,17 @@ func proxyDatabase(t *testing.T, cfg *core.Config) *cutProxy {
 				return
 			}
 			x.mu.Lock()
-			blocked := x.blocked
+			blocked, stalled := x.blocked, x.stalled
+			if stalled {
+				x.clients = append(x.clients, client)
+			}
 			x.mu.Unlock()
 			if blocked {
 				client.Close()
+				continue
+			}
+			if stalled {
+				go x.pipe(nil, client, true)
 				continue
 			}
 			server, err := net.Dial("tcp", target)
@@ -529,13 +607,56 @@ func proxyDatabase(t *testing.T, cfg *core.Config) *cutProxy {
 			x.mu.Lock()
 			x.clients, x.servers = append(x.clients, client), append(x.servers, server)
 			x.mu.Unlock()
-			go io.Copy(server, client)
-			go io.Copy(client, server)
+			go x.pipe(server, client, true)
+			go x.pipe(client, server, false)
 		}
 	}()
 	address.Host = listener.Addr().String()
 	cfg.DBURL = address.String()
 	return x
+}
+
+// pipe copies src to dst until either fails, discarding bytes while the
+// proxy is stalled. A nil dst discards everything.
+func (x *cutProxy) pipe(dst, src net.Conn, fromClient bool) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := src.Read(buf)
+		if err != nil {
+			return
+		}
+		x.mu.Lock()
+		if fromClient && x.trigger != nil && bytes.Contains(buf[:n], x.trigger) {
+			x.stalled = true
+		}
+		stalled := x.stalled
+		x.mu.Unlock()
+		if stalled || dst == nil {
+			if fromClient {
+				x.swallowOnce.Do(func() { close(x.swallowed) })
+			}
+			continue
+		}
+		if _, err = dst.Write(buf[:n]); err != nil {
+			return
+		}
+	}
+}
+
+// stall stops forwarding without closing anything, as an unresponsive
+// server or network would. It lasts until the test ends.
+func (x *cutProxy) stall() {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.stalled = true
+}
+
+// stallOn stalls the proxy, from that message on, once a client sends
+// trigger.
+func (x *cutProxy) stallOn(trigger []byte) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.trigger = trigger
 }
 
 func (x *cutProxy) cut() {

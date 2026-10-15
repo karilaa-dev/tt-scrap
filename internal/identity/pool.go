@@ -109,6 +109,9 @@ type Pool struct {
 	// identity work is refused until a save succeeds, so RAM does not collect
 	// state that cannot be saved.
 	unwritable error
+	// persistDeadline, set when Close starts saving, is when Close cancels
+	// persistCtx, which bounds every database wait.
+	persistDeadline atomic.Pointer[time.Time]
 	// ownerLookup, when set by tests, runs after a failed ownership claim.
 	ownerLookup func()
 }
@@ -146,11 +149,8 @@ func open(ctx context.Context, cfg core.Config, addresses []string, timing persi
 	config.ConnectTimeout = 10 * time.Second
 	config.RuntimeParams["statement_timeout"] = "10000"
 	config.RuntimeParams["application_name"] = "tt-scrap"
-	// An expired context cancels only the running statement, so the
-	// connection keeps the ownership lock. If the server does not answer the
-	// cancel, the connection closes.
 	config.BuildContextWatcherHandler = func(conn *pgconn.PgConn) ctxwatch.Handler {
-		return &pgconn.CancelRequestContextWatcherHandler{Conn: conn, DeadlineDelay: timing.probeTimeout}
+		return &statementCancel{CancelRequestContextWatcherHandler: pgconn.CancelRequestContextWatcherHandler{Conn: conn}, delay: timing.probeTimeout, pool: p}
 	}
 	p.dbConfig = config
 	p.db, err = pgx.ConnectConfig(connectCtx, config)
@@ -366,7 +366,10 @@ func (p *Pool) Close() error {
 			proxy.transport.CloseIdleConnections()
 		}
 		// Finished leases left checkpoints; save them before releasing
-		// ownership, within one deadline that also bounds a save in progress.
+		// ownership. The deadline bounds a save in progress, its cancel
+		// request and rollback, reconnecting, and closing the connection.
+		by := time.Now().Add(p.timing.shutdown)
+		p.persistDeadline.Store(&by)
 		deadline := time.AfterFunc(p.timing.shutdown, p.persistCancel)
 		close(p.persistStop)
 		<-p.persistDone

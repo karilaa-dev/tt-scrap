@@ -20,7 +20,7 @@ Stop the previous app service before starting the Go service against the same sc
 
 Start the new service and check `/health/live`, `/health/ready`, and an authenticated request. Readiness requires the Instagram API key as well as a healthy app pool. Startup reuses saved identities and registers missing slots until all ten identities per proxy are registered; the HTTP listener opens only afterward. Signing material is fetched before the first signed request and refreshed on use once it is an hour old.
 
-RAM caches and asset tokens restart with the process. Request fresh metadata after deployment instead of reusing old asset tokens. Allow 45 seconds for container shutdown so the service can finish its 30-second request drain and spend up to 10 seconds saving identity state.
+RAM caches and asset tokens restart with the process. Request fresh metadata after deployment instead of reusing old asset tokens. Allow 45 seconds for container shutdown so the service can finish its 30-second request drain, let cancelled identity operations return, and spend at most 10 seconds saving identity state, including cancelling a stalled save and closing the database connection.
 
 ## Roll back
 
