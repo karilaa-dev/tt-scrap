@@ -88,9 +88,7 @@ func BenchmarkAppExtraction(b *testing.B) {
 					s.Identity.InstallID = "7500000000000000002"
 					s.Identity.RegisteredAt = &now
 					s.SDK = &tiktokapp.SDKState{Seed: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{5}, 98)), Algorithm: 3, FetchedAt: now}
-					if err = l.finish(nil); err != nil {
-						b.Fatal(err)
-					}
+					l.finish(nil)
 				}
 				service := platform.NewTikTok(cfg, core.NewAssets(time.Minute, 64), p, nil)
 				defer service.Close()
@@ -121,10 +119,14 @@ func BenchmarkAppExtraction(b *testing.B) {
 				if failures.Load() != 0 || details.Load() != int64(b.N) || probes.Load() != 0 {
 					b.Fatalf("work mismatch details=%d probes=%d errors=%d", details.Load(), probes.Load(), failures.Load())
 				}
+				if err := p.flush(context.Background()); err != nil {
+					b.Fatal(err)
+				}
 				after := p.Stats()
 				if after.Busy != 0 || after.Queued != 0 || after.Reads != before.Reads {
 					b.Fatal("pool leaked work or queried DB", after)
 				}
+				// Writes coalesce checkpoints that arrive while a save is running.
 				b.ReportMetric(float64(after.Writes-before.Writes)/float64(b.N), "DB-writes/op")
 			})
 		}

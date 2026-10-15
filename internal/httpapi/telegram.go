@@ -587,7 +587,7 @@ func (s *telegramService) sendSingle(ctx context.Context, item preparedItem, par
 }
 
 // sendStreamed uploads one item while it downloads. Each upload withholds its
-// final bytes until preparation, including the identity checkpoint, succeeds,
+// final bytes until preparation succeeds and the identity lease is released,
 // so a failed or recovered transfer aborts a request Telegram never processes.
 // A retried or recovered transfer starts a new upload with the new bytes.
 func (s *telegramService) sendStreamed(ctx context.Context, item deliveryItem, parameters fields, document bool, event *DeliveryEvent) (deliveryResult, error) {

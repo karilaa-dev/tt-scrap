@@ -62,7 +62,7 @@ func TestIdentityWaitDoesNotReserveDownloadCapacity(t *testing.T) {
 	defer busy.finish(nil)
 	free := mustAcquire(t, p, "")
 	freeID := free.entry.id
-	finishLease(t, free, nil)
+	free.finish(nil)
 	d := platform.NewDownloader(cfg, p)
 	defer d.Close()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -98,7 +98,7 @@ func TestTelegramRelatedMediaShareIdentityAndRunConcurrently(t *testing.T) {
 			p := openTestPool(t, cfg, "")
 			l := mustAcquire(t, p, "")
 			id := l.entry.id
-			finishLease(t, l, nil)
+			l.finish(nil)
 			jpegData := deliveryJPEG(t)
 			started := make(chan struct{}, 3)
 			release := make(chan struct{})
@@ -176,8 +176,8 @@ func TestTelegramRelatedMediaShareIdentityAndRunConcurrently(t *testing.T) {
 			if !parallel {
 				t.Fatal("related media requests were serialized by the identity lease")
 			}
-			if response.Code != 200 || uploads.Load() != 1 || p.Stats().Writes != before.Writes+1 || p.Stats().Busy != 0 {
-				t.Fatalf("status=%d uploads=%d writes=%d: %s", response.Code, uploads.Load(), p.Stats().Writes-before.Writes, response.Body.String())
+			if response.Code != 200 || uploads.Load() != 1 || p.Stats().Checkpoints != before.Checkpoints+1 || p.Stats().Busy != 0 {
+				t.Fatalf("status=%d uploads=%d checkpoints=%d: %s", response.Code, uploads.Load(), p.Stats().Checkpoints-before.Checkpoints, response.Body.String())
 			}
 		})
 	}
@@ -214,7 +214,7 @@ func TestTelegramPreparationBoundsWorkAndCancelsSiblings(t *testing.T) {
 			p := openTestPool(t, cfg, "")
 			l := mustAcquire(t, p, "")
 			id := l.entry.id
-			finishLease(t, l, nil)
+			l.finish(nil)
 			started := make(chan struct{}, 12)
 			release := make(chan struct{})
 			var requests, stopped atomic.Int32
@@ -360,7 +360,7 @@ func TestTelegramRecoveryRepreparesBeforeOneUpload(t *testing.T) {
 			if failure == "invalid device_id" {
 				registrations = 2
 			}
-			if response.Code != 200 || uploads.Load() != 1 || covers.Load() != 2 || plays.Load() != 2 || protocol.registrations != registrations || protocol.seeds != 2 || p.Stats().Writes != before.Writes+1 {
+			if response.Code != 200 || uploads.Load() != 1 || covers.Load() != 2 || plays.Load() != 2 || protocol.registrations != registrations || protocol.seeds != 2 || p.Stats().Checkpoints != before.Checkpoints+1 {
 				t.Fatalf("status=%d uploads=%d plays=%d covers=%d protocol=%+v stats=%+v: %s", response.Code, uploads.Load(), plays.Load(), covers.Load(), protocol, p.Stats(), response.Body.String())
 			}
 			assertDeliveryIdle(t, p, cfg.TempDir)
@@ -409,7 +409,7 @@ func TestConcurrentTelegramDeliveriesRespectTransferLimit(t *testing.T) {
 			post.Media = append(post.Media, assets.Register(core.AssetContext{IdentityID: l.entry.id, Platform: "tiktok", Kind: "image", Filename: "photo.jpg", UpstreamURL: "https://cdn.example/photo"}, 0))
 		}
 		posts[strconv.Itoa(i)] = post
-		finishLease(t, l, nil)
+		l.finish(nil)
 	}
 	var uploads, parts atomic.Int32
 	telegram := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -459,7 +459,7 @@ func TestConcurrentTelegramDeliveriesRespectTransferLimit(t *testing.T) {
 		})
 	}
 	group.Wait()
-	if uploads.Load() != requests || parts.Load() != requests*8 || p.Stats().Writes != before.Writes+requests || p.Stats().Reads != before.Reads || peak.Load() > int32(cfg.DownloadConcurrency) || peak.Load() < 2 || active.Load() != 0 {
+	if uploads.Load() != requests || parts.Load() != requests*8 || p.Stats().Checkpoints != before.Checkpoints+requests || p.Stats().Reads != before.Reads || peak.Load() > int32(cfg.DownloadConcurrency) || peak.Load() < 2 || active.Load() != 0 {
 		t.Fatalf("uploads=%d parts=%d peak=%d active=%d stats=%+v", uploads.Load(), parts.Load(), peak.Load(), active.Load(), p.Stats())
 	}
 	assertDeliveryIdle(t, p, cfg.TempDir)

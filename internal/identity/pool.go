@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"sync"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
 	"github.com/karilaa-dev/tt-scrap/internal/core"
 	"github.com/karilaa-dev/tt-scrap/internal/tiktokapp"
 )
@@ -35,34 +38,54 @@ type proxyState struct {
 	preparationPace                   preparationPacer
 }
 type entry struct {
-	id                    string
-	proxy                 *proxyState
-	ordinal               int
-	session               *tiktokapp.Session
-	client                *tiktokapp.Client
-	assignments, revision int64
-	selected              uint64
+	id          string
+	proxy       *proxyState
+	ordinal     int
+	session     *tiktokapp.Session
+	client      *tiktokapp.Client
+	assignments int64
+	selected    uint64
 	// waiting counts operations queued for this identity's own media; new
 	// unpinned work skips the identity so those operations run next.
 	waiting          int
 	busy, registered bool
-	signedAt         time.Time
 	health           health
+	// pending is the latest finished state not yet saved to PostgreSQL.
+	pending *checkpoint
 }
 type Stats struct {
-	Ready      bool   `json:"ready"`
-	Proxies    int    `json:"proxies"`
-	Identities int    `json:"identities"`
-	Registered int    `json:"registered"`
-	Busy       int    `json:"busy"`
-	Queued     int    `json:"queued"`
-	Reads      uint64 `json:"database_reads"`
-	Writes     uint64 `json:"database_writes"`
+	Ready       bool   `json:"ready"`
+	Proxies     int    `json:"proxies"`
+	Identities  int    `json:"identities"`
+	Registered  int    `json:"registered"`
+	Busy        int    `json:"busy"`
+	Queued      int    `json:"queued"`
+	Checkpoints uint64 `json:"checkpoints"`
+	Unsaved     int    `json:"unsaved_identities"`
+	Connected   bool   `json:"database_connected"`
+	Reads       uint64 `json:"database_reads"`
+	Writes      uint64 `json:"database_writes"`
 }
 type Pool struct {
-	mu                            sync.Mutex
-	dbMu                          sync.Mutex
+	mu sync.Mutex
+	// db belongs to the persistence goroutine once Open returns.
 	db                            *pgx.Conn
+	dbConfig                      *pgx.ConnConfig
+	lockKey                       string
+	log                           *slog.Logger
+	timing                        persistTiming
+	persistCtx                    context.Context
+	persistCancel                 context.CancelFunc
+	persistWake                   chan struct{}
+	persistStop, persistDone      chan struct{}
+	persistErr                    error
+	dirty                         map[*entry]struct{}
+	checkpoints, saved            uint64
+	savedNotify                   chan struct{}
+	connected                     bool
+	owner                         backend
+	ownerToken                    string
+	failure                       error
 	proxies                       []*proxyState
 	entries                       map[string]*entry
 	notify                        chan struct{}
@@ -73,6 +96,7 @@ type Pool struct {
 	sequence                      uint64
 	queued, queueLimit            int
 	proxiesTable, identitiesTable string
+	ownershipTable                string
 	account                       tiktokapp.Account
 	reads, writes                 atomic.Uint64
 	mediaTransport                *http.Transport
@@ -82,18 +106,36 @@ type Pool struct {
 	preparation                   *preparationRun
 	preparationDelay              time.Duration
 	preparationTimeout            time.Duration
+	// unwritable is the save error, such as a missing table or a revoked
+	// privilege, that retrying cannot fix until the database changes. New
+	// identity work is refused until a save succeeds, so RAM does not collect
+	// state that cannot be saved.
+	unwritable error
+	// persistDeadline, set when Close starts saving, is when Close cancels
+	// persistCtx, which bounds every database wait.
+	persistDeadline atomic.Pointer[time.Time]
+	// ownerLookup, when set by tests, runs after a failed ownership claim.
+	ownerLookup func()
 }
 
 var schemaPattern = regexp.MustCompile(`^[a-z_][a-z_0-9]{0,62}$`)
 
 func Open(ctx context.Context, cfg core.Config, addresses []string) (*Pool, error) {
+	return open(ctx, cfg, addresses, defaultPersistTiming)
+}
+func open(ctx context.Context, cfg core.Config, addresses []string, timing persistTiming) (*Pool, error) {
 	if !schemaPattern.MatchString(cfg.DBSchema) {
 		return nil, core.ConfigError("DB_SCHEMA")
 	}
 	lifetime, stop := context.WithCancel(context.Background())
-	p := &Pool{entries: map[string]*entry{}, notify: make(chan struct{}), lifetime: lifetime, stop: stop, queueLimit: cfg.MaxQueuedRequests,
+	persistCtx, persistCancel := context.WithCancel(context.Background())
+	p := &Pool{persistCtx: persistCtx, persistCancel: persistCancel, entries: map[string]*entry{}, notify: make(chan struct{}), lifetime: lifetime, stop: stop, queueLimit: cfg.MaxQueuedRequests,
 		preparationDelay: preparationInterval, preparationTimeout: cfg.UpstreamTimeout,
 		proxiesTable: fmt.Sprintf(`"%s".scrap_proxies`, cfg.DBSchema), identitiesTable: fmt.Sprintf(`"%s".scrap_identities`, cfg.DBSchema),
+		ownershipTable: fmt.Sprintf(`"%s".scrap_ownership`, cfg.DBSchema),
+		lockKey:        cfg.DBSchema + ".scrap_app.ram_pool", log: slog.Default(), timing: timing,
+		persistWake: make(chan struct{}, 1), persistStop: make(chan struct{}), persistDone: make(chan struct{}),
+		dirty: map[*entry]struct{}{}, savedNotify: make(chan struct{}),
 		account:       tiktokapp.Account{SessionID: cfg.TikTokSessionID},
 		clientFactory: func(s *tiktokapp.Session, c *http.Client) *tiktokapp.Client { return tiktokapp.NewClient(s, c) }}
 	if p.queueLimit < 1 {
@@ -104,20 +146,30 @@ func Open(ctx context.Context, cfg core.Config, addresses []string) (*Pool, erro
 	config, err := pgx.ParseConfig(cfg.DBURL)
 	if err != nil {
 		stop()
+		persistCancel()
 		return nil, errors.New("invalid DB_URL")
 	}
 	config.ConnectTimeout = 10 * time.Second
 	config.RuntimeParams["statement_timeout"] = "10000"
+	config.RuntimeParams["application_name"] = "tt-scrap"
+	config.BuildContextWatcherHandler = func(conn *pgconn.PgConn) ctxwatch.Handler {
+		return &statementCancel{CancelRequestContextWatcherHandler: pgconn.CancelRequestContextWatcherHandler{Conn: conn}, delay: timing.probeTimeout, pool: p}
+	}
+	p.dbConfig = config
 	p.db, err = pgx.ConnectConfig(connectCtx, config)
 	if err != nil {
 		stop()
+		persistCancel()
 		return nil, errors.New("identity database connection failed")
 	}
 	if err = p.initialize(connectCtx, cfg, addresses); err != nil {
-		p.db.Close(context.Background())
+		p.closeConn(p.db)
 		stop()
+		persistCancel()
 		return nil, err
 	}
+	p.connected = true
+	go p.persist()
 	if cfg.ProxyDataOnly {
 		p.mediaTransport, err = newTransport("", cfg.HTTPMaxConnections)
 		if err != nil {
@@ -126,17 +178,15 @@ func Open(ctx context.Context, cfg core.Config, addresses []string) (*Pool, erro
 		}
 	}
 	p.ready = true
-	go p.monitor()
 	return p, nil
 }
 func (p *Pool) initialize(ctx context.Context, cfg core.Config, addresses []string) error {
-	var owned bool
-	p.reads.Add(1)
-	if err := p.db.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtextextended($1,0))`, cfg.DBSchema+".scrap_app.ram_pool").Scan(&owned); err != nil {
+	owned, err := p.claim(ctx, p.db)
+	if err != nil {
 		return errors.New("identity ownership check failed")
 	}
 	if !owned {
-		return errors.New("another process owns this identity pool")
+		return errOwnershipLost
 	}
 	tx, err := p.db.Begin(ctx)
 	if err != nil {
@@ -144,6 +194,7 @@ func (p *Pool) initialize(ctx context.Context, cfg core.Config, addresses []stri
 	}
 	defer tx.Rollback(context.Background())
 	statements := []string{
+		`CREATE TABLE IF NOT EXISTS ` + p.ownershipTable + ` (singleton BOOLEAN PRIMARY KEY CHECK(singleton),token UUID NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS ` + p.proxiesTable + ` (id BIGSERIAL PRIMARY KEY,server_key TEXT NOT NULL UNIQUE,proxy_url TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp())`,
 		`CREATE TABLE IF NOT EXISTS ` + p.identitiesTable + ` (id UUID PRIMARY KEY,proxy_id BIGINT NOT NULL REFERENCES ` + p.proxiesTable + `(id),ordinal SMALLINT NOT NULL CHECK(ordinal BETWEEN 0 AND 9),session JSONB NOT NULL,assignment_count BIGINT NOT NULL DEFAULT 0 CHECK(assignment_count>=0),revision BIGINT NOT NULL DEFAULT 0 CHECK(revision>=0),last_used_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),UNIQUE(proxy_id,ordinal))`,
 		`ALTER TABLE ` + p.identitiesTable + ` ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0`,
@@ -219,7 +270,7 @@ func (p *Pool) initialize(ctx context.Context, cfg core.Config, addresses []stri
 		return errors.New("no proxy servers configured; set PROXY_FILE or PROXY_INCLUDE_HOST")
 	}
 	p.reads.Add(1)
-	rows, err = tx.Query(ctx, `SELECT id::text,proxy_id,ordinal,session,assignment_count,revision,health FROM `+p.identitiesTable+` ORDER BY proxy_id,ordinal`)
+	rows, err = tx.Query(ctx, `SELECT id::text,proxy_id,ordinal,session,assignment_count,health FROM `+p.identitiesTable+` ORDER BY proxy_id,ordinal`)
 	if err != nil {
 		return err
 	}
@@ -227,7 +278,7 @@ func (p *Pool) initialize(ctx context.Context, cfg core.Config, addresses []stri
 		state := &entry{}
 		var proxyID int64
 		var raw, rawHealth []byte
-		if err = rows.Scan(&state.id, &proxyID, &state.ordinal, &raw, &state.assignments, &state.revision, &rawHealth); err != nil {
+		if err = rows.Scan(&state.id, &proxyID, &state.ordinal, &raw, &state.assignments, &rawHealth); err != nil {
 			rows.Close()
 			return err
 		}
@@ -249,9 +300,6 @@ func (p *Pool) initialize(ctx context.Context, cfg core.Config, addresses []stri
 			return errors.New("stored identity health is invalid")
 		}
 		state.registered = state.session.Identity.Kind == "registered"
-		if state.session.SDK != nil {
-			state.signedAt = state.session.SDK.FetchedAt
-		}
 		state.proxy.slots[state.ordinal] = state
 		p.entries[state.id] = state
 	}
@@ -260,15 +308,38 @@ func (p *Pool) initialize(ctx context.Context, cfg core.Config, addresses []stri
 	if err != nil {
 		return err
 	}
+	// Commit a new token with the loaded state. Reconnects retain this token
+	// so an intervening owner remains detectable after it releases the lock.
+	if err = tx.QueryRow(ctx, `INSERT INTO `+p.ownershipTable+`(singleton,token) VALUES(true,gen_random_uuid()) ON CONFLICT(singleton) DO UPDATE SET token=EXCLUDED.token RETURNING token::text`).Scan(&p.ownerToken); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 func (p *Pool) wakeLocked() { close(p.notify); p.notify = make(chan struct{}) }
-func (p *Pool) fail()       { p.mu.Lock(); p.ready = false; p.stop(); p.wakeLocked(); p.mu.Unlock() }
+
+// fail stops identity work after this process loses schema ownership.
+func (p *Pool) fail(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.failure == nil {
+		p.failure = err
+	}
+	p.ready = false
+	p.stop()
+	p.wakeLocked()
+	p.notifySavedLocked()
+}
 func (p *Pool) Ready() bool { p.mu.Lock(); defer p.mu.Unlock(); return p.ready && !p.closing }
+
+// Done is closed when the pool stops serving: after Close or lost ownership.
+func (p *Pool) Done() <-chan struct{} { return p.lifetime.Done() }
+
+// Err reports why the pool stopped serving before Close.
+func (p *Pool) Err() error { p.mu.Lock(); defer p.mu.Unlock(); return p.failure }
 func (p *Pool) Stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	s := Stats{Ready: p.ready && !p.closing, Proxies: len(p.proxies), Identities: len(p.entries), Queued: p.queued, Reads: p.reads.Load(), Writes: p.writes.Load()}
+	s := Stats{Ready: p.ready && !p.closing, Proxies: len(p.proxies), Identities: len(p.entries), Queued: p.queued, Checkpoints: p.checkpoints, Unsaved: len(p.dirty), Connected: p.connected, Reads: p.reads.Load(), Writes: p.writes.Load()}
 	for _, e := range p.entries {
 		if e.busy {
 			s.Busy++
@@ -288,30 +359,6 @@ func (p *Pool) ProxyAddresses() []string {
 	}
 	return out
 }
-func (p *Pool) monitor() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-p.lifetime.Done():
-			return
-		case <-ticker.C:
-			err := p.probeDatabase(5 * time.Second)
-			if err != nil {
-				p.fail()
-				return
-			}
-		}
-	}
-}
-func (p *Pool) probeDatabase(timeout time.Duration) error {
-	p.dbMu.Lock()
-	defer p.dbMu.Unlock()
-	ctx, cancel := context.WithTimeout(p.lifetime, timeout)
-	defer cancel()
-	return p.db.Ping(ctx)
-}
-
 func (p *Pool) Close() error {
 	p.closeOnce.Do(func() {
 		p.mu.Lock()
@@ -327,11 +374,17 @@ func (p *Pool) Close() error {
 		for _, proxy := range p.proxies {
 			proxy.transport.CloseIdleConnections()
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		p.dbMu.Lock()
-		p.closeErr = p.db.Close(ctx)
-		p.dbMu.Unlock()
+		// Finished leases left checkpoints; save them before releasing
+		// ownership. The deadline bounds a save in progress, its cancel
+		// request and rollback, reconnecting, and closing the connection.
+		by := time.Now().Add(p.timing.shutdown)
+		p.persistDeadline.Store(&by)
+		deadline := time.AfterFunc(p.timing.shutdown, p.persistCancel)
+		close(p.persistStop)
+		<-p.persistDone
+		deadline.Stop()
+		p.persistCancel()
+		p.closeErr = p.persistErr
 	})
 	return p.closeErr
 }
