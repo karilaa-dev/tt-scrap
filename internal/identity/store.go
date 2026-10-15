@@ -175,22 +175,7 @@ func (p *Pool) connect(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	owned, err := p.claim(ctx, conn)
-	if err == nil && !owned {
-		p.mu.Lock()
-		previous := p.owner
-		p.mu.Unlock()
-		var ended bool
-		err = conn.QueryRow(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid=$1 AND pid<>pg_backend_pid() AND ($2::timestamptz IS NULL OR backend_start=$2)`, previous.pid, previous.started).Scan(&ended)
-		switch {
-		case errors.Is(err, pgx.ErrNoRows):
-			err = errOwnershipLost
-		case err == nil:
-			p.log.Warn("ended previous identity database connection", "backend_pid", previous.pid, "signalled", ended)
-			err = errPreviousOwner
-		}
-	}
-	if err != nil {
+	if err = p.retake(ctx, conn); err != nil {
 		p.closeConn(conn)
 		return err
 	}
@@ -199,6 +184,33 @@ func (p *Pool) connect(ctx context.Context) error {
 	p.connected = true
 	p.mu.Unlock()
 	return nil
+}
+
+func (p *Pool) retake(ctx context.Context, conn *pgx.Conn) error {
+	p.mu.Lock()
+	previous, lookup := p.owner, p.ownerLookup
+	p.mu.Unlock()
+	// The previous backend can exit, releasing the lock, between a failed
+	// claim and its lookup, so a missing backend earns one more claim.
+	for range 2 {
+		owned, err := p.claim(ctx, conn)
+		if err != nil || owned {
+			return err
+		}
+		if lookup != nil {
+			lookup()
+		}
+		var ended bool
+		err = conn.QueryRow(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid=$1 AND pid<>pg_backend_pid() AND ($2::timestamptz IS NULL OR backend_start=$2)`, previous.pid, previous.started).Scan(&ended)
+		if err == nil {
+			p.log.Warn("ended previous identity database connection", "backend_pid", previous.pid, "signalled", ended)
+			return errPreviousOwner
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+	}
+	return errOwnershipLost
 }
 
 // disconnect closes the connection, releasing ownership. Admission pauses
@@ -277,6 +289,27 @@ func fatal(err error) bool {
 	return errors.Is(err, errOwnershipLost) || errors.Is(err, errConflict) || errors.As(err, &pg) && strings.HasPrefix(pg.Code, "23")
 }
 
+// permanent reports save errors that persist until an operator changes the
+// database, such as a missing table or a revoked privilege. Unlike fatal
+// errors they do not mean another process owns the identities, so the pool
+// keeps its RAM state and ownership and retries.
+func permanent(err error) bool {
+	var pg *pgconn.PgError
+	return errors.As(err, &pg) && (strings.HasPrefix(pg.Code, "42") || strings.HasPrefix(pg.Code, "3F"))
+}
+
+// setUnwritable pauses new identity work after a permanent save error, or
+// resumes it after a save succeeds.
+func (p *Pool) setUnwritable(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err != nil && p.unwritable == nil {
+		// Queued requests stop waiting for identities.
+		p.wakeLocked()
+	}
+	p.unwritable = err
+}
+
 func (p *Pool) persist() {
 	defer close(p.persistDone)
 	timer := time.NewTimer(p.timing.probe)
@@ -298,6 +331,7 @@ func (p *Pool) persist() {
 		}
 		err := p.sync(p.persistCtx, probe)
 		if err == nil {
+			p.setUnwritable(nil)
 			if !failingSince.IsZero() {
 				p.log.Info("identity database restored; RAM state saved", "unavailable_ms", time.Since(failingSince).Milliseconds())
 				failingSince = time.Time{}
@@ -320,6 +354,12 @@ func (p *Pool) persist() {
 			failingSince = time.Now()
 		}
 		message := "identity state not saved; serving from RAM"
+		if permanent(err) {
+			// Needs an operator, so every retry reports it.
+			p.setUnwritable(err)
+			level = slog.LevelError
+			message = "identity state cannot be saved; new identity work paused until a save succeeds"
+		}
 		if p.db == nil {
 			message = "identity database connection lost; identity work paused until ownership is retaken"
 		}
@@ -338,6 +378,11 @@ func (p *Pool) saveBeforeClose() {
 		return
 	}
 	for {
+		// Without a connection, ownership only needs retaking for state that
+		// is still unsaved.
+		if p.db == nil && !p.pending() {
+			return
+		}
 		err := p.sync(p.persistCtx, false)
 		if err == nil {
 			return
@@ -354,6 +399,21 @@ func (p *Pool) saveBeforeClose() {
 		p.persistErr = errors.New("identity state could not be saved before shutdown")
 		return
 	}
+}
+
+// pending reports identity checkpoints or proxy health not yet saved.
+func (p *Pool) pending() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.dirty) > 0 {
+		return true
+	}
+	for _, proxy := range p.proxies {
+		if proxy.healthVersion > proxy.savedHealthVersion {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Pool) unsaved() int {

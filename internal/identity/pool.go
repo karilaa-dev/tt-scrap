@@ -104,6 +104,13 @@ type Pool struct {
 	preparation                   *preparationRun
 	preparationDelay              time.Duration
 	preparationTimeout            time.Duration
+	// unwritable is the save error, such as a missing table or a revoked
+	// privilege, that retrying cannot fix until the database changes. New
+	// identity work is refused until a save succeeds, so RAM does not collect
+	// state that cannot be saved.
+	unwritable error
+	// ownerLookup, when set by tests, runs after a failed ownership claim.
+	ownerLookup func()
 }
 
 var schemaPattern = regexp.MustCompile(`^[a-z_][a-z_0-9]{0,62}$`)

@@ -3,14 +3,17 @@ package identity
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/karilaa-dev/tt-scrap/internal/core"
 )
 
@@ -299,6 +302,177 @@ func TestOwnershipTakenDuringOutageStopsPool(t *testing.T) {
 	var api *core.Error
 	if _, err := p.acquire(ctx, ""); !errors.As(err, &api) || api.Code != "service_not_configured" {
 		t.Fatal("pool granted an identity it no longer owns", err)
+	}
+}
+
+// The orphaned ownership connection can end on its own after the pool's
+// claim fails but before its lookup. The lock is then free, so the pool must
+// retake it rather than report another owner and stop.
+func TestOrphanEndingDuringReconnectIsNotOwnershipLoss(t *testing.T) {
+	cfg, db := testDatabase(t)
+	ctx := context.Background()
+	proxy := proxyDatabase(t, &cfg)
+	p := openTestPoolTiming(t, cfg, fastPersistTiming, "")
+	running := mustAcquire(t, p, "")
+	id := running.entry.id
+	orphaned := ownerPID(p)
+	// The hook runs on the persistence goroutine, so it needs its own
+	// connection.
+	ender, err := pgx.ConnectConfig(ctx, db.Config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ender.Close(ctx) })
+	var lookups atomic.Int32
+	p.mu.Lock()
+	p.ownerLookup = func() {
+		if lookups.Add(1) > 1 {
+			return
+		}
+		if _, err := ender.Exec(ctx, "SELECT pg_terminate_backend($1)", orphaned); err != nil {
+			t.Error(err)
+			return
+		}
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+			var alive bool
+			if err := ender.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1)", orphaned).Scan(&alive); err != nil || !alive {
+				return
+			}
+		}
+		t.Error("orphaned connection did not end")
+	}
+	p.mu.Unlock()
+	proxy.cut()
+	running.entry.session.StoreRegion = "after-orphan"
+	running.finish(nil)
+	persisted(t, p)
+	if lookups.Load() != 1 {
+		t.Fatal("reconnect did not race the orphan ending", lookups.Load())
+	}
+	if p.Err() != nil || !p.Ready() || ownerPID(p) == orphaned || !holdsOwnership(t, db, ownerPID(p)) {
+		t.Fatal("pool did not retake the freed ownership", p.Err())
+	}
+	var region string
+	if err := db.QueryRow(ctx, "SELECT session->>'storeRegion' FROM "+p.identitiesTable+" WHERE id=$1", id).Scan(&region); err != nil || region != "after-orphan" {
+		t.Fatal("RAM state was not saved after retaking ownership", region, err)
+	}
+	mustAcquire(t, p, "").finish(nil)
+}
+
+// A clean shutdown after an idle probe lost the connection needs PostgreSQL
+// only when state is still unsaved, including proxy health.
+func TestCloseWithoutConnectionReconnectsOnlyForUnsavedState(t *testing.T) {
+	for _, unsavedProxy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("unsaved_proxy=%t", unsavedProxy), func(t *testing.T) {
+			cfg, _ := testDatabase(t)
+			proxy := proxyDatabase(t, &cfg)
+			timing := fastPersistTiming
+			timing.shutdown = 500 * time.Millisecond
+			p, err := open(context.Background(), cfg, []string{""}, timing)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { p.Close() })
+			mustAcquire(t, p, "").finish(nil)
+			persisted(t, p)
+			proxy.block()
+			waitStats(t, p, func(s Stats) bool { return !s.Connected })
+			if unsavedProxy {
+				p.mu.Lock()
+				p.proxies[0].healthVersion++
+				p.mu.Unlock()
+			}
+			started := time.Now()
+			err = p.Close()
+			if unsavedProxy {
+				if err == nil {
+					t.Fatal("shutdown reported unsaved proxy health as saved")
+				}
+				return
+			}
+			if err != nil || time.Since(started) >= timing.shutdown {
+				t.Fatal("shutdown with nothing unsaved waited for the database", err, time.Since(started))
+			}
+		})
+	}
+}
+
+// A schema or privilege error cannot heal by retrying, but it does not mean
+// another process owns the identities. The pool keeps its RAM state and
+// ownership, refuses new work it could not save, and resumes after a save
+// succeeds.
+func TestUnwritableDatabasePausesNewWorkAndKeepsRAMState(t *testing.T) {
+	cfg, db := testDatabase(t)
+	ctx := context.Background()
+	p := openTestPoolTiming(t, cfg, fastPersistTiming, "")
+	l := mustAcquire(t, p, "")
+	id := l.entry.id
+	l.finish(nil)
+	persisted(t, p)
+	owner := ownerPID(p)
+	schema := pgx.Identifier{cfg.DBSchema}.Sanitize()
+	if _, err := db.Exec(ctx, "ALTER TABLE "+p.identitiesTable+" RENAME TO scrap_identities_moved"); err != nil {
+		t.Fatal(err)
+	}
+	restore := func() {
+		if _, err := db.Exec(ctx, "ALTER TABLE IF EXISTS "+schema+".scrap_identities_moved RENAME TO scrap_identities"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(restore)
+	l = mustAcquire(t, p, id)
+	l.entry.session.StoreRegion = "unwritable"
+	l.finish(nil)
+	var api *core.Error
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		l, err := p.acquire(ctx, "")
+		if err == nil {
+			l.finish(nil)
+		} else if errors.As(err, &api) && api.Status == 503 && api.Message == "The identity pool cannot save its state." {
+			break
+		} else {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pool kept starting identity work it cannot save")
+		}
+	}
+	// Exiting would discard the RAM state, and readiness failures invite a
+	// restart that does the same.
+	if stats := p.Stats(); p.Err() != nil || !stats.Ready || !stats.Connected || stats.Unsaved == 0 {
+		t.Fatal("unwritable database stopped the pool or lost unsaved state", p.Err(), stats)
+	}
+	if ownerPID(p) != owner || !holdsOwnership(t, db, owner) {
+		t.Fatal("unwritable database released ownership")
+	}
+	restore()
+	persisted(t, p)
+	var region string
+	if err := db.QueryRow(ctx, "SELECT session->>'storeRegion' FROM "+p.identitiesTable+" WHERE id=$1", id).Scan(&region); err != nil || region != "unwritable" {
+		t.Fatal("RAM state was not saved after the database was fixed", region, err)
+	}
+	mustAcquire(t, p, "").finish(nil)
+}
+
+func TestOnlySchemaAndPrivilegeErrorsPauseNewWork(t *testing.T) {
+	for code, want := range map[string]bool{
+		"42P01": true,  // undefined table
+		"42703": true,  // undefined column
+		"42501": true,  // insufficient privilege
+		"3F000": true,  // invalid schema
+		"57014": false, // statement timeout
+		"40P01": false, // deadlock
+		"40001": false, // serialization failure
+		"55P03": false, // lock not available
+		"08006": false, // connection failure
+		"53300": false, // too many connections
+	} {
+		if got := permanent(fmt.Errorf("checkpoint: %w", &pgconn.PgError{Code: code})); got != want {
+			t.Errorf("%s pauses new work: %t", code, got)
+		}
+	}
+	if permanent(context.DeadlineExceeded) {
+		t.Error("a timeout paused new work")
 	}
 }
 
