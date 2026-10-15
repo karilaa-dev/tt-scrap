@@ -84,6 +84,7 @@ type Pool struct {
 	savedNotify                   chan struct{}
 	connected                     bool
 	owner                         backend
+	ownerToken                    string
 	failure                       error
 	proxies                       []*proxyState
 	entries                       map[string]*entry
@@ -95,6 +96,7 @@ type Pool struct {
 	sequence                      uint64
 	queued, queueLimit            int
 	proxiesTable, identitiesTable string
+	ownershipTable                string
 	account                       tiktokapp.Account
 	reads, writes                 atomic.Uint64
 	mediaTransport                *http.Transport
@@ -130,7 +132,8 @@ func open(ctx context.Context, cfg core.Config, addresses []string, timing persi
 	p := &Pool{persistCtx: persistCtx, persistCancel: persistCancel, entries: map[string]*entry{}, notify: make(chan struct{}), lifetime: lifetime, stop: stop, queueLimit: cfg.MaxQueuedRequests,
 		preparationDelay: preparationInterval, preparationTimeout: cfg.UpstreamTimeout,
 		proxiesTable: fmt.Sprintf(`"%s".scrap_proxies`, cfg.DBSchema), identitiesTable: fmt.Sprintf(`"%s".scrap_identities`, cfg.DBSchema),
-		lockKey: cfg.DBSchema + ".scrap_app.ram_pool", log: slog.Default(), timing: timing,
+		ownershipTable: fmt.Sprintf(`"%s".scrap_ownership`, cfg.DBSchema),
+		lockKey:        cfg.DBSchema + ".scrap_app.ram_pool", log: slog.Default(), timing: timing,
 		persistWake: make(chan struct{}, 1), persistStop: make(chan struct{}), persistDone: make(chan struct{}),
 		dirty: map[*entry]struct{}{}, savedNotify: make(chan struct{}),
 		account:       tiktokapp.Account{SessionID: cfg.TikTokSessionID},
@@ -191,6 +194,7 @@ func (p *Pool) initialize(ctx context.Context, cfg core.Config, addresses []stri
 	}
 	defer tx.Rollback(context.Background())
 	statements := []string{
+		`CREATE TABLE IF NOT EXISTS ` + p.ownershipTable + ` (singleton BOOLEAN PRIMARY KEY CHECK(singleton),token UUID NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS ` + p.proxiesTable + ` (id BIGSERIAL PRIMARY KEY,server_key TEXT NOT NULL UNIQUE,proxy_url TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp())`,
 		`CREATE TABLE IF NOT EXISTS ` + p.identitiesTable + ` (id UUID PRIMARY KEY,proxy_id BIGINT NOT NULL REFERENCES ` + p.proxiesTable + `(id),ordinal SMALLINT NOT NULL CHECK(ordinal BETWEEN 0 AND 9),session JSONB NOT NULL,assignment_count BIGINT NOT NULL DEFAULT 0 CHECK(assignment_count>=0),revision BIGINT NOT NULL DEFAULT 0 CHECK(revision>=0),last_used_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),UNIQUE(proxy_id,ordinal))`,
 		`ALTER TABLE ` + p.identitiesTable + ` ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0`,
@@ -302,6 +306,11 @@ func (p *Pool) initialize(ctx context.Context, cfg core.Config, addresses []stri
 	err = rows.Err()
 	rows.Close()
 	if err != nil {
+		return err
+	}
+	// Commit a new token with the loaded state. Reconnects retain this token
+	// so an intervening owner remains detectable after it releases the lock.
+	if err = tx.QueryRow(ctx, `INSERT INTO `+p.ownershipTable+`(singleton,token) VALUES(true,gen_random_uuid()) ON CONFLICT(singleton) DO UPDATE SET token=EXCLUDED.token RETURNING token::text`).Scan(&p.ownerToken); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

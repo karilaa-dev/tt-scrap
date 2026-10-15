@@ -21,7 +21,8 @@ import (
 // The lock lives as long as the connection's server process, so a failed or
 // stalled save cancels only its statement and keeps the connection. Once the
 // connection itself is lost, the server may have released the lock to another
-// process, so no new identity work starts until connect retakes ownership.
+// process, so no new identity work starts until connect retakes ownership
+// and verifies that no other pool has loaded state since this pool started.
 
 type persistTiming struct {
 	probe, probeTimeout, connect, write, shutdown time.Duration
@@ -194,6 +195,16 @@ func (p *Pool) connect(ctx context.Context) error {
 		return err
 	}
 	if err = p.retake(ctx, conn); err != nil {
+		p.closeConn(conn)
+		return err
+	}
+	var token string
+	p.reads.Add(1)
+	err = conn.QueryRow(ctx, `SELECT token::text FROM `+p.ownershipTable+` WHERE singleton`).Scan(&token)
+	if errors.Is(err, pgx.ErrNoRows) || err == nil && token != p.ownerToken {
+		err = errOwnershipLost
+	}
+	if err != nil {
 		p.closeConn(conn)
 		return err
 	}

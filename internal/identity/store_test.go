@@ -305,6 +305,82 @@ func TestOwnershipTakenDuringOutageStopsPool(t *testing.T) {
 	}
 }
 
+func TestInterveningOwnerStopsPoolAfterReleasingLock(t *testing.T) {
+	for _, pending := range []string{"identity", "proxy", "none"} {
+		t.Run(pending, func(t *testing.T) {
+			cfg, db := testDatabase(t)
+			ctx := context.Background()
+			direct := cfg
+			proxy := proxyDatabase(t, &cfg)
+			p := openTestPoolTiming(t, cfg, fastPersistTiming, "")
+			var id string
+			var l *lease
+			for i := range 10 {
+				l = mustAcquire(t, p, "")
+				if i == 0 {
+					id = l.entry.id
+				}
+				l.entry.session.StoreRegion = "original"
+				l.finish(nil)
+			}
+			persisted(t, p)
+			if pending == "identity" {
+				l = mustAcquire(t, p, id)
+				t.Cleanup(func() { l.finish(context.Canceled) })
+			}
+			owner := ownerPID(p)
+			proxy.block()
+			if _, err := db.Exec(ctx, "SELECT pg_terminate_backend($1)", owner); err != nil {
+				t.Fatal(err)
+			}
+			waitStats(t, p, func(s Stats) bool { return !s.Connected })
+
+			next := openTestPoolTiming(t, direct, fastPersistTiming, "")
+			newer := mustAcquire(t, next, "")
+			t.Cleanup(func() { newer.finish(context.Canceled) })
+			if newer.entry.id != id {
+				t.Fatal("new owner did not select the first identity")
+			}
+			newer.entry.session.StoreRegion = "new-owner"
+			recovery := "new-owner"
+			next.mu.Lock()
+			newer.entry.health.LastRecovery = &recovery
+			newer.entry.proxy.health.LastRecovery = &recovery
+			newer.entry.proxy.healthVersion++
+			next.mu.Unlock()
+			newer.finish(nil)
+			if err := next.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if pending == "identity" {
+				l.entry.session.StoreRegion = "stale-owner"
+				l.finish(nil)
+			} else if pending == "proxy" {
+				p.mu.Lock()
+				p.proxies[0].healthVersion++
+				p.mu.Unlock()
+			}
+			proxy.restore()
+			select {
+			case <-p.Done():
+			case <-time.After(3 * time.Second):
+				t.Error("pool resumed after an intervening owner released the lock")
+			}
+			if !errors.Is(p.Err(), errOwnershipLost) || p.Ready() {
+				t.Error("intervening ownership was not reported", p.Err())
+			}
+			var region, identityRecovery, proxyRecovery string
+			var assignments int64
+			if err := db.QueryRow(ctx, "SELECT i.session->>'storeRegion', COALESCE(i.health->>'lastRecovery',''), i.assignment_count, COALESCE(p.health->>'lastRecovery','') FROM "+p.identitiesTable+" i JOIN "+p.proxiesTable+" p ON p.id=i.proxy_id WHERE i.id=$1", id).Scan(&region, &identityRecovery, &assignments, &proxyRecovery); err != nil {
+				t.Fatal(err)
+			}
+			if region != "new-owner" || identityRecovery != "new-owner" || assignments != 2 || proxyRecovery != "new-owner" {
+				t.Fatal("stale owner overwrote newer state", region, identityRecovery, assignments, proxyRecovery)
+			}
+		})
+	}
+}
+
 // The orphaned ownership connection can end on its own after the pool's
 // claim fails but before its lookup. The lock is then free, so the pool must
 // retake it rather than report another owner and stop.

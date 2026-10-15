@@ -61,6 +61,9 @@ func testDatabase(t testing.TB) (core.Config, *pgx.Conn) {
 			_, e = db.Exec(ctx, "DROP TABLE IF EXISTS "+schema+".scrap_proxies")
 		}
 		if e == nil {
+			_, e = db.Exec(ctx, "DROP TABLE IF EXISTS "+schema+".scrap_ownership")
+		}
+		if e == nil {
 			_, e = db.Exec(ctx, "DROP SCHEMA "+schema)
 		}
 		db.Close(ctx)

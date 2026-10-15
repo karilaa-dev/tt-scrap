@@ -8,7 +8,7 @@ Build the [Docker image](../Dockerfile), or install the native dependencies and 
 
 Review `.env` against [`.env.example`](../.env.example). Existing environment variables take precedence over the file. Keep your API key, Instagram key, Telegram settings, and download limits. Replace `YTDLP_COOKIES` with `TIKTOK_SESSION_ID`, containing only the value of your TikTok `sessionid` cookie. Cookie files and stored account credentials are no longer loaded. TikTok requests start anonymously and use the environment session only after a content restriction. The session is not saved in PostgreSQL. See the [account fallback configuration](../README.md#identity-lifecycle).
 
-Remove `TIKTOK_METHOD` from your environment; the method selector and TikTok web extractor have been removed. Supply `DB_URL`; the service creates `scrap_proxies` and `scrap_identities` in `DB_SCHEMA` (default `public`). The schema must already exist. The database role needs permission to create, alter, and update those tables. Existing compatible app identities are loaded from the database.
+Remove `TIKTOK_METHOD` from your environment; the method selector and TikTok web extractor have been removed. Supply `DB_URL`; the service creates `scrap_proxies`, `scrap_identities`, and `scrap_ownership` in `DB_SCHEMA` (default `public`). The schema must already exist. The database role needs permission to create, alter, and update those tables. Existing compatible app identities are loaded from the database.
 
 For a new app database, import proxy addresses through `PROXY_FILE`, or set `PROXY_INCLUDE_HOST=true` to use the host directly. Saved database proxies do not require a proxy file. With Docker Compose, use `compose.proxies.yml` alongside `docker-compose.yml` to mount `proxies.txt`. The base Compose file requires only `.env` and a reachable database.
 
@@ -16,7 +16,7 @@ App startup registers all ten identities per proxy before opening the HTTP liste
 
 ## Replace the running process
 
-Stop the previous app service before starting the Go service against the same schema. One app process owns a schema through a PostgreSQL advisory lock. Overlapping app replicas cannot share a schema, including during a rolling deployment. Use separate schemas and proxy assignments for independent app instances.
+Stop the previous app service before starting the Go service against the same schema. One app process owns a schema through a PostgreSQL advisory lock. A persisted ownership token prevents a disconnected process from resuming with stale RAM after another process has started and stopped. Overlapping app replicas cannot share a schema, including during a rolling deployment. Use separate schemas and proxy assignments for independent app instances.
 
 Start the new service and check `/health/live`, `/health/ready`, and an authenticated request. Readiness requires the Instagram API key as well as a healthy app pool. Startup reuses saved identities and registers missing slots until all ten identities per proxy are registered; the HTTP listener opens only afterward. Signing material is fetched before the first signed request and refreshed on use once it is an hour old.
 
