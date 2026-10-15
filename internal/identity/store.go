@@ -201,17 +201,18 @@ func (p *Pool) connect(ctx context.Context) error {
 	return nil
 }
 
-// disconnect closes the connection, releasing ownership. Waiting requests
-// are woken so they stop waiting for identities the pool may not own.
+// disconnect closes the connection, releasing ownership. Admission pauses
+// and waiting requests are woken first, so no request starts on identities
+// another process may already own.
 func (p *Pool) disconnect() {
-	if p.db != nil {
-		p.closeConn(p.db)
-		p.db = nil
-	}
 	p.mu.Lock()
 	p.connected = false
 	p.wakeLocked()
 	p.mu.Unlock()
+	if p.db != nil {
+		p.closeConn(p.db)
+		p.db = nil
+	}
 }
 
 // dropIfClosed forgets a connection that failed and reports whether it did.
@@ -306,9 +307,9 @@ func (p *Pool) persist() {
 			continue
 		}
 		if fatal(err) {
+			p.fail(err)
 			p.disconnect()
 			p.log.Error("identity pool ownership lost; stopping identity work", databaseAttributes(err, p.unsaved())...)
-			p.fail(err)
 			continue
 		}
 		level := slog.LevelWarn
