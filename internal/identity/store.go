@@ -17,13 +17,18 @@ import (
 // across restarts and crashes: one goroutine owns the connection and the
 // schema ownership lock, writes checkpoints after operations finish, and
 // reconnects after failures. Requests never wait for the database.
+//
+// The lock lives as long as the connection's server process, so a failed or
+// stalled save cancels only its statement and keeps the connection. Once the
+// connection itself is lost, the server may have released the lock to another
+// process, so no new identity work starts until connect retakes ownership.
 
 type persistTiming struct {
 	probe, probeTimeout, connect, write, shutdown time.Duration
 	minBackoff, maxBackoff                        time.Duration
 }
 
-var defaultPersistTiming = persistTiming{probe: 30 * time.Second, probeTimeout: 5 * time.Second, connect: 15 * time.Second, write: 15 * time.Second, shutdown: 10 * time.Second, minBackoff: time.Second, maxBackoff: 30 * time.Second}
+var defaultPersistTiming = persistTiming{probe: 5 * time.Second, probeTimeout: 5 * time.Second, connect: 15 * time.Second, write: 15 * time.Second, shutdown: 10 * time.Second, minBackoff: time.Second, maxBackoff: 30 * time.Second}
 
 // checkpoint is an identity's complete state when its lease finished.
 type checkpoint struct {
@@ -92,7 +97,13 @@ func (p *Pool) write(ctx context.Context, b saveBatch) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		// ctx may have expired; a failed rollback would close the connection
+		// and release ownership.
+		rollback, cancel := context.WithTimeout(context.Background(), p.timing.probeTimeout)
+		defer cancel()
+		_ = tx.Rollback(rollback)
+	}()
 	queue := &pgx.Batch{}
 	for i, e := range b.entries {
 		c := b.written[i]
@@ -190,6 +201,8 @@ func (p *Pool) connect(ctx context.Context) error {
 	return nil
 }
 
+// disconnect closes the connection, releasing ownership. Waiting requests
+// are woken so they stop waiting for identities the pool may not own.
 func (p *Pool) disconnect() {
 	if p.db != nil {
 		p.closeConn(p.db)
@@ -197,7 +210,19 @@ func (p *Pool) disconnect() {
 	}
 	p.mu.Lock()
 	p.connected = false
+	p.wakeLocked()
 	p.mu.Unlock()
+}
+
+// dropIfClosed forgets a connection that failed and reports whether it did.
+// A connection that survived the error, such as after a cancelled statement,
+// still holds ownership and stays.
+func (p *Pool) dropIfClosed() bool {
+	if p.db == nil || !p.db.IsClosed() {
+		return false
+	}
+	p.disconnect()
+	return true
 }
 
 func (p *Pool) closeConn(conn *pgx.Conn) {
@@ -280,20 +305,27 @@ func (p *Pool) persist() {
 			timer.Reset(p.timing.probe)
 			continue
 		}
-		p.disconnect()
 		if fatal(err) {
+			p.disconnect()
 			p.log.Error("identity pool ownership lost; stopping identity work", databaseAttributes(err, p.unsaved())...)
 			p.fail(err)
 			continue
 		}
 		level := slog.LevelWarn
+		if p.dropIfClosed() || failingSince.IsZero() {
+			level = slog.LevelError
+		}
 		if failingSince.IsZero() {
-			failingSince, level = time.Now(), slog.LevelError
+			failingSince = time.Now()
+		}
+		message := "identity state not saved; serving from RAM"
+		if p.db == nil {
+			message = "identity database connection lost; identity work paused until ownership is retaken"
 		}
 		backoff = min(max(2*backoff, p.timing.minBackoff), p.timing.maxBackoff)
 		retryAt = time.Now().Add(backoff)
 		timer.Reset(backoff)
-		p.log.Log(context.Background(), level, "identity database unavailable; serving from RAM", append(databaseAttributes(err, p.unsaved()), "retry_ms", backoff.Milliseconds())...)
+		p.log.Log(context.Background(), level, message, append(databaseAttributes(err, p.unsaved()), "retry_ms", backoff.Milliseconds())...)
 	}
 }
 
@@ -309,7 +341,7 @@ func (p *Pool) saveBeforeClose() {
 		if err == nil {
 			return
 		}
-		p.disconnect()
+		p.dropIfClosed()
 		if !fatal(err) {
 			select {
 			case <-time.After(p.timing.minBackoff):

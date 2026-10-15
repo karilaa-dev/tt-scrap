@@ -70,6 +70,12 @@ func (p *Pool) acquire(ctx context.Context, id string) (*lease, error) {
 			p.mu.Unlock()
 			return nil, core.NewError("service_not_configured", "The identity pool is unavailable.", 503)
 		}
+		// Without its connection the pool cannot know it still owns the
+		// identities; another process may have taken the lock.
+		if !p.connected {
+			p.mu.Unlock()
+			return nil, core.NewError("service_not_configured", "The identity pool is reconnecting to its database.", 503)
+		}
 		now := time.Now().UnixMilli()
 		var selected *entry
 		var selectedProxy *proxyState

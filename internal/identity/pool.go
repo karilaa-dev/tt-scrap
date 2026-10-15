@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
 	"github.com/karilaa-dev/tt-scrap/internal/core"
 	"github.com/karilaa-dev/tt-scrap/internal/tiktokapp"
 )
@@ -137,6 +139,12 @@ func open(ctx context.Context, cfg core.Config, addresses []string, timing persi
 	config.ConnectTimeout = 10 * time.Second
 	config.RuntimeParams["statement_timeout"] = "10000"
 	config.RuntimeParams["application_name"] = "tt-scrap"
+	// An expired context cancels only the running statement, so the
+	// connection keeps the ownership lock. If the server does not answer the
+	// cancel, the connection closes.
+	config.BuildContextWatcherHandler = func(conn *pgconn.PgConn) ctxwatch.Handler {
+		return &pgconn.CancelRequestContextWatcherHandler{Conn: conn, DeadlineDelay: timing.probeTimeout}
+	}
 	p.dbConfig = config
 	p.db, err = pgx.ConnectConfig(connectCtx, config)
 	if err != nil {
