@@ -24,7 +24,11 @@ type RequestEvent struct {
 	Duration                time.Duration
 	DurationMS              float64
 	Bytes                   int64
-	Delivery                *DeliveryEvent
+	ErrorCode               string
+	// WireStatus is the status already sent when a response fails mid-body
+	// and Status reports the outcome instead; zero otherwise.
+	WireStatus int
+	Delivery   *DeliveryEvent
 }
 type Dependencies struct {
 	Config     core.Config
@@ -43,12 +47,13 @@ type handler struct {
 	telegram     *telegramService
 }
 type response struct {
-	status   int
-	headers  http.Header
-	data     []byte
-	body     io.Reader
-	cleanup  func()
-	delivery *DeliveryEvent
+	status    int
+	headers   http.Header
+	data      []byte
+	body      io.Reader
+	cleanup   func()
+	delivery  *DeliveryEvent
+	errorCode string
 }
 
 func NewHandler(dependencies Dependencies) http.Handler {
@@ -68,6 +73,27 @@ func jsonResponse(status int, value any) (response, error) {
 	data, err := json.Marshal(value)
 	return response{status: status, headers: http.Header{"Content-Type": []string{"application/json"}}, data: data}, err
 }
+
+// statusClientClosedRequest follows the nginx 499 convention: the caller
+// canceled the request before the service finished, so no 5xx is reported.
+const statusClientClosedRequest = 499
+
+var errRequestCanceled = core.NewError("request_canceled", "Request canceled by caller", statusClientClosedRequest)
+
+// ErrServiceShutdown is the cancellation cause of the server's base context
+// when shutdown stops in-flight requests, so they are not reported as caller
+// cancellations.
+var ErrServiceShutdown = core.NewError("service_shutting_down", "Service is shutting down", 503)
+
+// cancellation classifies a canceled request context. The first cancellation
+// wins: a caller that left before shutdown stays a caller cancellation.
+func cancellation(ctx context.Context) *core.Error {
+	if errors.Is(context.Cause(ctx), ErrServiceShutdown) {
+		return ErrServiceShutdown
+	}
+	return errRequestCanceled
+}
+
 func errorResponse(err error, id string) response {
 	code, message, status := "internal_error", "Internal server error", 500
 	var failure *core.Error
@@ -77,6 +103,7 @@ func errorResponse(err error, id string) response {
 		code, message, status = "upstream_timeout", "Upstream request timed out", 504
 	}
 	result, _ := jsonResponse(status, fields{"error": fields{"code": code, "message": message, "request_id": id}})
+	result.errorCode = code
 	return result
 }
 
@@ -98,6 +125,17 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	result, err = h.route(w, r)
 	if err != nil {
 		delivery := result.delivery
+		// Only the request context's cancellation is a client or shutdown
+		// outcome; a context canceled internally while the caller still waits
+		// stays a 500.
+		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+			failure := cancellation(r.Context())
+			// The delivery saw only the raw cancellation; attribute it the same way.
+			if delivery != nil && delivery.ErrorCode == errRequestCanceled.Code {
+				delivery.ErrorCode = failure.Code
+			}
+			err = failure
+		}
 		result = errorResponse(err, id)
 		result.delivery = delivery
 	}
@@ -116,12 +154,23 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	written = true
 	w.WriteHeader(result.status)
 	var size int64
+	status, code, wireStatus := result.status, result.errorCode, 0
 	if r.Method != "HEAD" {
+		var err error
 		if result.body != nil {
-			size, _ = io.Copy(w, result.body)
+			size, err = io.Copy(w, result.body)
 		} else {
-			n, _ := w.Write(result.data)
+			var n int
+			n, err = w.Write(result.data)
 			size = int64(n)
+		}
+		// The status is already sent; report the interrupted body as the outcome.
+		if err != nil {
+			failure := core.NewError("internal_error", "Internal server error", 500)
+			if r.Context().Err() != nil {
+				failure = cancellation(r.Context())
+			}
+			status, code, wireStatus = failure.Status, failure.Code, result.status
 		}
 	}
 	if h.dependencies.OnRequest != nil {
@@ -130,7 +179,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(path, "/v1/assets/") {
 			path = "/v1/assets/{token}"
 		}
-		h.dependencies.OnRequest(RequestEvent{RequestID: id, Method: r.Method, Path: path, Status: result.status, Duration: total, DurationMS: float64(total) / float64(time.Millisecond), Bytes: size, Delivery: result.delivery})
+		h.dependencies.OnRequest(RequestEvent{RequestID: id, Method: r.Method, Path: path, Status: status, WireStatus: wireStatus, Duration: total, DurationMS: float64(total) / float64(time.Millisecond), Bytes: size, ErrorCode: code, Delivery: result.delivery})
 	}
 }
 

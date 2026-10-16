@@ -93,8 +93,8 @@ func run() error {
 	}
 	shutdownSignal, stopSignal := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignal()
-	lifetime, cancelLifetime := context.WithCancel(context.Background())
-	defer cancelLifetime()
+	lifetime, cancelLifetime := context.WithCancelCause(context.Background())
+	defer cancelLifetime(nil)
 	pool, err := identity.Open(lifetime, config, proxies)
 	if err != nil {
 		return err
@@ -145,11 +145,13 @@ func run() error {
 	logger.Info("service stopping")
 	shutdown, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// Requests still running when the drain times out are reported as shutdown
+	// casualties, not caller cancellations.
 	if err = server.Shutdown(shutdown); err != nil {
-		cancelLifetime()
+		cancelLifetime(httpapi.ErrServiceShutdown)
 		_ = server.Close()
 	}
-	cancelLifetime()
+	cancelLifetime(httpapi.ErrServiceShutdown)
 	return stopped
 }
 
@@ -161,10 +163,19 @@ func logRequest(logger *slog.Logger, event httpapi.RequestEvent) {
 	if event.Delivery != nil && event.Delivery.Outcome != "succeeded" {
 		level = slog.LevelWarn
 	}
+	if event.ErrorCode == "request_canceled" {
+		level = slog.LevelWarn
+	}
 	if event.Status >= 500 {
 		level = slog.LevelError
 	}
 	attributes := []any{"request_id", event.RequestID, "method", event.Method, "path", event.Path, "status", event.Status, "duration_ms", event.DurationMS, "bytes", event.Bytes}
+	if event.ErrorCode != "" {
+		attributes = append(attributes, "error_code", event.ErrorCode)
+	}
+	if event.WireStatus != 0 {
+		attributes = append(attributes, "wire_status", event.WireStatus)
+	}
 	if event.Delivery != nil {
 		attributes = append(attributes, "delivery", event.Delivery)
 	}

@@ -82,7 +82,7 @@ func TestRangedDownloadUsesParallelPartsAndAnnouncesEarly(t *testing.T) {
 	if err := d.WithIdentity(context.Background(), "", func(f core.DownloadFunc) error { download = f; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	got, err := download(context.Background(), core.AssetContext{Kind: "video", Filename: "123.mp4", UpstreamURL: server.URL + "/video", ExpectedWidth: 1080, ExpectedHeight: 1920}, 0, func(started *core.Downloaded) {
+	got, err := download(context.Background(), core.AssetContext{Kind: "video", Filename: "123.mp4", UpstreamURL: server.URL + "/video"}, 0, func(started *core.Downloaded) {
 		if started.Data.Bytes() != nil || started.Size != int64(len(cdn.data)) || started.ContentType != "video/mp4" || started.Filename != "123.mp4" {
 			t.Errorf("announced after completion or without metadata: %+v", started)
 		}

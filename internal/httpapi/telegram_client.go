@@ -105,6 +105,9 @@ func (c *telegramClient) call(ctx context.Context, method string, parameters fie
 	defer response.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(response.Body, (8<<20)+1))
 	if err != nil {
+		if ctx.Err() != nil {
+			return telegramCall{}, ctx.Err()
+		}
 		if errors.Is(callContext.Err(), context.DeadlineExceeded) {
 			return telegramCall{}, core.NewError("telegram_timeout", "Telegram upload timed out", 504)
 		}

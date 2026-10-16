@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"math/big"
 	"mime"
@@ -36,21 +37,42 @@ func readBody(w http.ResponseWriter, r *http.Request, allowEmpty bool) (fields, 
 		}
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	decoder := json.NewDecoder(r.Body)
+	body := &bodyReader{Reader: r.Body}
+	decoder := json.NewDecoder(body)
 	decoder.UseNumber()
 	var value fields
 	err := decoder.Decode(&value)
 	if err == io.EOF && allowEmpty {
 		return nil, nil
 	}
-	if err != nil || value == nil {
-		return nil, invalidRequest()
+	if err == nil && value != nil {
+		var extra any
+		if err = decoder.Decode(&extra); err == io.EOF {
+			return value, nil
+		}
 	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		return nil, invalidRequest()
+	// A body cut off by the caller's cancellation is not a validation failure.
+	if body.err != nil && r.Context().Err() != nil {
+		return nil, r.Context().Err()
 	}
-	return value, nil
+	return nil, invalidRequest()
+}
+
+// bodyReader records the request body's read failure, unlike a JSON syntax
+// error that a fully received body produces.
+type bodyReader struct {
+	io.Reader
+	err error
+}
+
+func (b *bodyReader) Read(p []byte) (int, error) {
+	n, err := b.Reader.Read(p)
+	// An oversized body is a payload failure whether or not the caller left.
+	var tooLarge *http.MaxBytesError
+	if err != nil && err != io.EOF && !errors.As(err, &tooLarge) {
+		b.err = err
+	}
+	return n, err
 }
 
 func httpURL(value any) (string, error) {

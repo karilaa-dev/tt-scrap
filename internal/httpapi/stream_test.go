@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,9 +29,14 @@ func mp4Box(kind string, payload ...[]byte) []byte {
 
 // streamVideo builds an MP4 whose movie metadata declares a 32x24 track.
 func streamVideo(size int, valid bool) []byte {
+	return sizedVideo(size, valid, 32, 24)
+}
+
+// sizedVideo builds an MP4 whose movie metadata declares a width x height track.
+func sizedVideo(size int, valid bool, width, height uint16) []byte {
 	entry := make([]byte, 78)
-	binary.BigEndian.PutUint16(entry[24:], 32)
-	binary.BigEndian.PutUint16(entry[26:], 24)
+	binary.BigEndian.PutUint16(entry[24:], width)
+	binary.BigEndian.PutUint16(entry[26:], height)
 	handler := make([]byte, 12)
 	copy(handler[8:], "vide")
 	stsd := mp4Box("stsd", []byte{0, 0, 0, 0, 0, 0, 0, 1}, mp4Box("avc1", entry))
@@ -124,6 +131,72 @@ func TestSingleVideoUploadStreamsWhileDownloading(t *testing.T) {
 			}
 			if downloader.MemoryInUse() != 0 {
 				t.Fatal("delivery kept download RAM")
+			}
+		})
+	}
+}
+
+// Extraction metadata advertises 1080x1920, but the served rendition is
+// 540x960. Only measured dimensions of complete media reach Telegram; a
+// streamed upload starts before they are known and omits them.
+func TestVideoDimensionsComeFromDownloadedMedia(t *testing.T) {
+	data := sizedVideo(256<<10, true, 540, 960)
+	for _, tc := range []struct {
+		name, caller string
+		streamed     bool
+		want         map[string]string
+	}{
+		{"buffered", "", false, map[string]string{"width": "540", "height": "960"}},
+		{"streamed", "", true, map[string]string{}},
+		{"caller dimensions", `,"width":720,"height":1280`, false, map[string]string{"width": "720", "height": "1280"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.streamed {
+					http.ServeContent(w, r, "video.mp4", time.Time{}, bytes.NewReader(data))
+					return
+				}
+				// Without a length the download completes before any upload.
+				w.Header().Set("Content-Type", "video/mp4")
+				for chunk := range slices.Chunk(data, 64<<10) {
+					_, _ = w.Write(chunk)
+					w.(http.Flusher).Flush()
+				}
+			}))
+			defer cdn.Close()
+			got := map[string]string{}
+			telegram := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				reader, err := r.MultipartReader()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				for {
+					part, err := reader.NextPart()
+					if err != nil {
+						break
+					}
+					body, _ := io.ReadAll(part)
+					if name := part.FormName(); name == "width" || name == "height" {
+						got[name] = string(body)
+					} else if name == "video_file" && !bytes.Equal(body, data) {
+						t.Error("upload altered the video")
+					}
+				}
+				_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":1}}`)
+			}))
+			defer telegram.Close()
+			dependencies, tt, _, assets := fixture(t)
+			dependencies.Config.TelegramBotToken = "fixture"
+			dependencies.Config.TelegramAPIBaseURL = telegram.URL
+			downloader := platform.NewDownloader(dependencies.Config, nil)
+			defer downloader.Close()
+			dependencies.Downloader = downloader
+			tt.extraction.Width, tt.extraction.Height = core.Ptr(1080), core.Ptr(1920)
+			tt.extraction.Media = []core.AssetDescriptor{assets.Register(core.AssetContext{Platform: "tiktok", Kind: "video", Filename: "video.mp4", UpstreamURL: cdn.URL + "/video"}, 0)}
+			response := request(NewHandler(dependencies), "POST", "/v1/tiktok/telegram-deliveries", `{"source":{"extraction_id":"saved"},"telegram":{"chat_id":1`+tc.caller+`}}`, true)
+			if response.Code != 200 || !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("status=%d dimensions=%v: %s", response.Code, got, response.Body.String())
 			}
 		})
 	}

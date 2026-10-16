@@ -28,6 +28,32 @@ func TestRequestLogLevelsReflectDeliveryOutcome(t *testing.T) {
 	}
 }
 
+func TestRequestLogDistinguishesCallerCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		status      int
+		code, level string
+	}{
+		{499, "request_canceled", "WARN"}, {500, "internal_error", "ERROR"}, {504, "upstream_timeout", "ERROR"}, {503, "service_shutting_down", "ERROR"},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			var output bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&output, nil))
+			logRequest(logger, httpapi.RequestEvent{Status: tc.status, ErrorCode: tc.code})
+			if !strings.Contains(output.String(), `"level":"`+tc.level+`"`) || !strings.Contains(output.String(), `"error_code":"`+tc.code+`"`) {
+				t.Fatal("missing error code or severity", output.String())
+			}
+		})
+	}
+}
+
+func TestRequestLogReportsStatusSentBeforeInterruption(t *testing.T) {
+	var output bytes.Buffer
+	logRequest(slog.New(slog.NewJSONHandler(&output, nil)), httpapi.RequestEvent{Status: 499, WireStatus: 200, ErrorCode: "request_canceled"})
+	if !strings.Contains(output.String(), `"level":"WARN"`) || !strings.Contains(output.String(), `"status":499`) || !strings.Contains(output.String(), `"wire_status":200`) {
+		t.Fatal("interrupted response log", output.String())
+	}
+}
+
 func TestCriticalLogLevelSuppressesLowerLevels(t *testing.T) {
 	var output bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: logLevel(" critical ")}))

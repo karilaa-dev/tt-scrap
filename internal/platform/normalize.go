@@ -71,8 +71,6 @@ func (t *TikTok) normalize(ctx context.Context, data object, base core.AssetCont
 	asset.AlternateURLs = selected.URLs[1:]
 	asset.ContentType = "video/mp4"
 	asset.DurationSeconds = duration
-	asset.ExpectedWidth = selected.Width
-	asset.ExpectedHeight = selected.Height
 	result.Media = append(result.Media, t.assets.RegisterUntil(asset, 0, expiresAt))
 	result.Cover = register(firstURLs(video["cover"], video["origin_cover"]), "cover", id+"_cover.jpg", "", 0)
 	return result, nil

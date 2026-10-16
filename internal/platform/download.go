@@ -314,9 +314,6 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 		if e != nil {
 			return nil, core.NewError("upstream_network_error", "Upstream MP4 is invalid or incomplete", 502)
 		}
-		if asset.ExpectedWidth > 0 && asset.ExpectedHeight > 0 && (width != asset.ExpectedWidth || height != asset.ExpectedHeight) {
-			return nil, core.NewError("upstream_network_error", "Video dimensions differ from the selected rendition", 502)
-		}
 	}
 	succeeded = true
 	return &core.Downloaded{Data: data, Filename: detectedFilename(asset.Filename, mime), ContentType: mime, Size: size, SHA256: hex.EncodeToString(digest.Sum(nil)), Width: width, Height: height}, nil
