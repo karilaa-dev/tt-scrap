@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -25,12 +26,17 @@ import (
 type fakeTikTok struct {
 	extraction core.TikTokExtraction
 	resolveErr error
+	resolve    func(context.Context) error
 	musicID    string
 	refresh    bool
 }
 
-func (f *fakeTikTok) ResolveURL(_ context.Context, url string) (core.TikTokResolution, error) {
-	return core.TikTokResolution{Platform: "tiktok", SourceID: "7695962883523464478", SourceURL: url, ResolvedURL: url}, f.resolveErr
+func (f *fakeTikTok) ResolveURL(ctx context.Context, url string) (core.TikTokResolution, error) {
+	err := f.resolveErr
+	if f.resolve != nil {
+		err = f.resolve(ctx)
+	}
+	return core.TikTokResolution{Platform: "tiktok", SourceID: "7695962883523464478", SourceURL: url, ResolvedURL: url}, err
 }
 func (f *fakeTikTok) ExtractURL(_ context.Context, _ string, refresh bool) (core.TikTokExtraction, error) {
 	f.refresh = refresh
@@ -435,6 +441,186 @@ func TestCallerCancellationIsNotServerError(t *testing.T) {
 			}
 			if event.Status != tc.status || event.ErrorCode != tc.code {
 				t.Fatalf("completion event %d %q", event.Status, event.ErrorCode)
+			}
+		})
+	}
+}
+
+// Shutdown cancels the server's base context, which every request inherits.
+// Whichever of shutdown and the caller cancels first decides the outcome.
+func TestShutdownCancellationIsNotCallerCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		first  string
+		status int
+		code   string
+	}{
+		{"shutdown", "shutdown", 503, "service_shutting_down"},
+		{"caller before shutdown", "caller", 499, "request_canceled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dependencies, tt, _, _ := fixture(t)
+			entered, canceled, proceed := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			tt.resolve = func(ctx context.Context) error {
+				close(entered)
+				<-ctx.Done()
+				close(canceled)
+				<-proceed
+				return fmt.Errorf("resolve: %w", ctx.Err())
+			}
+			events := make(chan RequestEvent, 1)
+			dependencies.OnRequest = func(e RequestEvent) { events <- e }
+			lifetime, stop := context.WithCancelCause(context.Background())
+			defer stop(nil)
+			server := httptest.NewUnstartedServer(NewHandler(dependencies))
+			server.Config.BaseContext = func(net.Listener) context.Context { return lifetime }
+			server.Start()
+			defer server.Close()
+			caller, leave := context.WithCancel(context.Background())
+			defer leave()
+			r, _ := http.NewRequestWithContext(caller, "POST", server.URL+"/v1/tiktok/resolutions", strings.NewReader(`{"url":"https://www.tiktok.com/@x/video/123"}`))
+			r.Header.Set("Authorization", "Bearer "+dependencies.Config.APIKey)
+			responses := make(chan *http.Response, 1)
+			go func() {
+				response, _ := server.Client().Do(r)
+				responses <- response
+			}()
+			<-entered
+			if tc.first == "caller" {
+				leave()
+				<-canceled
+				// Shutdown arrives before the handler reports the outcome.
+				stop(ErrServiceShutdown)
+			} else {
+				stop(ErrServiceShutdown)
+				<-canceled
+			}
+			close(proceed)
+			event := <-events
+			if event.Status != tc.status || event.ErrorCode != tc.code {
+				t.Fatalf("completion event %d %q", event.Status, event.ErrorCode)
+			}
+			if response := <-responses; tc.first == "shutdown" {
+				body, _ := io.ReadAll(response.Body)
+				response.Body.Close()
+				if response.StatusCode != 503 || !strings.Contains(string(body), `"code":"service_shutting_down"`) {
+					t.Fatalf("response %d %s", response.StatusCode, body)
+				}
+			}
+		})
+	}
+}
+
+// failingWriter accepts the first write, then fails as a lost connection does.
+type failingWriter struct {
+	*httptest.ResponseRecorder
+	writes, headers int
+	fail            func()
+}
+
+func (w *failingWriter) WriteHeader(status int) {
+	w.headers++
+	w.ResponseRecorder.WriteHeader(status)
+}
+func (w *failingWriter) Write(data []byte) (int, error) {
+	if w.writes++; w.writes > 1 {
+		w.fail()
+		return 0, errors.New("connection lost")
+	}
+	return w.ResponseRecorder.Write(data)
+}
+
+func TestInterruptedResponseBodyIsNotReportedAsSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cancel bool
+		status int
+		code   string
+	}{
+		{"caller canceled", true, 499, "request_canceled"},
+		{"write failure", false, 500, "internal_error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dependencies, _, downloader, assets := fixture(t)
+			downloader.data = bytes.Repeat([]byte("abcd"), 64*1024)
+			descriptor := assets.Register(core.AssetContext{Filename: "video.mp4"}, 0)
+			var event RequestEvent
+			dependencies.OnRequest = func(value RequestEvent) { event = value }
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			r := httptest.NewRequestWithContext(ctx, "GET", descriptor.DownloadURL, nil)
+			r.Header.Set("Authorization", "Bearer "+dependencies.Config.APIKey)
+			writer := &failingWriter{ResponseRecorder: httptest.NewRecorder(), fail: func() {
+				if tc.cancel {
+					cancel()
+				}
+			}}
+			NewHandler(dependencies).ServeHTTP(writer, r)
+			if writer.headers != 1 || writer.Code != 200 {
+				t.Fatalf("wire status %d written %d times", writer.Code, writer.headers)
+			}
+			if event.Status != tc.status || event.WireStatus != 200 || event.ErrorCode != tc.code {
+				t.Fatalf("completion event %d wire %d %q", event.Status, event.WireStatus, event.ErrorCode)
+			}
+			if event.Bytes <= 0 || event.Bytes >= int64(len(downloader.data)) || event.Bytes != int64(writer.Body.Len()) {
+				t.Fatalf("sent %d of %d bytes, event %d", writer.Body.Len(), len(downloader.data), event.Bytes)
+			}
+			if downloader.leaked() != 0 {
+				t.Fatal("download not released")
+			}
+		})
+	}
+}
+
+// disconnectingBody delivers part of the JSON, then loses the connection.
+type disconnectingBody struct {
+	data   *strings.Reader
+	cancel context.CancelFunc
+}
+
+func (b *disconnectingBody) Read(p []byte) (int, error) {
+	if b.data.Len() > 0 {
+		return b.data.Read(p)
+	}
+	if b.cancel != nil {
+		b.cancel()
+	}
+	return 0, io.ErrUnexpectedEOF
+}
+
+func TestRequestBodyCancellationIsNotValidationFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		body   io.Reader
+		status int
+		code   string
+	}{
+		// The body ends mid-object because the caller disconnected.
+		{"disconnect during body", &disconnectingBody{data: strings.NewReader(`{"url":"https://www.tik`)}, 499, "request_canceled"},
+		// A complete but invalid body stays invalid even after cancellation.
+		{"invalid body", strings.NewReader(`{"url":`), 422, "validation_error"},
+		// A body that fails without cancellation is still rejected as invalid.
+		{"read failure", &disconnectingBody{data: strings.NewReader(`{"url":`)}, 422, "validation_error"},
+		// The 1 MiB limit is a payload failure even when the caller also left.
+		{"oversized body", strings.NewReader(`{"url":"` + strings.Repeat("x", 1<<20) + `"}`), 422, "validation_error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dependencies, _, _, _ := fixture(t)
+			var event RequestEvent
+			dependencies.OnRequest = func(e RequestEvent) { event = e }
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if body, ok := tc.body.(*disconnectingBody); ok && tc.status == 499 {
+				body.cancel = cancel
+			} else if !ok {
+				cancel()
+			}
+			r := httptest.NewRequestWithContext(ctx, "POST", "/v1/tiktok/resolutions", tc.body)
+			r.Header.Set("Authorization", "Bearer "+dependencies.Config.APIKey)
+			w := httptest.NewRecorder()
+			NewHandler(dependencies).ServeHTTP(w, r)
+			if w.Code != tc.status || !strings.Contains(w.Body.String(), `"code":"`+tc.code+`"`) || event.ErrorCode != tc.code {
+				t.Fatalf("response %d %s event %q", w.Code, w.Body.String(), event.ErrorCode)
 			}
 		})
 	}

@@ -1,10 +1,12 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -77,6 +79,51 @@ func TestDeliveryRequestEventsPreserveOutcomesWithoutPayloads(t *testing.T) {
 			}
 			if strings.Contains(response.Body.String(), "failed_stage") {
 				t.Fatal("logging changed public response", response.Body.String())
+			}
+		})
+	}
+}
+
+// A delivery stopped by cancellation carries the same attribution as the
+// request: shutdown is not reported as the caller leaving.
+func TestCanceledDeliveryEventMatchesRequestAttribution(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cause  error
+		status int
+		code   string
+	}{
+		{"shutdown", ErrServiceShutdown, 503, "service_shutting_down"},
+		{"caller", nil, 499, "request_canceled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dependencies, tt, downloader, assets := fixture(t)
+			downloader.data, downloader.mime = jpegFixture(t), "image/jpeg"
+			tt.extraction.ContentType = "slideshow"
+			for i := range 11 {
+				tt.extraction.Media = append(tt.extraction.Media, assets.Register(core.AssetContext{Kind: "image", Filename: "image.jpg", UpstreamURL: "fixture"}, i))
+			}
+			dependencies.Config.TelegramBotToken = "fixture"
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+			calls := 0
+			dependencies.HTTPClient = deliveryDoer(func(r *http.Request) (*http.Response, error) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				if calls++; calls == 2 {
+					cancel(tc.cause)
+					return nil, r.Context().Err()
+				}
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"ok":true,"result":[]}`))}, nil
+			})
+			var event RequestEvent
+			dependencies.OnRequest = func(value RequestEvent) { event = value }
+			r := httptest.NewRequestWithContext(ctx, "POST", "/v1/tiktok/telegram-deliveries", strings.NewReader(`{"source":{"extraction_id":"saved"},"telegram":{"chat_id":1}}`))
+			r.Header.Set("Authorization", "Bearer "+dependencies.Config.APIKey)
+			w := httptest.NewRecorder()
+			NewHandler(dependencies).ServeHTTP(w, r)
+			want := DeliveryEvent{Outcome: "partial", FailedStage: "upload", Batches: 2, Attempts: 2, Succeeded: 1, ErrorCode: tc.code}
+			if w.Code != tc.status || event.Status != tc.status || event.ErrorCode != tc.code || event.Delivery == nil || *event.Delivery != want {
+				t.Fatalf("response %d %s event %d %q delivery %+v", w.Code, w.Body.String(), event.Status, event.ErrorCode, event.Delivery)
 			}
 		})
 	}

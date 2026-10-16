@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -76,7 +77,7 @@ func TestTelegramSingleVideoMultipartAndRawResponse(t *testing.T) {
 				parameters[part.FormName()] = string(data)
 			}
 		}
-		expected := map[string]string{"chat_id": "-1001234567890123456", "video": "attach://video_file", "width": "1080", "height": "1920", "duration": "18", "supports_streaming": "true", "caption": "hello", "future_flag": "yes"}
+		expected := map[string]string{"chat_id": "-1001234567890123456", "video": "attach://video_file", "duration": "18", "supports_streaming": "true", "caption": "hello", "future_flag": "yes"}
 		if !reflect.DeepEqual(parameters, expected) {
 			t.Errorf("fields: %#v", parameters)
 		}
@@ -287,5 +288,61 @@ func TestAlbumBatchBoundaries(t *testing.T) {
 		if !reflect.DeepEqual(sizes, tc.want) {
 			t.Fatal(sizes)
 		}
+	}
+}
+
+// stalledBody fails a Telegram response read with err, or once the request
+// ends.
+type stalledBody struct {
+	ctx     context.Context
+	reading chan struct{}
+	err     error
+}
+
+func (b *stalledBody) Read([]byte) (int, error) {
+	close(b.reading)
+	if b.err != nil {
+		return 0, b.err
+	}
+	<-b.ctx.Done()
+	return 0, errors.New("read on canceled connection")
+}
+func (b *stalledBody) Close() error { return nil }
+
+func TestTelegramResponseReadPreservesCallerCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name, code string
+		readErr    error
+		cancel     bool
+		timeout    time.Duration
+	}{
+		{"caller canceled", "", nil, true, time.Minute},
+		{"upstream timeout", "telegram_timeout", nil, false, 30 * time.Millisecond},
+		{"read failure", "telegram_network_error", errors.New("reset"), false, time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			config := core.DefaultConfig()
+			config.TelegramBotToken = "fixture"
+			config.TelegramTimeout = tc.timeout
+			client := newTelegramClient(config, deliveryDoer(func(r *http.Request) (*http.Response, error) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				body := &stalledBody{ctx: r.Context(), reading: make(chan struct{}), err: tc.readErr}
+				if tc.cancel {
+					go func() { <-body.reading; cancel() }()
+				}
+				return &http.Response{StatusCode: 200, Header: http.Header{}, Body: body}, nil
+			}))
+			_, err := client.call(ctx, "sendMessage", fields{"chat_id": 1}, nil)
+			var failure *core.Error
+			if tc.code == "" {
+				if !errors.Is(err, context.Canceled) || errors.As(err, &failure) {
+					t.Fatalf("caller cancellation became %v", err)
+				}
+			} else if !errors.As(err, &failure) || failure.Code != tc.code {
+				t.Fatalf("error %v", err)
+			}
+		})
 	}
 }

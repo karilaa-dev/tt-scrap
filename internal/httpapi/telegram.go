@@ -110,6 +110,8 @@ type preparedItem struct {
 	Thumbnail *media.Prepared
 	Kind      string
 	Owned     []*core.Downloaded
+	// Width and Height are measured from complete video; zero while streaming.
+	Width, Height int
 }
 
 func (p *preparedItem) cleanup() {
@@ -206,13 +208,9 @@ func (s *telegramService) deliver(ctx context.Context, request telegramRequest, 
 		setDefaults(parameters, request.Telegram, fields{"disable_content_type_detection": true})
 	}
 	if !document && extraction.ContentType == "video" {
+		// Metadata width and height may not match the served rendition, so
+		// only dimensions measured from complete media are sent by default.
 		defaults := fields{"supports_streaming": true}
-		if extraction.Width != nil {
-			defaults["width"] = *extraction.Width
-		}
-		if extraction.Height != nil {
-			defaults["height"] = *extraction.Height
-		}
 		if extraction.DurationSeconds != nil {
 			defaults["duration"] = *extraction.DurationSeconds
 		}
@@ -363,6 +361,7 @@ func (s *telegramService) prepare(ctx context.Context, item deliveryItem, docume
 	}
 	result.Owned = append(result.Owned, asset)
 	result.Media = preparedMedia(item, asset)
+	result.Width, result.Height = asset.Width, asset.Height
 	if item.Kind == "image" && !document {
 		converted, err := s.images.Prepare(ctx, asset.Data, item.Descriptor.Filename, false)
 		if err != nil {
@@ -565,6 +564,12 @@ func singleUpload(item preparedItem, parameters fields, document bool) (string, 
 	}
 	uploads := []upload{{Prepared: item.Media, Field: field + "_file"}}
 	parameters[field] = "attach://" + field + "_file"
+	_, width := parameters["width"]
+	_, height := parameters["height"]
+	// Caller dimensions win; measured ones never mix with a caller's.
+	if field == "video" && item.Width > 0 && item.Height > 0 && !width && !height {
+		parameters["width"], parameters["height"] = item.Width, item.Height
+	}
 	if item.Thumbnail != nil {
 		parameters["thumbnail"] = "attach://thumbnail_file"
 		if field == "video" {
