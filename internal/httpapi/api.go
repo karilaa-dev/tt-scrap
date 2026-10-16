@@ -24,6 +24,7 @@ type RequestEvent struct {
 	Duration                time.Duration
 	DurationMS              float64
 	Bytes                   int64
+	ErrorCode               string
 	Delivery                *DeliveryEvent
 }
 type Dependencies struct {
@@ -43,12 +44,13 @@ type handler struct {
 	telegram     *telegramService
 }
 type response struct {
-	status   int
-	headers  http.Header
-	data     []byte
-	body     io.Reader
-	cleanup  func()
-	delivery *DeliveryEvent
+	status    int
+	headers   http.Header
+	data      []byte
+	body      io.Reader
+	cleanup   func()
+	delivery  *DeliveryEvent
+	errorCode string
 }
 
 func NewHandler(dependencies Dependencies) http.Handler {
@@ -68,6 +70,13 @@ func jsonResponse(status int, value any) (response, error) {
 	data, err := json.Marshal(value)
 	return response{status: status, headers: http.Header{"Content-Type": []string{"application/json"}}, data: data}, err
 }
+
+// statusClientClosedRequest follows the nginx 499 convention: the caller
+// canceled the request before the service finished, so no 5xx is reported.
+const statusClientClosedRequest = 499
+
+var errRequestCanceled = core.NewError("request_canceled", "Request canceled by caller", statusClientClosedRequest)
+
 func errorResponse(err error, id string) response {
 	code, message, status := "internal_error", "Internal server error", 500
 	var failure *core.Error
@@ -77,6 +86,7 @@ func errorResponse(err error, id string) response {
 		code, message, status = "upstream_timeout", "Upstream request timed out", 504
 	}
 	result, _ := jsonResponse(status, fields{"error": fields{"code": code, "message": message, "request_id": id}})
+	result.errorCode = code
 	return result
 }
 
@@ -98,6 +108,11 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	result, err = h.route(w, r)
 	if err != nil {
 		delivery := result.delivery
+		// Only the caller's own cancellation is a client outcome; a context
+		// canceled internally while the caller still waits stays a 500.
+		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+			err = errRequestCanceled
+		}
 		result = errorResponse(err, id)
 		result.delivery = delivery
 	}
@@ -130,7 +145,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(path, "/v1/assets/") {
 			path = "/v1/assets/{token}"
 		}
-		h.dependencies.OnRequest(RequestEvent{RequestID: id, Method: r.Method, Path: path, Status: result.status, Duration: total, DurationMS: float64(total) / float64(time.Millisecond), Bytes: size, Delivery: result.delivery})
+		h.dependencies.OnRequest(RequestEvent{RequestID: id, Method: r.Method, Path: path, Status: result.status, Duration: total, DurationMS: float64(total) / float64(time.Millisecond), Bytes: size, ErrorCode: result.errorCode, Delivery: result.delivery})
 	}
 }
 

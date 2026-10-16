@@ -86,8 +86,6 @@ type AssetContext struct {
 	Referer         string
 	Headers         http.Header
 	IdentityID      string
-	ExpectedWidth   int
-	ExpectedHeight  int
 	DurationSeconds int
 	ExtractionID    string
 }

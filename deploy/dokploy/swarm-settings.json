@@ -1,0 +1,26 @@
+{
+  "healthCheckSwarm": {
+    "Test": ["CMD", "/app/out", "healthcheck"],
+    "Interval": 10000000000,
+    "Timeout": 5000000000,
+    "StartPeriod": 300000000000,
+    "Retries": 3
+  },
+  "updateConfigSwarm": {
+    "Parallelism": 1,
+    "Delay": 0,
+    "FailureAction": "rollback",
+    "Monitor": 60000000000,
+    "MaxFailureRatio": 0,
+    "Order": "stop-first"
+  },
+  "rollbackConfigSwarm": {
+    "Parallelism": 1,
+    "Delay": 0,
+    "FailureAction": "pause",
+    "Monitor": 60000000000,
+    "MaxFailureRatio": 0,
+    "Order": "stop-first"
+  },
+  "stopGracePeriodSwarm": 60000000000
+}

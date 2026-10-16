@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -399,5 +400,42 @@ func TestURLLengthLimitAcrossPublicRoutes(t *testing.T) {
 		if response.Code != tc.status {
 			t.Errorf("input bytes %d: got %d, want %d", len(tc.url), response.Code, tc.status)
 		}
+	}
+}
+
+func TestCallerCancellationIsNotServerError(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		err            error
+		callerCanceled bool
+		status         int
+		code           string
+	}{
+		{"caller canceled", fmt.Errorf("resolve: %w", context.Canceled), true, 499, "request_canceled"},
+		{"internal cancel", context.Canceled, false, 500, "internal_error"},
+		{"upstream deadline", context.DeadlineExceeded, true, 504, "upstream_timeout"},
+		{"internal failure", errors.New("boom"), false, 500, "internal_error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dependencies, tt, _, _ := fixture(t)
+			tt.resolveErr = tc.err
+			var event RequestEvent
+			dependencies.OnRequest = func(e RequestEvent) { event = e }
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.callerCanceled {
+				cancel()
+			}
+			r := httptest.NewRequestWithContext(ctx, "POST", "/v1/tiktok/resolutions", strings.NewReader(`{"url":"https://www.tiktok.com/@x/video/123"}`))
+			r.Header.Set("Authorization", "Bearer "+dependencies.Config.APIKey)
+			w := httptest.NewRecorder()
+			NewHandler(dependencies).ServeHTTP(w, r)
+			if w.Code != tc.status || !strings.Contains(w.Body.String(), `"code":"`+tc.code+`"`) {
+				t.Fatalf("response %d %s", w.Code, w.Body.String())
+			}
+			if event.Status != tc.status || event.ErrorCode != tc.code {
+				t.Fatalf("completion event %d %q", event.Status, event.ErrorCode)
+			}
+		})
 	}
 }

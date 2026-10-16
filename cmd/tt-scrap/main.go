@@ -161,10 +161,16 @@ func logRequest(logger *slog.Logger, event httpapi.RequestEvent) {
 	if event.Delivery != nil && event.Delivery.Outcome != "succeeded" {
 		level = slog.LevelWarn
 	}
+	if event.ErrorCode == "request_canceled" {
+		level = slog.LevelWarn
+	}
 	if event.Status >= 500 {
 		level = slog.LevelError
 	}
 	attributes := []any{"request_id", event.RequestID, "method", event.Method, "path", event.Path, "status", event.Status, "duration_ms", event.DurationMS, "bytes", event.Bytes}
+	if event.ErrorCode != "" {
+		attributes = append(attributes, "error_code", event.ErrorCode)
+	}
 	if event.Delivery != nil {
 		attributes = append(attributes, "delivery", event.Delivery)
 	}

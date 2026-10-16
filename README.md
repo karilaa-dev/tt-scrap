@@ -90,7 +90,7 @@ docker build -t tt-scrap:go .
 docker compose up --build -d
 ```
 
-The container runs as an unprivileged user and includes the Go binary and native HEIF codecs. `tt-scrap healthcheck` probes readiness. Shutdown drains requests for up to 30 seconds before cancelling remaining work.
+The container runs as an unprivileged user and includes the Go binary and native HEIF codecs. `tt-scrap healthcheck` probes readiness. Shutdown drains requests for up to 30 seconds before cancelling remaining work. Compose allows 60 seconds for shutdown and rotates container logs at five 50 MB files.
 
 `DB_URL` must be reachable from the container. A host-only `127.0.0.1` address refers to the container itself: join the database's Docker network and use its service hostname, or configure a host gateway. The base Compose file uses saved database proxies without a file mount. To import `proxies.txt`, use `docker compose -f docker-compose.yml -f compose.proxies.yml up --build -d`. For a new app database, provide that file or explicitly set `PROXY_INCLUDE_HOST=true`. Leave `PROXY_FILE` unset when using only saved database proxies. For account fallback, set `TIKTOK_SESSION_ID` in `.env`; Compose passes it to the service.
 
@@ -101,6 +101,8 @@ For Dokploy with Railpack 0.15.4, `buildAptPackages` must contain only package n
 The build uses structured `cmd` entries because Railpack 0.15.4 wraps string commands in single quotes without escaping embedded quotes. That breaks the linker flags and can report a successful build without producing `out`. The final build command checks that `out` is executable before creating the runtime image.
 
 Railpack's build inputs explicitly include the Go sources and embedded OpenAPI files. Railpack 0.15.4 splits `.dockerignore` negations from exclusions, so the Docker allowlist's `**` exclusion otherwise removes nested sources such as `cmd/tt-scrap`. CI builds the Railpack image and checks its startup command as well as the Dockerfile image.
+
+One process owns each database schema, so updates and rollbacks must stop the old task before starting the new one. [Dokploy settings](docs/dokploy.md) lists the Swarm update, rollback, stop grace, health check, and log retention settings for Dokploy.
 
 ## Migrate from the Python release
 

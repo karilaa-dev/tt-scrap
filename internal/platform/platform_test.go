@@ -515,16 +515,15 @@ func TestFailedDownloadReturnsByteBudgetBeforeFallback(t *testing.T) {
 	}
 }
 
-func TestSelectedRenditionDimensionsValidateDownloadedFallbacks(t *testing.T) {
-	var mismatches, matches atomic.Int32
+func TestDownloadAcceptsVideoWhoseDimensionsDifferFromMetadata(t *testing.T) {
+	var first, fallback atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/match" {
-			matches.Add(1)
-			w.Write(testVideo(1080, 1920))
+		if r.URL.Path == "/first" {
+			first.Add(1)
 		} else {
-			mismatches.Add(1)
-			w.Write(testVideo(540, 960))
+			fallback.Add(1)
 		}
+		w.Write(testVideo(540, 960))
 	}))
 	defer server.Close()
 	cfg := testConfig()
@@ -535,35 +534,32 @@ func TestSelectedRenditionDimensionsValidateDownloadedFallbacks(t *testing.T) {
 	defer service.Close()
 	downloader := NewDownloader(cfg, backend)
 	defer downloader.Close()
-	for _, fallback := range []string{"/match", "/mismatch-again"} {
-		data := object{"video": object{"width": 1080, "height": 1920}}
-		base := core.AssetContext{Platform: "tiktok"}
-		sources := []any{server.URL + "/mismatch", server.URL + fallback}
-		obj(data["video"])["play_addr"] = object{"width": 1080, "height": 1920, "url_list": sources}
-		base.IdentityID = "sticky"
-		post, err := service.normalize(context.Background(), data, base, core.TikTokResolution{SourceID: "123"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		asset, err := assets.GetAsset(post.Media[0].AssetID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		file, err := downloader.Download(context.Background(), asset, 0)
-		if fallback == "/match" {
-			if err != nil || file.Width != 1080 || file.Height != 1920 {
-				t.Errorf("did not return matching fallback: file=%+v error=%v", file, err)
-			}
-		} else if err == nil {
-			t.Error("accepted a video that does not match advertised dimensions")
-		}
-		file.Cleanup()
+	data := object{"video": object{"width": 1080, "height": 1920}}
+	obj(data["video"])["play_addr"] = object{"width": 1080, "height": 1920, "url_list": []any{server.URL + "/first", server.URL + "/fallback"}}
+	post, err := service.normalize(context.Background(), data, core.AssetContext{Platform: "tiktok", IdentityID: "sticky"}, core.TikTokResolution{SourceID: "123"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if mismatches.Load() != 3 || matches.Load() != 1 {
-		t.Errorf("fallbacks not validated: mismatches=%d matches=%d", mismatches.Load(), matches.Load())
+	if post.Width == nil || post.Height == nil || *post.Width != 1080 || *post.Height != 1920 {
+		t.Fatalf("metadata dimensions changed: %v x %v", post.Width, post.Height)
+	}
+	asset, err := assets.GetAsset(post.Media[0].AssetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := downloader.Download(context.Background(), asset, 0)
+	if err != nil {
+		t.Fatal("rejected a valid video with inaccurate metadata dimensions", err)
+	}
+	if file.Width != 540 || file.Height != 960 {
+		t.Errorf("did not report downloaded dimensions: %dx%d", file.Width, file.Height)
+	}
+	file.Cleanup()
+	if first.Load() != 1 || fallback.Load() != 0 {
+		t.Errorf("valid first source was not used once: first=%d fallback=%d", first.Load(), fallback.Load())
 	}
 	files, err := os.ReadDir(cfg.TempDir)
 	if err != nil || len(files) != 0 {
-		t.Fatal("rendition validation leaked files", files, err)
+		t.Fatal("download leaked files", files, err)
 	}
 }
