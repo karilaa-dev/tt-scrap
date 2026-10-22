@@ -6,7 +6,7 @@ Production runs one Go binary. TikTok registration and signing run in Go; image 
 
 ## Run
 
-Install Go **1.27.2**, a C compiler, `pkg-config`, and `libheif-dev`. Debian/Ubuntu installations that split HEIF codecs into plugins also need `libheif-plugin-libde265` for HEIC and `libheif-plugin-dav1d` for AVIF. On Debian 13 or recent Ubuntu:
+Install Go **1.27.3**, a C compiler, `pkg-config`, and `libheif-dev`. Debian/Ubuntu installations that split HEIF codecs into plugins also need `libheif-plugin-libde265` for HEIC and `libheif-plugin-dav1d` for AVIF. On Debian 13 or recent Ubuntu:
 
 ```sh
 sudo apt-get install build-essential pkg-config libheif-dev libheif-plugin-libde265 libheif-plugin-dav1d
@@ -63,7 +63,13 @@ POST returns `202` for a running job or `200` when the pool is already prepared.
 
 ## Throughput and memory
 
+Optional covers download alongside the main media. Once media is ready to upload, a cover gets up to 50 ms of additional selection time, within `TELEGRAM_THUMBNAIL_WAIT_SECONDS` (default 1.5 seconds total). A slower cover is canceled and omitted; cancellation joins its worker before releasing the identity lease, so an uninterruptible decoder can still delay completion. Set the timeout to zero to disable covers. Converted source buffers close as soon as their replacement is ready, and acknowledged album batches release their buffers before the next upload. Memory and concurrency limits remain unchanged.
+
 Upstream connections are pooled and reused. Matching metadata requests share work. Share links resolve from redirect headers alone: the first location that names a post ends resolution, and redirects to the TikTok home, profile, or login pages fail without loading them.
+
+Telegram preparation skips the SHA-256 calculation used by raw asset responses. File-size, media-format, range identity and final-upload validation still run. Raw downloads retain their checksum headers.
+
+See [performance measurements and tradeoffs](docs/performance.md) for the comparison data and local benchmark commands.
 
 Downloaded media stays in RAM when its length is known, it is at most `MEDIA_MEMORY_MAX_MB` (default 250), and the shared `MEDIA_MEMORY_BUDGET_MB` (default 1024) has room. Larger media, media of unknown length beyond that limit, and media arriving while the budget is spent use unlinked files in `TEMP_DIR`, which disappear even after a crash. When more than one part is allowed, the first media request asks for 1 MiB; if the server returns a byte range, the remaining parts download over up to `DOWNLOAD_PARALLEL_PARTS` connections (default four). Each media file holds one download slot, and extra part connections use only free slots, so a limit of one still serializes transfers. Parts are bound to the first response: each sends its strong `ETag` in `If-Range` and must return that `ETag` from the same post-redirect address. If the file changes, the download discards its buffer and restarts rather than mixing versions. A server that sends no strong `ETag` gets one complete request instead of parts. A dropped part resumes from its last received byte under the same check. Media retries use exponential delay plus up to 10% jitter within the download deadline.
 

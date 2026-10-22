@@ -141,6 +141,13 @@ func TestTelegramAlbumPreflightBatchesAndPartial207(t *testing.T) {
 		sizes = append(sizes, len(group))
 		batch := len(sizes)
 		mu.Unlock()
+		wantLive := 11
+		if batch > 1 {
+			wantLive = 2
+		}
+		if live := downloader.leaked(); live != wantLive {
+			t.Errorf("batch %d retained %d source buffers, want %d", batch, live, wantLive)
+		}
 		if len(r.MultipartForm.File) != len(group) {
 			t.Errorf("missing uploads %d %d", len(r.MultipartForm.File), len(group))
 		}

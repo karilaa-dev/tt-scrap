@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"hash"
 	"io"
 	"math/rand/v2"
 	"net/http"
@@ -20,12 +21,13 @@ import (
 )
 
 type Downloader struct {
-	cfg     core.Config
-	app     core.AppBackend
-	client  *http.Client
-	gate    *core.Limiter
-	store   *spool.Store
-	buffers sync.Pool
+	cfg       core.Config
+	app       core.AppBackend
+	client    *http.Client
+	gate      *core.Limiter
+	store     *spool.Store
+	buffers   sync.Pool
+	newDigest func() hash.Hash
 }
 
 // The first request asks for one part; its Content-Range reveals the size and
@@ -34,16 +36,25 @@ const firstPart = 1 << 20
 const minPart = 1 << 20
 
 func NewDownloader(cfg core.Config, backend core.AppBackend) *Downloader {
-	return &Downloader{cfg: cfg, app: backend, client: &http.Client{Transport: newTransport(cfg.HTTPMaxConnections)}, gate: core.NewLimiter(cfg.DownloadConcurrency, cfg.MaxQueuedRequests), store: spool.NewStore(cfg.TempDir, cfg.MediaMemoryFileBytes, cfg.MediaMemoryBudgetBytes), buffers: sync.Pool{New: func() any { buffer := make([]byte, 128<<10); return &buffer }}}
+	return &Downloader{cfg: cfg, app: backend, client: &http.Client{Transport: newTransport(cfg.HTTPMaxConnections)}, gate: core.NewLimiter(cfg.DownloadConcurrency, cfg.MaxQueuedRequests), store: spool.NewStore(cfg.TempDir, cfg.MediaMemoryFileBytes, cfg.MediaMemoryBudgetBytes), buffers: sync.Pool{New: func() any { buffer := make([]byte, 128<<10); return &buffer }}, newDigest: sha256.New}
 }
 func (d *Downloader) Close() { d.client.CloseIdleConnections() }
 
 // MemoryInUse reports RAM reserved by open downloads.
 func (d *Downloader) MemoryInUse() int64 { return d.store.Used() }
 func (d *Downloader) WithIdentity(ctx context.Context, id string, run func(core.DownloadFunc) error) error {
+	return d.withIdentity(ctx, id, run, true)
+}
+
+// WithDeliveryIdentity validates media for delivery without computing SHA256.
+func (d *Downloader) WithDeliveryIdentity(ctx context.Context, id string, run func(core.DownloadFunc) error) error {
+	return d.withIdentity(ctx, id, run, false)
+}
+
+func (d *Downloader) withIdentity(ctx context.Context, id string, run func(core.DownloadFunc) error, checksum bool) error {
 	if id == "" {
 		return run(func(ctx context.Context, asset core.AssetContext, maxBytes int64, started func(*core.Downloaded)) (*core.Downloaded, error) {
-			return d.downloadAsset(ctx, asset, maxBytes, nil, started)
+			return d.downloadAsset(ctx, asset, maxBytes, nil, started, checksum)
 		})
 	}
 	if d.app == nil {
@@ -54,14 +65,14 @@ func (d *Downloader) WithIdentity(ctx context.Context, id string, run func(core.
 			if asset.IdentityID != id {
 				return nil, core.Upstream("Media does not belong to the leased identity")
 			}
-			return d.downloadAsset(ctx, asset, maxBytes, open, started)
+			return d.downloadAsset(ctx, asset, maxBytes, open, started, checksum)
 		})
 	})
 }
 func (d *Downloader) Download(ctx context.Context, asset core.AssetContext, maxBytes int64) (*core.Downloaded, error) {
-	return d.downloadAsset(ctx, asset, maxBytes, nil, nil)
+	return d.downloadAsset(ctx, asset, maxBytes, nil, nil, true)
 }
-func (d *Downloader) downloadAsset(ctx context.Context, asset core.AssetContext, maxBytes int64, open core.OpenAppMedia, started func(*core.Downloaded)) (*core.Downloaded, error) {
+func (d *Downloader) downloadAsset(ctx context.Context, asset core.AssetContext, maxBytes int64, open core.OpenAppMedia, started func(*core.Downloaded), checksum bool) (*core.Downloaded, error) {
 	var cancel context.CancelFunc
 	defer func() {
 		if cancel != nil {
@@ -84,7 +95,7 @@ func (d *Downloader) downloadAsset(ctx context.Context, asset core.AssetContext,
 		}
 		// Identity recovery can rerun the transfer before returning to the caller.
 		downloaded.Cleanup()
-		downloaded, err = d.download(ctx, asset, maxBytes, open, started)
+		downloaded, err = d.download(ctx, asset, maxBytes, open, started, checksum)
 		return err
 	}
 	var err error
@@ -105,14 +116,14 @@ func (d *Downloader) downloadAsset(ctx context.Context, asset core.AssetContext,
 	return downloaded, nil
 }
 
-func (d *Downloader) download(ctx context.Context, asset core.AssetContext, maximum int64, open core.OpenAppMedia, started func(*core.Downloaded)) (*core.Downloaded, error) {
+func (d *Downloader) download(ctx context.Context, asset core.AssetContext, maximum int64, open core.OpenAppMedia, started func(*core.Downloaded), checksum bool) (*core.Downloaded, error) {
 	sources := append([]string{asset.UpstreamURL}, asset.AlternateURLs...)
 	var last error
 	for attempt := 0; attempt < max(len(sources), d.cfg.DownloadRetries); attempt++ {
 		if e := ctx.Err(); e != nil {
 			return nil, networkError(ctx, e)
 		}
-		result, e := d.downloadOnce(ctx, asset, sources[attempt%len(sources)], maximum, open, started)
+		result, e := d.downloadOnce(ctx, asset, sources[attempt%len(sources)], maximum, open, started, checksum)
 		if e == nil {
 			return result, nil
 		}
@@ -162,7 +173,7 @@ func (d *Downloader) open(ctx context.Context, asset core.AssetContext, source, 
 	req.Header = headers
 	return d.client.Do(req)
 }
-func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, source string, maximum int64, open core.OpenAppMedia, started func(*core.Downloaded)) (*core.Downloaded, error) {
+func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, source string, maximum int64, open core.OpenAppMedia, started func(*core.Downloaded), checksum bool) (*core.Downloaded, error) {
 	ranged := d.cfg.DownloadParts > 1
 	byteRange := ""
 	if ranged {
@@ -214,24 +225,46 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 	}
 	succeeded := false
 	var parts *rangeJob
+	var hashed chan error
 	defer func() {
 		if !succeeded {
 			data.Close()
 		}
 		parts.stop()
+		if hashed != nil {
+			<-hashed
+		}
 	}()
-	digest := sha256.New()
-	hashed := make(chan error, 1)
-	go func() {
+	var digest hash.Hash
+	if checksum {
+		digest = d.newDigest()
+	}
+	if digest != nil && ranged && total > end {
+		// Parallel parts arrive out of order; hash their contiguous spool prefix.
+		hashed = make(chan error, 1)
+		go func(done chan<- error) {
+			reader := data.Reader(ctx, 0, -1)
+			if direct, ok := reader.(io.WriterTo); ok {
+				_, err := direct.WriteTo(digest)
+				done <- err
+				return
+			}
+			pooled := d.buffers.Get().(*[]byte)
+			defer d.buffers.Put(pooled)
+			_, err := io.CopyBuffer(digest, reader, *pooled)
+			done <- err
+		}(hashed)
+	}
+	writer := data.Writer(0, end)
+	var buffer []byte
+	if end > 0 && end <= 1<<10 {
+		// Tiny responses need less scratch than a pooled transfer buffer.
+		buffer = make([]byte, end)
+	} else {
 		pooled := d.buffers.Get().(*[]byte)
 		defer d.buffers.Put(pooled)
-		_, err := io.CopyBuffer(digest, data.Reader(ctx, 0, -1), *pooled)
-		hashed <- err
-	}()
-	writer := data.Writer(0, end)
-	pooled := d.buffers.Get().(*[]byte)
-	defer d.buffers.Put(pooled)
-	buffer := *pooled
+		buffer = *pooled
+	}
 	prefix := make([]byte, 0, 512)
 	mime := ""
 	// Validate the media type before requesting other parts or announcing bytes.
@@ -272,6 +305,10 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 			if _, e = writer.Write(buffer[:n]); e != nil {
 				return nil, e
 			}
+			if digest != nil && hashed == nil {
+				// A single response is already ordered; avoid rereading the spool.
+				_, _ = digest.Write(buffer[:n])
+			}
 			received += int64(n)
 		}
 		if readErr == io.EOF {
@@ -301,11 +338,18 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 			return nil, e
 		}
 	}
+	if e = ctx.Err(); e != nil {
+		return nil, networkError(ctx, e)
+	}
 	if e = data.Complete(); e != nil {
 		return nil, core.NewError("upstream_network_error", "Media download is empty or truncated", 502)
 	}
-	if e = <-hashed; e != nil {
-		return nil, e
+	if hashed != nil {
+		e = <-hashed
+		hashed = nil
+		if e != nil {
+			return nil, e
+		}
 	}
 	size := data.Size()
 	width, height := 0, 0
@@ -315,8 +359,16 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 			return nil, core.NewError("upstream_network_error", "Upstream MP4 is invalid or incomplete", 502)
 		}
 	}
+	var sum string
+	if digest != nil {
+		sum = hex.EncodeToString(digest.Sum(nil))
+	}
+	// Cancellation must still reject completed bytes when no hasher is joined.
+	if e = ctx.Err(); e != nil {
+		return nil, networkError(ctx, e)
+	}
 	succeeded = true
-	return &core.Downloaded{Data: data, Filename: detectedFilename(asset.Filename, mime), ContentType: mime, Size: size, SHA256: hex.EncodeToString(digest.Sum(nil)), Width: width, Height: height}, nil
+	return &core.Downloaded{Data: data, Filename: detectedFilename(asset.Filename, mime), ContentType: mime, Size: size, SHA256: sum, Width: width, Height: height}, nil
 }
 
 // representation identifies the file the first response came from. Parts must

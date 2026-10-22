@@ -128,6 +128,13 @@ type Downloader interface {
 	WithIdentity(context.Context, string, func(DownloadFunc) error) error
 }
 
+// DeliveryDownloader optionally prepares media without computing SHA256.
+// It preserves WithIdentity's lease, retry, and complete validation semantics.
+// Callers needing a checksum must use Downloader instead.
+type DeliveryDownloader interface {
+	WithDeliveryIdentity(context.Context, string, func(DownloadFunc) error) error
+}
+
 // DownloadFunc fetches a complete, validated asset. When started is set, it
 // receives each transfer attempt once the length and media type are known,
 // while bytes are still arriving; a failed attempt fails its buffer.

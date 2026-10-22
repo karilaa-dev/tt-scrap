@@ -2,7 +2,10 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,7 +18,9 @@ import (
 	"time"
 
 	"github.com/karilaa-dev/tt-scrap/internal/core"
+	"github.com/karilaa-dev/tt-scrap/internal/media"
 	"github.com/karilaa-dev/tt-scrap/internal/platform"
+	"github.com/karilaa-dev/tt-scrap/internal/spool"
 )
 
 func mp4Box(kind string, payload ...[]byte) []byte {
@@ -25,6 +30,164 @@ func mp4Box(kind string, payload ...[]byte) []byte {
 	copy(box[4:8], kind)
 	copy(box[8:], body)
 	return box
+}
+
+func TestMultipartWithholdsFinal64KiBUntilReleased(t *testing.T) {
+	for _, size := range []int{65535, 65536, 65537} {
+		for _, canceled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%d/canceled=%t", size, canceled), func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				data := spool.Bytes(bytes.Repeat([]byte{'v'}, size))
+				defer data.Close()
+				gate, release := make(chan struct{}), make(chan struct{})
+				body, _, _, err := multipartBody(ctx, nil, []upload{{
+					Prepared: media.Prepared{Data: data, Filename: "video.mp4", ContentType: "video/mp4", Size: int64(size)},
+					Field:    "video_file",
+					hold: func(ctx context.Context) error {
+						close(gate)
+						select {
+						case <-release:
+							return nil
+						case <-ctx.Done():
+							return ctx.Err()
+						}
+					},
+				}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var output bytes.Buffer
+				done := make(chan error, 1)
+				go func() {
+					_, err := io.Copy(&output, body)
+					done <- err
+				}()
+				select {
+				case <-gate:
+				case <-time.After(time.Second):
+					t.Fatal("upload did not reach its final-byte gate")
+				}
+				prefix := bytes.Clone(output.Bytes())
+				headerEnd := bytes.Index(prefix, []byte("\r\n\r\n")) + 4
+				if headerEnd < 4 || !bytes.Equal(prefix[headerEnd:], bytes.Repeat([]byte{'v'}, max(0, size-65536))) {
+					t.Fatal("upload released media tail or multipart ending before validation")
+				}
+				if canceled {
+					cancel()
+				} else {
+					close(release)
+				}
+				select {
+				case err := <-done:
+					if canceled {
+						if !errors.Is(err, context.Canceled) || !bytes.Equal(output.Bytes(), prefix) {
+							t.Fatal("canceled upload sent its final bytes", err)
+						}
+					} else if err != nil || !bytes.HasPrefix(output.Bytes()[headerEnd:], bytes.Repeat([]byte{'v'}, size)) || !bytes.HasSuffix(output.Bytes(), []byte("--\r\n")) {
+						t.Fatal("released upload did not finish exactly", err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("upload did not leave its final-byte gate")
+				}
+			})
+		}
+	}
+}
+
+func TestStreamedVideoRecoveryKeepsTimelyThumbnail(t *testing.T) {
+	valid, invalid := streamVideo(128<<10, true), streamVideo(128<<10, false)
+	cover := jpegFixture(t)
+	uploading := make(chan struct{})
+	var first sync.Once
+	var downloads, complete, aborted atomic.Int32
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/cover" {
+			_, _ = w.Write(cover)
+			return
+		}
+		downloads.Add(1)
+		w.Header().Set("Content-Length", "131072")
+		if r.URL.Path == "/bad" {
+			_, _ = w.Write(invalid[:32<<10])
+			w.(http.Flusher).Flush()
+			select {
+			case <-uploading:
+			case <-r.Context().Done():
+				return
+			}
+			_, _ = w.Write(invalid[32<<10:])
+		} else {
+			_, _ = w.Write(valid)
+		}
+	}))
+	defer cdn.Close()
+	telegram := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reader, err := r.MultipartReader()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		var gotVideo, gotCover []byte
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				aborted.Add(1)
+				return
+			}
+			var prefix []byte
+			if part.FormName() == "video_file" {
+				prefix = make([]byte, 512)
+				if _, err := io.ReadFull(part, prefix); err != nil {
+					aborted.Add(1)
+					return
+				}
+				first.Do(func() { close(uploading) })
+			}
+			data, err := io.ReadAll(part)
+			if err != nil {
+				aborted.Add(1)
+				return
+			}
+			switch part.FormName() {
+			case "video_file":
+				gotVideo = append(prefix, data...)
+			case "thumbnail_file":
+				gotCover = data
+			}
+		}
+		if !bytes.Equal(gotVideo, valid) || !bytes.Equal(gotCover, cover) {
+			t.Error("recovery sent wrong media or lost its thumbnail")
+		}
+		complete.Add(1)
+		_, _ = io.WriteString(w, `{"ok":true,"result":{"message_id":1}}`)
+	}))
+	defer telegram.Close()
+	dependencies, tt, _, assets := fixture(t)
+	cfg := dependencies.Config
+	cfg.TelegramBotToken, cfg.TelegramAPIBaseURL = "fixture", telegram.URL
+	cfg.ThumbnailWait = core.DefaultConfig().ThumbnailWait
+	cfg.DownloadRetries, cfg.RetryDelay, cfg.TelegramUploadConcurrency = 1, 0, 1
+	cfg.TempDir = t.TempDir()
+	downloader := platform.NewDownloader(cfg, nil)
+	defer downloader.Close()
+	dependencies.Config, dependencies.Downloader = cfg, downloader
+	tt.extraction.Media = []core.AssetDescriptor{assets.Register(core.AssetContext{Kind: "video", Filename: "video.mp4", UpstreamURL: cdn.URL + "/bad", AlternateURLs: []string{cdn.URL + "/good"}}, 0)}
+	thumbnail := assets.Register(core.AssetContext{Kind: "image", UpstreamURL: cdn.URL + "/cover"}, 0)
+	tt.extraction.Cover = &thumbnail
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r := httptest.NewRequest("POST", "/v1/tiktok/telegram-deliveries", strings.NewReader(`{"source":{"extraction_id":"saved"},"telegram":{"chat_id":1}}`)).WithContext(ctx)
+	r.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+	response := httptest.NewRecorder()
+	NewHandler(dependencies).ServeHTTP(response, r)
+	telegram.Close()
+	if response.Code != 200 || downloads.Load() != 2 || complete.Load() != 1 || aborted.Load() != 1 || downloader.MemoryInUse() != 0 {
+		t.Fatalf("status=%d downloads=%d complete=%d aborted=%d retained=%d: %s", response.Code, downloads.Load(), complete.Load(), aborted.Load(), downloader.MemoryInUse(), response.Body.String())
+	}
 }
 
 // streamVideo builds an MP4 whose movie metadata declares a 32x24 track.
@@ -78,7 +241,6 @@ func TestSingleVideoUploadStreamsWhileDownloading(t *testing.T) {
 			defer cdn.Close()
 			var complete, aborted atomic.Int32
 			telegram := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				signal.Do(func() { close(uploading) })
 				reader, err := r.MultipartReader()
 				if err != nil {
 					t.Error(err)
@@ -93,12 +255,21 @@ func TestSingleVideoUploadStreamsWhileDownloading(t *testing.T) {
 						aborted.Add(1)
 						return
 					}
+					var prefix []byte
+					if part.FormName() == "video_file" {
+						prefix = make([]byte, 512)
+						if _, err := io.ReadFull(part, prefix); err != nil {
+							aborted.Add(1)
+							return
+						}
+						signal.Do(func() { close(uploading) })
+					}
 					body, err := io.ReadAll(part)
 					if err != nil {
 						aborted.Add(1)
 						return
 					}
-					if part.FormName() == "video_file" && !bytes.Equal(body, data) {
+					if part.FormName() == "video_file" && !bytes.Equal(append(prefix, body...), data) {
 						t.Error("streamed upload altered the video")
 					}
 				}
