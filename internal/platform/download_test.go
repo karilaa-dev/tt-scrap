@@ -236,106 +236,121 @@ func otherVersion(data []byte) []byte {
 	return other
 }
 
-func downloadVersion(t *testing.T, url string, retries int) ([]byte, error) {
+func downloadVersion(t *testing.T, contract downloadContract, url string, retries int) ([]byte, error) {
 	t.Helper()
 	cfg := testConfig()
 	cfg.DownloadRetries = retries
 	d := NewDownloader(cfg, nil)
 	defer d.Close()
-	got, err := d.Download(context.Background(), core.AssetContext{Kind: "video", Filename: "v.mp4", UpstreamURL: url}, 0)
+	got, err := contract.download(d, context.Background(), core.AssetContext{Kind: "video", Filename: "v.mp4", UpstreamURL: url}, 0, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer got.Cleanup()
+	if got.SHA256 != contract.sum(got.Data.Bytes()) {
+		t.Fatal("download hash differs after representation or range retries")
+	}
 	return bytes.Clone(got.Data.Bytes()), nil
 }
 
 func TestRangedDownloadNeverSplicesChangedRepresentations(t *testing.T) {
-	a := largeVideo(3 << 20)
-	b := otherVersion(a)
-	for _, test := range []struct {
-		name string
-		cdn  *versionCDN
-	}{
-		{"strong validator", &versionCDN{etags: []string{`"a"`, `"b"`}, switchAfter: 1}},
-		{"If-Range ignored", &versionCDN{etags: []string{`"a"`, `"b"`}, switchAfter: 1, ignoreIfRange: true}},
-		{"no validator", &versionCDN{etags: []string{"", ""}, switchAfter: 1}},
-		{"weak validator", &versionCDN{etags: []string{`W/"a"`, `W/"b"`}, switchAfter: 1}},
-		{"resumed part", &versionCDN{etags: []string{`"a"`, `"b"`}, dropPart: firstPart}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			test.cdn.versions = [][]byte{a, b}
-			server := httptest.NewServer(test.cdn)
-			defer server.Close()
-			got, err := downloadVersion(t, server.URL+"/video", 3)
-			if err != nil {
-				t.Fatal(err, test.cdn.requested())
-			}
-			if !bytes.Equal(got, b) {
-				t.Fatalf("download mixed representations: equal to first=%v requests=%v", bytes.Equal(got, a), test.cdn.requested())
+	for _, contract := range []downloadContract{rawDownload, deliveryDownload} {
+		t.Run(string(contract), func(t *testing.T) {
+			a := largeVideo(3 << 20)
+			b := otherVersion(a)
+			for _, test := range []struct {
+				name string
+				cdn  *versionCDN
+			}{
+				{"strong validator", &versionCDN{etags: []string{`"a"`, `"b"`}, switchAfter: 1}},
+				{"If-Range ignored", &versionCDN{etags: []string{`"a"`, `"b"`}, switchAfter: 1, ignoreIfRange: true}},
+				{"no validator", &versionCDN{etags: []string{"", ""}, switchAfter: 1}},
+				{"weak validator", &versionCDN{etags: []string{`W/"a"`, `W/"b"`}, switchAfter: 1}},
+				{"resumed part", &versionCDN{etags: []string{`"a"`, `"b"`}, dropPart: firstPart}},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					test.cdn.versions = [][]byte{a, b}
+					server := httptest.NewServer(test.cdn)
+					defer server.Close()
+					got, err := downloadVersion(t, contract, server.URL+"/video", 3)
+					if err != nil {
+						t.Fatal(err, test.cdn.requested())
+					}
+					if !bytes.Equal(got, b) {
+						t.Fatalf("download mixed representations: equal to first=%v requests=%v", bytes.Equal(got, a), test.cdn.requested())
+					}
+				})
 			}
 		})
 	}
 }
 
 func TestRangedDownloadPinsStrongValidatorAndFallsBackWithoutOne(t *testing.T) {
-	data := largeVideo(5 << 20)
-	strong := &versionCDN{versions: [][]byte{data}, etags: []string{`"a"`}}
-	server := httptest.NewServer(strong)
-	defer server.Close()
-	if got, err := downloadVersion(t, server.URL+"/video", 1); err != nil || !bytes.Equal(got, data) {
-		t.Fatal("pinned ranged download failed", err)
-	}
-	requests := strong.requested()
-	if len(requests) < 3 {
-		t.Fatalf("strong validator did not allow parallel parts: %v", requests)
-	}
-	for _, request := range requests[1:] {
-		if !strings.HasPrefix(request, "bytes=") || !strings.HasSuffix(request, `|"a"`) {
-			t.Fatalf("part was not bound to the first representation: %v", requests)
-		}
-	}
-	unpinned := &versionCDN{versions: [][]byte{data}, etags: []string{""}}
-	fallback := httptest.NewServer(unpinned)
-	defer fallback.Close()
-	if got, err := downloadVersion(t, fallback.URL+"/video", 1); err != nil || !bytes.Equal(got, data) {
-		t.Fatal("unpinned download failed", err)
-	}
-	if requests := unpinned.requested(); len(requests) != 2 || requests[1] != "|" {
-		t.Fatalf("unpinned media did not restart as one request: %v", requests)
+	for _, contract := range []downloadContract{rawDownload, deliveryDownload} {
+		t.Run(string(contract), func(t *testing.T) {
+			data := largeVideo(5 << 20)
+			strong := &versionCDN{versions: [][]byte{data}, etags: []string{`"a"`}}
+			server := httptest.NewServer(strong)
+			defer server.Close()
+			if got, err := downloadVersion(t, contract, server.URL+"/video", 1); err != nil || !bytes.Equal(got, data) {
+				t.Fatal("pinned ranged download failed", err)
+			}
+			requests := strong.requested()
+			if len(requests) < 3 {
+				t.Fatalf("strong validator did not allow parallel parts: %v", requests)
+			}
+			for _, request := range requests[1:] {
+				if !strings.HasPrefix(request, "bytes=") || !strings.HasSuffix(request, `|"a"`) {
+					t.Fatalf("part was not bound to the first representation: %v", requests)
+				}
+			}
+			unpinned := &versionCDN{versions: [][]byte{data}, etags: []string{""}}
+			fallback := httptest.NewServer(unpinned)
+			defer fallback.Close()
+			if got, err := downloadVersion(t, contract, fallback.URL+"/video", 1); err != nil || !bytes.Equal(got, data) {
+				t.Fatal("unpinned download failed", err)
+			}
+			if requests := unpinned.requested(); len(requests) != 2 || requests[1] != "|" {
+				t.Fatalf("unpinned media did not restart as one request: %v", requests)
+			}
+		})
 	}
 }
 
 func TestRangedPartRetriesRejectOtherRedirectTargets(t *testing.T) {
-	a := largeVideo(2 << 20)
-	b := otherVersion(a)
-	var redirects, finals atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Both targets share a validator; only the address identifies the file.
-		w.Header().Set("ETag", `"same"`)
-		switch r.URL.Path {
-		case "/video":
-			if redirects.Add(1) == 1 {
-				http.Redirect(w, r, "/final", http.StatusFound)
-			} else {
-				http.Redirect(w, r, "/other", http.StatusFound)
+	for _, contract := range []downloadContract{rawDownload, deliveryDownload} {
+		t.Run(string(contract), func(t *testing.T) {
+			a := largeVideo(2 << 20)
+			b := otherVersion(a)
+			var redirects, finals atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Both targets share a validator; only the address identifies the file.
+				w.Header().Set("ETag", `"same"`)
+				switch r.URL.Path {
+				case "/video":
+					if redirects.Add(1) == 1 {
+						http.Redirect(w, r, "/final", http.StatusFound)
+					} else {
+						http.Redirect(w, r, "/other", http.StatusFound)
+					}
+				case "/final":
+					if finals.Add(1) == 2 {
+						http.Error(w, "busy", http.StatusServiceUnavailable)
+						return
+					}
+					http.ServeContent(w, r, "video.mp4", time.Time{}, bytes.NewReader(a))
+				case "/other":
+					http.ServeContent(w, r, "video.mp4", time.Time{}, bytes.NewReader(b))
+				}
+			}))
+			defer server.Close()
+			got, err := downloadVersion(t, contract, server.URL+"/video", 3)
+			if err != nil {
+				t.Fatal(err)
 			}
-		case "/final":
-			if finals.Add(1) == 2 {
-				http.Error(w, "busy", http.StatusServiceUnavailable)
-				return
+			if !bytes.Equal(got, a) {
+				t.Fatalf("part retry accepted another redirect target: equal to other=%v", bytes.Equal(got[firstPart:], b[firstPart:]))
 			}
-			http.ServeContent(w, r, "video.mp4", time.Time{}, bytes.NewReader(a))
-		case "/other":
-			http.ServeContent(w, r, "video.mp4", time.Time{}, bytes.NewReader(b))
-		}
-	}))
-	defer server.Close()
-	got, err := downloadVersion(t, server.URL+"/video", 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, a) {
-		t.Fatalf("part retry accepted another redirect target: equal to other=%v", bytes.Equal(got[firstPart:], b[firstPart:]))
+		})
 	}
 }

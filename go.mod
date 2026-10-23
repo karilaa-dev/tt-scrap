@@ -1,6 +1,6 @@
 module github.com/karilaa-dev/tt-scrap
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/emmansun/gmsm v0.45.0

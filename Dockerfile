@@ -1,4 +1,4 @@
-FROM golang:1.27.2-trixie AS build
+FROM golang:1.27.3-trixie AS build
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends libheif-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*

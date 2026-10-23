@@ -312,17 +312,8 @@ func (p *Processor) prepare(ctx context.Context, source *spool.Buffer, filename 
 		return Prepared{}, err
 	}
 	width, height, paddedW, paddedH := outputSize(img.Bounds().Dx(), img.Bounds().Dy(), m)
-	dst := image.NewRGBA(image.Rect(0, 0, width, height))
-	stddraw.Draw(dst, dst.Bounds(), image.NewUniform(color.White), image.Point{}, stddraw.Src)
-	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), img, img.Bounds(), draw.Over, nil)
-	if paddedW != width || paddedH != height {
-		padded := image.NewRGBA(image.Rect(0, 0, paddedW, paddedH))
-		stddraw.Draw(padded, padded.Bounds(), image.NewUniform(color.White), image.Point{}, stddraw.Src)
-		offset := image.Pt((paddedW-width)/2, (paddedH-height)/2)
-		stddraw.Draw(padded, dst.Bounds().Add(offset), dst, image.Point{}, stddraw.Src)
-		dst = padded
-		width, height = paddedW, paddedH
-	}
+	dst := preparePixels(img, width, height, paddedW, paddedH)
+	width, height = paddedW, paddedH
 	limit, quality := int64(photoMaxBytes), 85
 	switch m {
 	case thumbnailMode:
@@ -345,7 +336,7 @@ func (p *Processor) prepare(ctx context.Context, source *spool.Buffer, filename 
 			break
 		}
 		quality = 75
-		if attempt >= 1 {
+		if attempt >= 1 && attempt < 3 {
 			scale := math.Sqrt(float64(limit)/float64(output.Len())) * 0.95
 			width = max(1, int(float64(width)*scale))
 			height = max(1, int(float64(height)*scale))
@@ -363,6 +354,63 @@ func (p *Processor) prepare(ctx context.Context, source *spool.Buffer, filename 
 	data := make([]byte, output.Len())
 	copy(data, output.Bytes())
 	return Prepared{Data: spool.Bytes(data), Filename: FilenameForType(filename, "image/jpeg"), ContentType: "image/jpeg", Size: int64(len(data)), Owned: true}, nil
+}
+
+// preparePixels consumes a decoded image, flattening transparency onto white.
+// Full-size RGBA/NRGBA images can reuse their pixels because the decoder's
+// output is private to this preparation; encoded source bytes are untouched.
+func preparePixels(img image.Image, width, height, paddedW, paddedH int) *image.RGBA {
+	if img.Bounds().Size() == image.Pt(width, height) && width == paddedW && height == paddedH {
+		var dst *image.RGBA
+		straightAlpha := false
+		switch src := img.(type) {
+		case *image.RGBA:
+			dst = src
+		case *image.NRGBA:
+			dst = &image.RGBA{Pix: src.Pix, Stride: src.Stride, Rect: src.Rect}
+			straightAlpha = true
+		}
+		if dst != nil {
+			for y := range height {
+				row := dst.Pix[y*dst.Stride : y*dst.Stride+width*4]
+				for x := 0; x < len(row); x += 4 {
+					p := row[x : x+4 : x+4]
+					if p[3] == 255 {
+						continue
+					}
+					if straightAlpha {
+						// Match image/draw's 16-bit premultiplication before
+						// compositing; rounding to 8 bits first loses precision.
+						a := uint32(p[3]) * 0x101
+						white := 0xffff - a
+						p[0] = uint8((uint32(p[0])*a/0xff + white) >> 8)
+						p[1] = uint8((uint32(p[1])*a/0xff + white) >> 8)
+						p[2] = uint8((uint32(p[2])*a/0xff + white) >> 8)
+					} else {
+						white := uint32(255-p[3]) * 0x101
+						p[0] = uint8((uint32(p[0])*0x101 + white) >> 8)
+						p[1] = uint8((uint32(p[1])*0x101 + white) >> 8)
+						p[2] = uint8((uint32(p[2])*0x101 + white) >> 8)
+					}
+					p[3] = 255
+				}
+			}
+			return dst
+		}
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, paddedW, paddedH))
+	op := draw.Over
+	switch img.(type) {
+	case *image.YCbCr, *image.Gray, *image.Gray16, *image.CMYK:
+		// These formats are always opaque; their pixels replace the backdrop.
+		op = draw.Src
+	}
+	if op == draw.Over || width != paddedW || height != paddedH {
+		stddraw.Draw(dst, dst.Bounds(), image.White, image.Point{}, stddraw.Src)
+	}
+	offset := image.Pt((paddedW-width)/2, (paddedH-height)/2)
+	draw.ApproxBiLinear.Scale(dst, image.Rectangle{Min: offset, Max: offset.Add(image.Pt(width, height))}, img, img.Bounds(), op, nil)
+	return dst
 }
 
 // heifSize reads the coded dimensions of the primary item from its ispe

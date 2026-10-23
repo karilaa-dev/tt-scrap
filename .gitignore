@@ -17,6 +17,8 @@
 coverage.out
 /downloads/
 /tmp/
+# Local architecture trials, raw measurements, and live-test helpers
+/experiments/
 *.part
 
 # Logs and editors

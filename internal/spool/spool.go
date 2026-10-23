@@ -34,7 +34,7 @@ func NewStore(dir string, fileLimit, budget int64) *Store {
 	return &Store{dir: dir, fileLimit: fileLimit, budget: budget}
 }
 
-// Used reports the RAM currently reserved by open buffers.
+// Used reports the RAM reserved by buffers and their in-flight writes.
 func (s *Store) Used() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -107,6 +107,7 @@ type Buffer struct {
 	mem      []byte
 	file     *os.File
 	reserved int64
+	pinned   int
 	regions  []*region
 	ready    int64
 	err      error
@@ -198,15 +199,22 @@ func (w *Writer) Write(p []byte) (int, error) {
 		return b.appendLocked(r, p)
 	}
 	mem, file := b.mem, b.file
+	if file == nil {
+		b.pinned++
+	}
 	b.mu.Unlock()
 	// Disjoint ranges ahead of the ready prefix are never read concurrently.
 	if file == nil {
 		copy(mem[offset:], p)
+		mem = nil
 	} else if _, err := file.WriteAt(p, offset); err != nil {
 		return 0, err
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if file == nil {
+		b.unpinLocked()
+	}
 	if b.err != nil {
 		return 0, b.err
 	}
@@ -309,7 +317,8 @@ func (b *Buffer) Fail(err error) {
 	}
 }
 
-// Close releases RAM or the temporary file; later reads fail.
+// Close releases RAM or the temporary file; later reads fail. RAM passed to an
+// in-flight Write remains reserved until that Write returns.
 func (b *Buffer) Close() {
 	if b == nil {
 		return
@@ -322,9 +331,12 @@ func (b *Buffer) Close() {
 	b.closed = true
 	b.err = ErrClosed
 	b.notifyLocked()
-	b.store.release(b.reserved)
+	if b.pinned == 0 {
+		b.store.release(b.reserved)
+		b.reserved = 0
+	}
 	// Retried deliveries keep closed buffers referenced; drop the released RAM.
-	b.mem, b.reserved = nil, 0
+	b.mem = nil
 	if b.file != nil {
 		_ = b.file.Close()
 	}
@@ -374,6 +386,11 @@ func (b *Buffer) ReadAt(p []byte, off int64) (int, error) {
 // Reader streams [start, end) in order, waiting for bytes to arrive. A
 // negative end reads until the buffer completes.
 func (b *Buffer) Reader(ctx context.Context, start, end int64) io.Reader {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.file == nil && b.size >= 0 {
+		return &memoryReader{reader: reader{b: b, ctx: ctx, offset: start, end: end}}
+	}
 	return &reader{b: b, ctx: ctx, offset: start, end: end}
 }
 
@@ -381,6 +398,69 @@ type reader struct {
 	b           *Buffer
 	ctx         context.Context
 	offset, end int64
+}
+
+// Fixed RAM buffers never move or rewrite their ready prefix. Growing and
+// disk buffers keep the copying reader so growth and spills cannot retain
+// unaccounted backing arrays, and callers can reuse their scratch buffers.
+type memoryReader struct{ reader }
+
+func (b *Buffer) unpinLocked() {
+	b.pinned--
+	if b.closed && b.pinned == 0 {
+		b.store.release(b.reserved)
+		b.reserved = 0
+	}
+}
+
+func (b *Buffer) writePinned(w io.Writer, p []byte) (int, error) {
+	defer func() {
+		b.mu.Lock()
+		b.unpinLocked()
+		b.mu.Unlock()
+	}()
+	return w.Write(p)
+}
+
+func (r *memoryReader) WriteTo(w io.Writer) (int64, error) {
+	var written int64
+	b := r.b
+	for r.end < 0 || r.offset < r.end {
+		b.mu.Lock()
+		if err := b.waitReadyLocked(r.ctx, r.offset); err != nil {
+			b.mu.Unlock()
+			if err == io.EOF {
+				err = nil
+			}
+			return written, err
+		}
+		if err := r.ctx.Err(); err != nil {
+			b.mu.Unlock()
+			return written, err
+		}
+		// Bound each call so cancellation is observed between ready chunks.
+		end := r.offset + min(b.ready-r.offset, 128<<10)
+		if r.end >= 0 {
+			end = min(end, r.end)
+		}
+		p := b.mem[r.offset:end]
+		b.pinned++
+		b.mu.Unlock()
+		length := len(p)
+		n, err := b.writePinned(w, p)
+		if n < 0 || n > length {
+			return written, errors.New("invalid Write count")
+		}
+		r.offset += int64(n)
+		written += int64(n)
+		if n < length && err == nil {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			return written, err
+		}
+	}
+	return written, nil
 }
 
 func (r *reader) Read(p []byte) (int, error) {
@@ -401,16 +481,23 @@ func (r *reader) Read(p []byte) (int, error) {
 func (b *Buffer) wait(ctx context.Context, p []byte, off int64) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if err := b.waitReadyLocked(ctx, off); err != nil {
+		return 0, err
+	}
+	return b.readLocked(p, off)
+}
+
+func (b *Buffer) waitReadyLocked(ctx context.Context, off int64) error {
 	for {
 		switch {
 		case b.closed:
-			return 0, ErrClosed
+			return ErrClosed
 		case off < b.ready:
-			return b.readLocked(p, off)
+			return nil
 		case b.complete:
-			return 0, io.EOF
+			return io.EOF
 		case b.err != nil:
-			return 0, b.err
+			return b.err
 		}
 		if b.waiters == nil {
 			b.waiters = make(chan struct{})
@@ -421,7 +508,7 @@ func (b *Buffer) wait(ctx context.Context, p []byte, off int64) (int, error) {
 		case <-changed:
 		case <-ctx.Done():
 			b.mu.Lock()
-			return 0, ctx.Err()
+			return ctx.Err()
 		}
 		b.mu.Lock()
 	}
