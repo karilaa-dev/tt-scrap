@@ -217,7 +217,7 @@ func (p *Pool) acquire(ctx context.Context, pinned string, avoid map[string]bool
 		if p.closed {
 			return nil, nil, core.NewError("service_not_configured", "Instagram account pool is closed", 503)
 		}
-		if p.pendingDeaths > 0 || (p.options.Store != nil && p.options.Store.dirty.Load()) {
+		if pinned == "" && (p.pendingDeaths > 0 || (p.options.Store != nil && p.options.Store.dirty.Load())) {
 			return nil, nil, dbFailure()
 		}
 		if len(p.accounts) == 0 {

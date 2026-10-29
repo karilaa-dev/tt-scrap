@@ -208,11 +208,11 @@ func parseLogin(status int, header http.Header, body []byte) (loginResponse, err
 }
 func loginCheck(r loginResponse) error {
 	text := strings.ToLower(stringField(r.value, "message") + " " + stringField(r.value, "error_type"))
+	if r.status == http.StatusTooManyRequests || strings.Contains(text, "rate_limit") || strings.Contains(text, "please wait") {
+		return loginFailure("upstream_rate_limited")
+	}
 	if truthy(r.value["challenge"]) || truthy(r.value["challenge_required"]) || truthy(r.value["checkpoint_required"]) || strings.Contains(text, "challenge") || strings.Contains(text, "checkpoint") || strings.Contains(text, "security_requirement") {
 		return loginFailure("challenge_required")
-	}
-	if r.status == 429 || strings.Contains(text, "rate_limit") || strings.Contains(text, "please wait") {
-		return loginFailure("upstream_rate_limited")
 	}
 	return nil
 }

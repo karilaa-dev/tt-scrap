@@ -188,7 +188,7 @@ func TestAttemptRowsAndFailedDeathPersistence(t *testing.T) {
 	}); e != nil || total != 3 || legacy != 2 {
 		t.Fatal("attempt metrics incorrect", e, total, legacy)
 	}
-	p, e := Open(Options{Store: store, AccountsFile: newTestPool(t, 1, 1).options.AccountsFile})
+	p, e := Open(Options{Store: store, AccountsFile: newTestPool(t, 2, 1).options.AccountsFile})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -208,6 +208,16 @@ func TestAttemptRowsAndFailedDeathPersistence(t *testing.T) {
 	}
 	if _, e = p.Detail(ctx, "123"); e == nil {
 		t.Fatal("admitted while death could not persist")
+	}
+	// Already issued CDN URLs do not need a metadata session or database write.
+	// Check both the failed account and an unrelated healthy account.
+	p.accounts[0].disabled = true
+	for _, id := range []string{"instagram:a", "instagram:b"} {
+		called := false
+		e = p.WithMedia(ctx, id, func(core.OpenAppMedia) error { called = true; return nil })
+		if e != nil || !called {
+			t.Fatalf("pending death blocked signed CDN batch for %s: %v", id, e)
+		}
 	}
 	// Restore using the qualified table prefix, then flush and verify.
 	prefix := store.accounts[:strings.LastIndex(store.accounts, ".")+1]

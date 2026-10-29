@@ -90,6 +90,11 @@ func (s *loginSession) post(ctx context.Context, origin, path string, form url.V
 		return loginResponse{}, loginFailure("upstream_network_error")
 	}
 	defer res.Body.Close()
+	// Throttling must stop the import batch even if the body is a challenge,
+	// malformed, or cut off before it can be parsed.
+	if res.StatusCode == http.StatusTooManyRequests {
+		return loginResponse{}, loginFailure("upstream_rate_limited")
+	}
 	raw, e := io.ReadAll(io.LimitReader(res.Body, metadataLimit+1))
 	if e != nil || len(raw) > metadataLimit {
 		return loginResponse{}, loginFailure("invalid_login_response")

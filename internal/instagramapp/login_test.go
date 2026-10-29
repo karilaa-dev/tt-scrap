@@ -220,19 +220,33 @@ func testEncryptedLogin(t *testing.T, method string) {
 	}
 }
 func TestLoginStopsAtRateLimitAndChallenge(t *testing.T) {
-	for _, status := range []int{429, 403, 400} {
-		t.Run(fmt.Sprint(status), func(t *testing.T) {
+	for _, test := range []struct {
+		name, body, code string
+		status           int
+		truncated        bool
+	}{
+		{"rate_limited_challenge", `{"status":"fail","challenge_required":true}`, "upstream_rate_limited", 429, false},
+		{"rate_limited_nested_error", `{"payload":"invalid JSON"}`, "upstream_rate_limited", 429, false},
+		{"rate_limited_truncated", "", "upstream_rate_limited", 429, true},
+		{"forbidden_challenge", `{"challenge_required":true}`, "challenge_required", 403, false},
+		{"bad_request_challenge", `{"challenge_required":true}`, "challenge_required", 400, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			calls := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls++
-				w.WriteHeader(status)
-				fmt.Fprint(w, `{"status":"fail","challenge_required":true}`)
+				if test.truncated {
+					w.Header().Set("Content-Length", "1024")
+				}
+				w.WriteHeader(test.status)
+				fmt.Fprint(w, test.body)
 			}))
 			defer server.Close()
 			_, e := login(context.Background(), server.Client(), server.URL, Credentials{Username: "alice", Password: "password"})
 			if e == nil || calls != 1 {
 				t.Fatal("login retried rejected bootstrap")
 			}
+			assertCode(t, e, test.code)
 		})
 	}
 }
