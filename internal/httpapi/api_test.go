@@ -205,6 +205,38 @@ func TestReadinessAndSanitizedFailure(t *testing.T) {
 	}
 }
 
+type readinessInstagram struct {
+	fakeInstagram
+	ready bool
+}
+
+func (f *readinessInstagram) Ready() bool { return f.ready }
+
+func TestInstagramReadinessUsesSelectedBackend(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, rapidAPIKey string
+		service                   core.InstagramService
+		want                      int
+	}{
+		{"app sessions need no RapidAPI", "app", "", &readinessInstagram{ready: true}, 200},
+		{"unusable app sessions", "app", "configured", &readinessInstagram{}, 503},
+		{"legacy configured", "legacy", "configured", &fakeInstagram{}, 200},
+		{"legacy missing key", "legacy", "", &fakeInstagram{}, 503},
+		{"missing service", "app", "configured", nil, 503},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dependencies, _, _, _ := fixture(t)
+			dependencies.Config.InstagramMethod = tc.method
+			dependencies.Config.RapidAPIKey = tc.rapidAPIKey
+			dependencies.Instagram = tc.service
+			response := request(NewHandler(dependencies), "GET", "/health/ready", "", false)
+			if response.Code != tc.want {
+				t.Fatalf("readiness: got %d %s, want %d", response.Code, response.Body.String(), tc.want)
+			}
+		})
+	}
+}
+
 func TestAssetHTTPStreamsExactBytesAndCleansTemporaryFile(t *testing.T) {
 	dependencies, _, downloader, assets := fixture(t)
 	downloader.data = bytes.Repeat([]byte("abcd"), 512*1024+77)
@@ -274,8 +306,13 @@ func TestAPIServesOpenAPIWithIdentityPreparation(t *testing.T) {
 	if err = json.Unmarshal(data, &schema); err != nil {
 		t.Fatal(err)
 	}
-	if len(schema.Paths) != 10 {
-		t.Fatalf("want 10 paths, got %d", len(schema.Paths))
+	if len(schema.Paths) != 13 {
+		t.Fatalf("want 13 paths, got %d", len(schema.Paths))
+	}
+	for _, path := range []string{instagramImportPath, instagramAccountsPath, instagramDeviceProfilesPath} {
+		if schema.Paths[path] == nil {
+			t.Fatalf("account route missing from schema: %s", path)
+		}
 	}
 }
 

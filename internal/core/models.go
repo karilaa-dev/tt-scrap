@@ -60,21 +60,37 @@ type TikTokMusic struct {
 	ExpiresAt       string           `json:"expires_at"`
 }
 type InstagramMedia struct {
-	Position  int              `json:"position"`
-	MediaType string           `json:"media_type"`
-	Quality   *string          `json:"quality"`
-	Asset     AssetDescriptor  `json:"asset"`
-	Thumbnail *AssetDescriptor `json:"thumbnail"`
+	Position        int              `json:"position"`
+	MediaType       string           `json:"media_type"`
+	Quality         *string          `json:"quality"`
+	Width           *int             `json:"width"`
+	Height          *int             `json:"height"`
+	DurationSeconds *int             `json:"duration_seconds"`
+	Asset           AssetDescriptor  `json:"asset"`
+	Thumbnail       *AssetDescriptor `json:"thumbnail"`
 }
 type InstagramExtraction struct {
-	ExtractionID    string           `json:"extraction_id"`
-	Platform        string           `json:"platform"`
-	SourceID        string           `json:"source_id"`
-	SourceURL       string           `json:"source_url"`
-	CreatorUsername *string          `json:"creator_username"`
-	ContentType     string           `json:"content_type"`
-	Media           []InstagramMedia `json:"media"`
-	ExpiresAt       string           `json:"expires_at"`
+	ExtractionID               string           `json:"extraction_id"`
+	Platform                   string           `json:"platform"`
+	Method                     string           `json:"method"`
+	SourceID                   string           `json:"source_id"`
+	SourceURL                  string           `json:"source_url"`
+	ResolvedURL                string           `json:"resolved_url"`
+	CreatorUsername            *string          `json:"creator_username"`
+	ContentType                string           `json:"content_type"`
+	Cover                      *AssetDescriptor `json:"cover"`
+	Width                      *int             `json:"width"`
+	Height                     *int             `json:"height"`
+	DurationSeconds            *int             `json:"duration_seconds"`
+	Likes                      *int64           `json:"likes"`
+	Views                      *int64           `json:"views"`
+	Comments                   *int64           `json:"comments"`
+	Music                      *MusicMetadata   `json:"music"`
+	Caption                    *string          `json:"caption"`
+	CreatedAt                  *string          `json:"created_at"`
+	ThirdPartyDownloadEligible *bool            `json:"third_party_download_eligible"`
+	Media                      []InstagramMedia `json:"media"`
+	ExpiresAt                  string           `json:"expires_at"`
 }
 type AssetContext struct {
 	Platform        string
@@ -148,6 +164,12 @@ type AppBackend interface {
 	Detail(context.Context, string) (AppDetail, error)
 	Feed(context.Context) (map[string]any, error)
 	OpenMedia(context.Context, string, string, http.Header) (*http.Response, error)
+	WithMedia(context.Context, string, func(OpenAppMedia) error) error
+}
+
+// InstagramBackend uses a stable account route for metadata and subsequent media.
+type InstagramBackend interface {
+	Detail(context.Context, string) (AppDetail, error)
 	WithMedia(context.Context, string, func(OpenAppMedia) error) error
 }
 type OpenAppMedia func(context.Context, string, http.Header) (*http.Response, error)

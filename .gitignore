@@ -27,3 +27,8 @@ coverage.out
 .DS_Store
 .idea/
 .vscode/
+
+# Instagram Android sessions and account routing manifests
+/.state/
+/instagram-accounts.json
+/instagram-accounts/

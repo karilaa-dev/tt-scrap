@@ -30,6 +30,11 @@ type Config struct {
 	VideoInfoMaxRetries, ResolveRetries, DownloadRetries                              int
 	RetryDelay                                                                        time.Duration
 	RapidAPIKey, RapidAPIHost, RapidAPIBaseURL                                        string
+	InstagramMethod, InstagramAccountsFile, InstagramAccountsDir                      string
+	InstagramLegacyFallback                                                           bool
+	InstagramActiveAccounts                                                           int
+	InstagramAccountConcurrency, InstagramAccountDownloadConcurrency                  int
+	InstagramAppTimeout                                                               time.Duration
 	InstagramConcurrency, InstagramMaxAttempts                                        int
 	InstagramTimeout, InstagramRetryDelay                                             time.Duration
 	TelegramBotToken, TelegramAPIBaseURL                                              string
@@ -50,8 +55,9 @@ func DefaultConfig() Config {
 		MaxVideoDuration: 0, MediaMemoryFileBytes: 250 << 20, MediaMemoryBudgetBytes: 1 << 30, DownloadParts: 4,
 		UpstreamTimeout: 180 * time.Second, ResolveTimeout: 12 * time.Second, DownloadTimeout: 60 * time.Second,
 		VideoInfoMaxRetries: 3, ResolveRetries: 3, DownloadRetries: 3, RetryDelay: time.Second,
-		RapidAPIHost:         "instagram-downloader-download-instagram-stories-videos4.p.rapidapi.com",
-		RapidAPIBaseURL:      "https://instagram-downloader-download-instagram-stories-videos4.p.rapidapi.com",
+		RapidAPIHost:    "instagram-downloader-download-instagram-stories-videos4.p.rapidapi.com",
+		RapidAPIBaseURL: "https://instagram-downloader-download-instagram-stories-videos4.p.rapidapi.com",
+		InstagramMethod: "app", InstagramActiveAccounts: 10, InstagramAccountConcurrency: 1, InstagramAccountDownloadConcurrency: 1, InstagramAppTimeout: 15 * time.Second,
 		InstagramConcurrency: 4, InstagramMaxAttempts: 3, InstagramTimeout: 3 * time.Second, InstagramRetryDelay: 100 * time.Millisecond,
 		TelegramAPIBaseURL: "https://api.telegram.org", TelegramPipelineConcurrency: 32, TelegramUploadConcurrency: 32,
 		TelegramPreparationConcurrency: 32,
@@ -115,7 +121,7 @@ func ParseConfig(env map[string]string) (Config, error) {
 			}
 		}
 	}
-	for key, dst := range map[string]*string{"TT_SCRAP_API_KEY": &c.APIKey, "HOST": &c.Host, "DB_URL": &c.DBURL, "DB_SCHEMA": &c.DBSchema, "PROXY_FILE": &c.ProxyFile, "TIKTOK_SESSION_ID": &c.TikTokSessionID, "TEMP_DIR": &c.TempDir, "RAPIDAPI_KEY": &c.RapidAPIKey, "RAPIDAPI_HOST": &c.RapidAPIHost, "RAPIDAPI_BASE_URL": &c.RapidAPIBaseURL, "TELEGRAM_BOT_TOKEN": &c.TelegramBotToken, "TELEGRAM_API_BASE_URL": &c.TelegramAPIBaseURL, "LOG_LEVEL": &c.LogLevel} {
+	for key, dst := range map[string]*string{"TT_SCRAP_API_KEY": &c.APIKey, "HOST": &c.Host, "DB_URL": &c.DBURL, "DB_SCHEMA": &c.DBSchema, "PROXY_FILE": &c.ProxyFile, "TIKTOK_SESSION_ID": &c.TikTokSessionID, "TEMP_DIR": &c.TempDir, "RAPIDAPI_KEY": &c.RapidAPIKey, "RAPIDAPI_HOST": &c.RapidAPIHost, "RAPIDAPI_BASE_URL": &c.RapidAPIBaseURL, "TELEGRAM_BOT_TOKEN": &c.TelegramBotToken, "TELEGRAM_API_BASE_URL": &c.TelegramAPIBaseURL, "LOG_LEVEL": &c.LogLevel, "INSTAGRAM_METHOD": &c.InstagramMethod, "INSTAGRAM_ACCOUNTS_FILE": &c.InstagramAccountsFile, "INSTAGRAM_ACCOUNTS_DIR": &c.InstagramAccountsDir} {
 		stringValue(key, dst)
 	}
 	number("PORT", &c.Port, 1, 65535)
@@ -129,6 +135,9 @@ func ParseConfig(env map[string]string) (Config, error) {
 	number("URL_RESOLVE_MAX_RETRIES", &c.ResolveRetries, 1, 10)
 	number("DOWNLOAD_MAX_RETRIES", &c.DownloadRetries, 1, 10)
 	number("DOWNLOAD_PARALLEL_PARTS", &c.DownloadParts, 1, 16)
+	number("INSTAGRAM_ACTIVE_ACCOUNTS", &c.InstagramActiveAccounts, 1, 10000)
+	number("INSTAGRAM_ACCOUNT_CONCURRENCY", &c.InstagramAccountConcurrency, 1, 64)
+	number("INSTAGRAM_ACCOUNT_DOWNLOAD_CONCURRENCY", &c.InstagramAccountDownloadConcurrency, 1, 64)
 	number("INSTAGRAM_CONCURRENCY", &c.InstagramConcurrency, 1, 64)
 	number("INSTAGRAM_MAX_ATTEMPTS", &c.InstagramMaxAttempts, 1, 10)
 	number("TELEGRAM_PIPELINE_CONCURRENCY", &c.TelegramPipelineConcurrency, 1, 1024)
@@ -145,6 +154,7 @@ func ParseConfig(env map[string]string) (Config, error) {
 	duration("URL_RESOLVE_TIMEOUT_SECONDS", &c.ResolveTimeout, .001, 120)
 	duration("UPSTREAM_DOWNLOAD_TIMEOUT_SECONDS", &c.DownloadTimeout, .001, 600)
 	duration("DOWNLOAD_RETRY_BASE_DELAY", &c.RetryDelay, 0, 30)
+	duration("INSTAGRAM_APP_TIMEOUT_SECONDS", &c.InstagramAppTimeout, .001, 600)
 	duration("INSTAGRAM_REQUEST_TIMEOUT_SECONDS", &c.InstagramTimeout, .001, 60)
 	duration("INSTAGRAM_RETRY_DELAY_SECONDS", &c.InstagramRetryDelay, 0, 30)
 	duration("TELEGRAM_UPLOAD_TIMEOUT_SECONDS", &c.TelegramTimeout, .001, 3600)
@@ -164,10 +174,15 @@ func ParseConfig(env map[string]string) (Config, error) {
 	if c.ImageMemoryBytes == 0 {
 		c.ImageMemoryBytes = DefaultConfig().ImageMemoryBytes
 	}
+	boolean("INSTAGRAM_LEGACY_FALLBACK", &c.InstagramLegacyFallback)
 	boolean("PROXY_INCLUDE_HOST", &c.ProxyIncludeHost)
 	boolean("PROXY_DATA_ONLY", &c.ProxyDataOnly)
 	if invalid != "" {
 		return c, ConfigError(invalid)
+	}
+	c.InstagramMethod = strings.ToLower(strings.TrimSpace(c.InstagramMethod))
+	if c.InstagramMethod != "app" && c.InstagramMethod != "legacy" {
+		return c, ConfigError("INSTAGRAM_METHOD")
 	}
 	if len(c.APIKey) < 16 {
 		return c, ConfigError("TT_SCRAP_API_KEY")

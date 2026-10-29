@@ -18,6 +18,7 @@ import (
 	"github.com/karilaa-dev/tt-scrap/internal/core"
 	"github.com/karilaa-dev/tt-scrap/internal/httpapi"
 	"github.com/karilaa-dev/tt-scrap/internal/identity"
+	"github.com/karilaa-dev/tt-scrap/internal/instagramapp"
 	"github.com/karilaa-dev/tt-scrap/internal/platform"
 )
 
@@ -100,6 +101,24 @@ func run() error {
 		return err
 	}
 	defer pool.Close()
+	instagramStore, err := instagramapp.OpenStore(lifetime, config)
+	if err != nil {
+		return err
+	}
+	defer instagramStore.Close()
+	instagramPool, err := instagramapp.Open(instagramapp.Options{
+		Store: instagramStore, ActiveAccounts: config.InstagramActiveAccounts,
+		AccountsFile: config.InstagramAccountsFile, AccountsDir: config.InstagramAccountsDir,
+		PerAccountDownloadConcurrency: config.InstagramAccountDownloadConcurrency,
+		PerAccountConcurrency:         config.InstagramAccountConcurrency, MaxQueuedRequests: config.MaxQueuedRequests,
+		Timeout: config.InstagramAppTimeout, MaxAttempts: config.InstagramMaxAttempts,
+		RetryDelay: config.InstagramRetryDelay, HTTPMaxConnections: config.HTTPMaxConnections,
+	})
+	if err != nil {
+		return err
+	}
+	defer instagramPool.Close()
+	logger.Info("Instagram accounts loaded", "accounts", instagramPool.Count(), "active_limit", config.InstagramActiveAccounts)
 	logger.Info("preparing identities before API startup", "status", pool.PreparationStatus())
 	if err = pool.Prepare(shutdownSignal); err != nil {
 		if shutdownSignal.Err() != nil {
@@ -113,11 +132,17 @@ func run() error {
 	assets := core.NewAssets(config.CacheTTL, config.CacheMaxEntries)
 	tiktok := platform.NewTikTok(config, assets, pool, proxies)
 	defer tiktok.Close()
-	instagram := platform.NewInstagram(config, assets)
+	var instagramBackend core.InstagramBackend
+	if instagramPool != nil {
+		instagramBackend = instagramPool
+	}
+	instagram := platform.NewInstagram(config, assets, instagramBackend)
 	defer instagram.Close()
-	downloader := platform.NewDownloader(config, pool)
+	instagram.Attempts = instagramStore
+	instagramAccounts := instagramapp.NewAccountManager(instagramPool, instagramStore, proxies)
+	downloader := platform.NewDownloader(config, pool, instagramBackend)
 	defer downloader.Close()
-	handler := httpapi.NewHandler(httpapi.Dependencies{Config: config, Assets: assets, TikTok: tiktok, Instagram: instagram, Downloader: downloader, Identities: pool, IsReady: pool.Ready, OpenAPI: ttscrap.OpenAPI, OnRequest: func(event httpapi.RequestEvent) {
+	handler := httpapi.NewHandler(httpapi.Dependencies{Config: config, Assets: assets, TikTok: tiktok, Instagram: instagram, Downloader: downloader, Identities: pool, InstagramAccounts: instagramAccounts, IsReady: pool.Ready, OpenAPI: ttscrap.OpenAPI, OnRequest: func(event httpapi.RequestEvent) {
 		logRequest(logger, event)
 	}})
 	server := &http.Server{Addr: net.JoinHostPort(config.Host, strconv.Itoa(config.Port)), Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 32 * 1024, BaseContext: func(net.Listener) context.Context { return lifetime }}

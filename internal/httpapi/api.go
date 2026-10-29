@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/karilaa-dev/tt-scrap/internal/core"
+	"github.com/karilaa-dev/tt-scrap/internal/instagramapp"
 	"github.com/karilaa-dev/tt-scrap/internal/media"
 )
 
@@ -30,17 +31,22 @@ type RequestEvent struct {
 	WireStatus int
 	Delivery   *DeliveryEvent
 }
+type InstagramAccounts interface {
+	Import(context.Context, []instagramapp.Credentials) ([]instagramapp.ImportResult, error)
+	Status() []instagramapp.AccountStatus
+}
 type Dependencies struct {
-	Config     core.Config
-	Assets     core.AssetReader
-	TikTok     core.TikTokService
-	Instagram  core.InstagramService
-	Downloader core.Downloader
-	IsReady    func() bool
-	OpenAPI    []byte
-	HTTPClient core.HTTPDoer
-	OnRequest  func(RequestEvent)
-	Identities core.IdentityPreparer
+	InstagramAccounts InstagramAccounts
+	Config            core.Config
+	Assets            core.AssetReader
+	TikTok            core.TikTokService
+	Instagram         core.InstagramService
+	Downloader        core.Downloader
+	IsReady           func() bool
+	OpenAPI           []byte
+	HTTPClient        core.HTTPDoer
+	OnRequest         func(RequestEvent)
+	Identities        core.IdentityPreparer
 }
 type handler struct {
 	dependencies Dependencies
@@ -187,7 +193,11 @@ const preparationPath = "/v1/tiktok/identities/preparations"
 
 var attachmentFilename = strings.NewReplacer("\r", "_", "\n", "_", "\"", "_", "\\", "_")
 
-var routes = map[string]string{"/health/live": "GET", "/health/ready": "GET", "/v1/tiktok/resolutions": "POST", "/v1/tiktok/extractions": "POST", "/v1/tiktok/music": "POST", "/v1/tiktok/telegram-deliveries": "POST", "/v1/instagram/extractions": "POST", "/v1/instagram/telegram-deliveries": "POST", preparationPath: "GET, POST"}
+const instagramImportPath = "/v1/instagram/accounts/imports"
+const instagramAccountsPath = "/v1/instagram/accounts"
+const instagramDeviceProfilesPath = "/v1/instagram/device-profiles"
+
+var routes = map[string]string{instagramDeviceProfilesPath: "GET", instagramImportPath: "POST", instagramAccountsPath: "GET", "/health/live": "GET", "/health/ready": "GET", "/v1/tiktok/resolutions": "POST", "/v1/tiktok/extractions": "POST", "/v1/tiktok/music": "POST", "/v1/tiktok/telegram-deliveries": "POST", "/v1/instagram/extractions": "POST", "/v1/instagram/telegram-deliveries": "POST", preparationPath: "GET, POST"}
 
 func assetToken(path string) (string, bool) {
 	token, ok := strings.CutPrefix(path, "/v1/assets/")
@@ -239,8 +249,14 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) (response, error
 		return jsonResponse(200, fields{"status": "ok"})
 	}
 	if path == "/health/ready" {
-		if d.Config.RapidAPIKey == "" {
-			return response{}, core.NewError("service_not_configured", "RAPIDAPI_KEY is not configured", 503)
+		instagramReady := d.Instagram != nil
+		if service, ok := d.Instagram.(interface{ Ready() bool }); ok {
+			instagramReady = service.Ready()
+		} else if d.Config.InstagramMethod == "legacy" {
+			instagramReady = instagramReady && d.Config.RapidAPIKey != ""
+		}
+		if !instagramReady {
+			return response{}, core.NewError("service_not_configured", "Instagram backend is not ready", 503)
 		}
 		if d.IsReady != nil && !d.IsReady() {
 			return response{}, core.NewError("service_not_configured", "TikTok identities are not ready", 503)
@@ -249,7 +265,7 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) (response, error
 	}
 	var body fields
 	var err error
-	if r.Method == "POST" && (path != preparationPath || r.ContentLength != 0) {
+	if path != instagramImportPath && r.Method == "POST" && (path != preparationPath || r.ContentLength != 0) {
 		body, err = readBody(w, r, path == preparationPath)
 		if err != nil {
 			return response{}, err
@@ -276,6 +292,26 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) (response, error
 		return response{status: 200, body: asset.Data.Reader(r.Context(), 0, asset.Size), cleanup: asset.Cleanup, headers: http.Header{"Content-Type": []string{asset.ContentType}, "Content-Length": []string{strconv.FormatInt(asset.Size, 10)}, "Content-Disposition": []string{`attachment; filename="` + filename + `"`}, "Etag": []string{`"` + asset.SHA256 + `"`}, "X-Content-Sha256": []string{asset.SHA256}, "Cache-Control": []string{"private, no-store"}}}, nil
 	}
 	switch path {
+	case instagramDeviceProfilesPath:
+		return jsonResponse(200, fields{"profiles": instagramapp.DeviceProfiles()})
+	case instagramAccountsPath:
+		if d.InstagramAccounts == nil {
+			return response{}, core.NewError("service_not_configured", "Instagram account management unavailable", 503)
+		}
+		return jsonResponse(200, fields{"accounts": d.InstagramAccounts.Status(), "active_limit": d.Config.InstagramActiveAccounts})
+	case instagramImportPath:
+		if d.InstagramAccounts == nil {
+			return response{}, core.NewError("service_not_configured", "Instagram account management unavailable", 503)
+		}
+		accounts, err := readInstagramImport(w, r)
+		if err != nil {
+			return response{}, err
+		}
+		result, err := d.InstagramAccounts.Import(r.Context(), accounts)
+		if err != nil {
+			return response{}, err
+		}
+		return jsonResponse(200, fields{"results": result})
 	case preparationPath:
 		if len(body) != 0 {
 			return response{}, invalidRequest()

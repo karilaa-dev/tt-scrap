@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -14,10 +15,16 @@ import (
 
 const instagramHost = "instagram-downloader-download-instagram-stories-videos4.p.rapidapi.com"
 
-var instagramPath = regexp.MustCompile(`(?i)^/(?:p|reels?|tv|stories)/[\w-]+`)
+var instagramPath = regexp.MustCompile(`(?i)^/(?:(?:p|reels?|tv)/[A-Za-z0-9_-]+|stories/[A-Za-z0-9_.-]+(?:/[0-9]+)?)/?$`)
+
+type InstagramAttemptRecorder interface {
+	Attempt(context.Context, string, bool, func() (core.InstagramExtraction, error)) (core.InstagramExtraction, error)
+}
 
 type Instagram struct {
+	Attempts    InstagramAttemptRecorder
 	cfg         core.Config
+	app         core.InstagramBackend
 	assets      *core.Assets
 	client      *http.Client
 	posts       *memo[core.InstagramExtraction]
@@ -25,13 +32,17 @@ type Instagram struct {
 	gate        *core.Limiter
 }
 
-func NewInstagram(cfg core.Config, assets *core.Assets) *Instagram {
+func NewInstagram(cfg core.Config, assets *core.Assets, backend ...core.InstagramBackend) *Instagram {
+	var app core.InstagramBackend
+	if len(backend) > 0 {
+		app = backend[0]
+	}
 	limit := min(cfg.InstagramConcurrency, cfg.ExtractionConcurrency)
 	if limit < 1 {
 		limit = 4
 	}
 	cacheCapacity := core.CacheBudget(cfg.CacheMaxEntries).Responses
-	return &Instagram{cfg: cfg, assets: assets, client: &http.Client{Transport: newTransport(cfg.HTTPMaxConnections), Timeout: cfg.InstagramTimeout}, posts: newMemo[core.InstagramExtraction](cfg.CacheTTL, cacheCapacity, cfg.CacheMaxEntries), extractions: newMemo[core.InstagramExtraction](cfg.CacheTTL, cacheCapacity, cfg.CacheMaxEntries), gate: core.NewLimiter(limit, cfg.MaxQueuedRequests)}
+	return &Instagram{cfg: cfg, assets: assets, app: app, client: &http.Client{Transport: newTransport(cfg.HTTPMaxConnections), Timeout: cfg.InstagramTimeout}, posts: newMemo[core.InstagramExtraction](cfg.CacheTTL, cacheCapacity, cfg.CacheMaxEntries), extractions: newMemo[core.InstagramExtraction](cfg.CacheTTL, cacheCapacity, cfg.CacheMaxEntries), gate: core.NewLimiter(limit, cfg.MaxQueuedRequests)}
 }
 func (i *Instagram) Close() { i.client.CloseIdleConnections() }
 func normalizeInstagram(raw string) (string, string, error) {
@@ -58,54 +69,109 @@ func (i *Instagram) ExtractURL(ctx context.Context, raw string, refresh bool) (c
 	if e != nil {
 		return core.InstagramExtraction{}, e
 	}
-	response, e := i.posts.do(ctx, normalized, refresh, func() (core.InstagramExtraction, error) {
-		data, e := i.fetch(ctx, normalized)
-		if e != nil {
-			return core.InstagramExtraction{}, e
-		}
-		extraction := core.NewID()
-		expires := time.Now().UTC().Add(i.cfg.CacheTTL)
-		response := core.InstagramExtraction{Platform: "instagram", ExtractionID: extraction, SourceID: id, SourceURL: raw, ExpiresAt: expires.Format(time.RFC3339Nano), Media: []core.InstagramMedia{}}
-		response.CreatorUsername = instagramCreator(data)
-		var usable []object
-		for _, v := range arr(data["media"]) {
-			media := obj(v)
-			if str(media["url"]) != "" {
-				usable = append(usable, media)
+	// Canonical post routes are aliases for one shortcode. Sharing both the
+	// cache and in-flight work avoids repeating authenticated requests when bots
+	// receive different URL forms for the same post. Legacy stories stay URL-keyed.
+	key := normalized
+	if i.cfg.InstagramMethod != "legacy" && !strings.Contains(strings.ToLower(normalized), "/stories/") {
+		key = "post:" + id
+	}
+	response, e := i.posts.do(ctx, key, refresh, func() (core.InstagramExtraction, error) {
+		var result core.InstagramExtraction
+		var err error
+		if i.cfg.InstagramMethod == "legacy" {
+			result, err = i.attempt(ctx, normalized, id, raw, true)
+		} else {
+			result, err = i.attempt(ctx, normalized, id, raw, false)
+			var failure *core.Error
+			policyFailure := errors.As(err, &failure) && (failure.Code == "content_too_long" || failure.Code == "instagram_database_unavailable")
+			if err != nil && i.cfg.InstagramLegacyFallback && ctx.Err() == nil && !policyFailure && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				result, err = i.attempt(ctx, normalized, id, raw, true)
 			}
 		}
-		for p, media := range usable {
-			kind, ext, mime := "image", "jpg", ""
-			if str(media["type"]) == "video" {
-				kind, ext, mime = "video", "mp4", "video/mp4"
-			}
-			stem := id
-			if len(usable) > 1 {
-				stem = fmt.Sprintf("%s_%d", id, p+1)
-			}
-			asset := i.assets.RegisterUntil(core.AssetContext{Platform: "instagram", Kind: kind, Filename: stem + "." + ext, ContentType: mime, UpstreamURL: str(media["url"]), ExtractionID: extraction}, p, expires)
-			item := core.InstagramMedia{Position: p, MediaType: kind, Asset: asset, Quality: nonempty(str(media["quality"]))}
-			if u := str(media["thumbnail"]); u != "" {
-				d := i.assets.RegisterUntil(core.AssetContext{Platform: "instagram", Kind: "thumbnail", Filename: stem + "_thumbnail.jpg", UpstreamURL: u, ExtractionID: extraction}, p, expires)
-				item.Thumbnail = &d
-			}
-			response.Media = append(response.Media, item)
+		if err == nil {
+			i.extractions.put(result.ExtractionID, result)
 		}
-		if len(response.Media) == 0 {
-			return core.InstagramExtraction{}, core.NewError("content_deleted", "Instagram response contained no usable media", 404)
-		}
-		response.ContentType = response.Media[0].MediaType
-		if len(response.Media) > 1 {
-			response.ContentType = "carousel"
-		}
-		i.extractions.put(extraction, response)
-		return response, nil
+		return result, err
 	})
 	if e == nil {
 		response.SourceURL = raw
+		response.ResolvedURL = normalized
 	}
 	return response, e
 }
+
+func (i *Instagram) attempt(ctx context.Context, normalized, id, raw string, legacy bool) (core.InstagramExtraction, error) {
+	run := func() (core.InstagramExtraction, error) {
+		if legacy {
+			return i.extractLegacy(ctx, normalized, id, raw)
+		}
+		return i.extractApp(ctx, normalized, id, raw)
+	}
+	if i.Attempts != nil {
+		return i.Attempts.Attempt(ctx, id, legacy, run)
+	}
+	return run()
+}
+
+// Ready reports whether the selected method has an available credential source.
+func (i *Instagram) Ready() bool {
+	legacy := strings.TrimSpace(i.cfg.RapidAPIKey) != ""
+	if i.cfg.InstagramMethod == "legacy" {
+		return legacy
+	}
+	ready := i.app != nil
+	if backend, ok := i.app.(interface{ Ready() bool }); ok {
+		ready = backend.Ready()
+	} else if backend, ok := i.app.(interface{ Count() int }); ok {
+		ready = backend.Count() > 0
+	}
+	return ready || i.cfg.InstagramLegacyFallback && legacy
+}
+
+func (i *Instagram) extractLegacy(ctx context.Context, normalized, id, raw string) (core.InstagramExtraction, error) {
+	data, e := i.fetch(ctx, normalized)
+	if e != nil {
+		return core.InstagramExtraction{}, e
+	}
+	extraction := core.NewID()
+	expires := time.Now().UTC().Add(i.cfg.CacheTTL)
+	response := core.InstagramExtraction{Platform: "instagram", ExtractionID: extraction, SourceID: id, SourceURL: raw, ResolvedURL: normalized, Method: "legacy", ExpiresAt: expires.Format(time.RFC3339Nano), Media: []core.InstagramMedia{}}
+	response.CreatorUsername = instagramCreator(data)
+	var usable []object
+	for _, v := range arr(data["media"]) {
+		media := obj(v)
+		if str(media["url"]) != "" {
+			usable = append(usable, media)
+		}
+	}
+	for p, media := range usable {
+		kind, ext, mime := "image", "jpg", ""
+		if str(media["type"]) == "video" {
+			kind, ext, mime = "video", "mp4", "video/mp4"
+		}
+		stem := id
+		if len(usable) > 1 {
+			stem = fmt.Sprintf("%s_%d", id, p+1)
+		}
+		asset := i.assets.RegisterUntil(core.AssetContext{Platform: "instagram", Kind: kind, Filename: stem + "." + ext, ContentType: mime, UpstreamURL: str(media["url"]), ExtractionID: extraction}, p, expires)
+		item := core.InstagramMedia{Position: p, MediaType: kind, Asset: asset, Quality: nonempty(str(media["quality"]))}
+		if u := str(media["thumbnail"]); u != "" {
+			d := i.assets.RegisterUntil(core.AssetContext{Platform: "instagram", Kind: "thumbnail", Filename: stem + "_thumbnail.jpg", UpstreamURL: u, ExtractionID: extraction}, p, expires)
+			item.Thumbnail = &d
+		}
+		response.Media = append(response.Media, item)
+	}
+	if len(response.Media) == 0 {
+		return core.InstagramExtraction{}, core.NewError("content_deleted", "Instagram response contained no usable media", 404)
+	}
+	response.ContentType = response.Media[0].MediaType
+	if len(response.Media) > 1 {
+		response.ContentType = "carousel"
+	}
+	return response, nil
+}
+
 func (i *Instagram) GetExtraction(ctx context.Context, id string) (core.InstagramExtraction, error) {
 	if e := ctx.Err(); e != nil {
 		return core.InstagramExtraction{}, e

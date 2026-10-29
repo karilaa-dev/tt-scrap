@@ -261,6 +261,7 @@ func TestInstagramProviderCarouselAndCoalescing(t *testing.T) {
 	defer server.Close()
 	cfg := testConfig()
 	cfg.RapidAPIKey = "fixture-key"
+	cfg.InstagramMethod = "legacy"
 	cfg.RapidAPIBaseURL = server.URL
 	service := NewInstagram(cfg, core.NewAssets(time.Minute, 100))
 	defer service.Close()
@@ -475,6 +476,7 @@ func TestInstagramProviderAuthenticationFailureIsNetworkError(t *testing.T) {
 	defer server.Close()
 	cfg := testConfig()
 	cfg.RapidAPIKey = "fixture-key"
+	cfg.InstagramMethod = "legacy"
 	cfg.RapidAPIBaseURL = server.URL
 	cfg.InstagramMaxAttempts = 1
 	service := NewInstagram(cfg, core.NewAssets(time.Minute, 100))
