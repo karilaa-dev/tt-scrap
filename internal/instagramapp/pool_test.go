@@ -219,7 +219,7 @@ func TestPinnedCDNRouteAndCredentialStripping(t *testing.T) {
 	err := p.WithMedia(context.Background(), "instagram:b", func(open core.OpenAppMedia) error {
 		headers := http.Header{"Authorization": {"secret"}, "Cookie": {"secret"}, "X-IG-App-ID": {"secret"}, "Proxy-Authorization": {"secret"}, "IG-U-RUR": {"secret"}}
 		p.accounts[1].device.headers(headers)
-		headers.Del("User-Agent") // Exercise the pinned account's CDN fallback UA.
+		headers.Set("User-Agent", "Mozilla/5.0") // The downloader supplies a browser UA before calling this backend.
 		var wg sync.WaitGroup
 		for range 3 {
 			wg.Add(1)

@@ -79,10 +79,10 @@ func TestInstagramAppMetadataAndPinnedAssets(t *testing.T) {
 	if post.Likes == nil || *post.Likes != 0 || post.Views == nil || *post.Views != 12345678901 || post.Comments == nil || *post.Comments != 12 || post.ThirdPartyDownloadEligible == nil || *post.ThirdPartyDownloadEligible {
 		t.Fatalf("missing counters or eligibility: %+v", post)
 	}
-	if post.Music == nil || post.Music.Title != "Track" || post.Music.Author != "Artist" || post.Music.DurationSeconds != 180 || post.Music.Audio == nil || post.Music.Cover == nil || post.Cover == nil || post.Media[0].Thumbnail == nil {
+	if post.Music == nil || post.Music.Title != "Track" || post.Music.Author != "Artist" || post.Music.DurationSeconds != 180 || post.Music.Audio != nil || post.Music.Cover == nil || post.Cover == nil || post.Media[0].Thumbnail == nil {
 		t.Fatalf("missing music or covers: %+v", post)
 	}
-	for _, descriptor := range []core.AssetDescriptor{post.Media[0].Asset, *post.Cover, *post.Media[0].Thumbnail, *post.Music.Audio, *post.Music.Cover} {
+	for _, descriptor := range []core.AssetDescriptor{post.Media[0].Asset, *post.Cover, *post.Media[0].Thumbnail, *post.Music.Cover} {
 		asset, err := assets.GetAsset(descriptor.AssetID)
 		if err != nil || asset.IdentityID != "instagram:account-1" || asset.Platform != "instagram" || len(asset.Headers) != 0 || asset.ExtractionID != post.ExtractionID {
 			t.Fatalf("asset did not retain credential-free account route: %+v, %v", asset, err)
@@ -140,7 +140,7 @@ func TestInstagramAppPhotoAndOriginalMusic(t *testing.T) {
 	}})
 	defer service.Close()
 	post, err := service.ExtractURL(context.Background(), "https://www.instagram.com/p/DYm5N7px50o/", false)
-	if err != nil || post.ContentType != "image" || post.Likes != nil || post.Views != nil || post.Comments != nil || post.DurationSeconds != nil || post.ThirdPartyDownloadEligible != nil || post.Music == nil || post.Music.Title != "Original audio" || post.Music.Author != "artist" {
+	if err != nil || post.ContentType != "image" || post.Likes != nil || post.Views != nil || post.Comments != nil || post.DurationSeconds != nil || post.ThirdPartyDownloadEligible != nil || post.Music == nil || post.Music.Title != "Original audio" || post.Music.Author != "artist" || post.Music.Audio != nil {
 		t.Fatalf("photo nullable metadata or music was lost: %+v, %v", post, err)
 	}
 	asset, err := assets.GetAsset(post.Media[0].Asset.AssetID)

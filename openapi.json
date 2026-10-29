@@ -2526,14 +2526,8 @@
             ]
           },
           "audio": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/AssetDescriptor"
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "type": "null",
+            "description": "Instagram music downloads are not supported."
           }
         },
         "type": "object",
@@ -2543,7 +2537,7 @@
           "duration_seconds"
         ],
         "title": "InstagramMusicMetadata",
-        "description": "Music metadata supplied by Instagram. Cover and audio references are present only when the upstream response supplies those resources."
+        "description": "Music metadata supplied by Instagram, with a cover reference when available. Audio is always null; Instagram music downloads are not supported."
       },
       "InstagramAccountCredentials": {
         "type": "object",

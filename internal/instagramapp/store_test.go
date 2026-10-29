@@ -226,7 +226,7 @@ func TestAttemptRowsAndFailedDeathPersistence(t *testing.T) {
 	}
 }
 
-func TestImportStopsBatchOnRateLimitAndSkipsBrokenProxy(t *testing.T) {
+func TestImportStopsBatchOnSessionRateLimitAndSkipsBrokenProxy(t *testing.T) {
 	store, _ := testStore(t)
 	p, e := Open(Options{Store: store, ActiveAccounts: 10})
 	if e != nil {
@@ -243,13 +243,23 @@ func TestImportStopsBatchOnRateLimitAndSkipsBrokenProxy(t *testing.T) {
 		return "192.0.2.1", nil
 	}
 	logins := 0
+	verification := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/accounts/current_user/" {
+			t.Error("unexpected verification path")
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer verification.Close()
 	manager.login = func(context.Context, *http.Client, string, Credentials) (loginResult, error) {
 		logins++
-		return loginResult{}, loginFailure("upstream_rate_limited")
+		return verifyLogin(context.Background(), verification.Client(), verification.URL, "Bearer IGT:2:fixture", nil)
 	}
 	result, e := manager.Import(context.Background(), []Credentials{{Username: "a", Password: "x"}, {Username: "b", Password: "y"}})
 	if e != nil || len(result) != 2 || result[0].Status != "failed" || result[1].Status != "skipped" || logins != 1 || probes != 2 || p.Count() != 0 {
 		t.Fatal("rate-limited batch continued", e, result)
+	}
+	if result[0].ErrorCode != "upstream_rate_limited" || result[1].ErrorCode != "batch_rate_limited" {
+		t.Fatal("lost verification rate limit classification", result)
 	}
 	rows, e := store.Load(context.Background())
 	if e != nil || len(rows) != 0 {

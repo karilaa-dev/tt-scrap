@@ -339,9 +339,7 @@ func (p *Pool) WithMedia(ctx context.Context, id string, run func(core.OpenAppMe
 			req.Header = make(http.Header)
 		}
 		stripCredentials(req.Header)
-		if req.Header.Get("User-Agent") == "" {
-			req.Header.Set("User-Agent", a.device.userAgent())
-		}
+		req.Header.Set("User-Agent", a.device.userAgent())
 		response, err := a.mediaClient.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {

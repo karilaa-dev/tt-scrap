@@ -149,7 +149,7 @@ The response includes these additional fields when supplied by Instagram:
 | `width`, `height` | Selected rendition dimensions |
 | `duration_seconds` | Video duration as an integer number of seconds |
 | `likes`, `views`, `comments` | Available engagement counts |
-| `music` | Title, author, duration, and any supplied cover/audio assets |
+| `music` | Title, author, duration, and any supplied cover asset; `audio` is always `null` |
 | `caption` | Post caption |
 | `created_at` | Post creation timestamp in RFC 3339 format |
 | `third_party_download_eligible` | Instagram's reported download eligibility flag |

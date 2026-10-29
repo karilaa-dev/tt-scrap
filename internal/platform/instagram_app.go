@@ -273,19 +273,11 @@ func (i *Instagram) instagramMusic(media object, base core.AssetContext, shortco
 		result.Title = str(music["original_audio_title"])
 		result.Author = str(obj(music["ig_artist"])["username"])
 	}
-	register := func(source any, kind, suffix, mime string) *core.AssetDescriptor {
-		url := instagramMediaURL(source)
-		if url == "" {
-			return nil
-		}
+	if url := instagramMediaURL(first(music["cover_artwork_uri"], music["cover_artwork_thumbnail_uri"])); url != "" {
 		asset := base
-		asset.Kind, asset.Filename, asset.UpstreamURL, asset.ContentType = kind, shortcode+suffix, url, mime
+		asset.Kind, asset.Filename, asset.UpstreamURL = "cover", shortcode+"_music_cover.jpg", url
 		descriptor := i.assets.RegisterUntil(asset, 0, expires)
-		return &descriptor
+		result.Cover = &descriptor
 	}
-	// Instagram commonly returns an MP4 audio container. Preserve the actual
-	// resource and let the downloader validate its type; do not label it MP3.
-	result.Audio = register(music["progressive_download_url"], "audio", "_audio.m4a", "")
-	result.Cover = register(first(music["cover_artwork_uri"], music["cover_artwork_thumbnail_uri"]), "cover", "_music_cover.jpg", "")
 	return result
 }
