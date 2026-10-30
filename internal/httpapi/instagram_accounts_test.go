@@ -111,3 +111,61 @@ func TestInstagramDeviceProfilesRequireAuthentication(t *testing.T) {
 		}
 	}
 }
+
+func TestInstagramCookieImportRoutes(t *testing.T) {
+	cookies := `[{"domain":".instagram.com","path":"/","name":"sessionid","value":"123%3Afixture","secure":true},{"domain":".instagram.com","path":"/","name":"ds_user_id","value":"123","secure":true}]`
+	for _, format := range []string{"text/plain", "text/plain-bom", "application/json", "json-envelope", "json-combined", "multipart/form-data", "multipart/form-data-bom"} {
+		t.Run(format, func(t *testing.T) {
+			d, _, _, _ := fixture(t)
+			manager := &fakeInstagramAccounts{}
+			d.InstagramAccounts = manager
+			var body bytes.Buffer
+			contentType := strings.TrimSuffix(format, "-bom")
+			export := cookies
+			if strings.HasSuffix(format, "-bom") {
+				export = "\ufeff" + cookies
+			}
+			switch contentType {
+			case "json-envelope", "json-combined":
+				contentType = "application/json"
+				extra := ""
+				if format == "json-combined" {
+					extra = `,"username":"alice","password":"backup-password","totp_secret":"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"`
+				}
+				body.WriteString(`{"accounts":[{"cookies":` + cookies + extra + `}]}`)
+			case "multipart/form-data":
+				mw := multipart.NewWriter(&body)
+				f, _ := mw.CreateFormFile("file", "accounts.txt")
+				f.Write([]byte(export))
+				mw.Close()
+				contentType = mw.FormDataContentType()
+			default:
+				body.WriteString(export)
+			}
+			data := append([]byte(nil), body.Bytes()...)
+			for _, authenticated := range []bool{false, true} {
+				req := httptest.NewRequest("POST", instagramImportPath, bytes.NewReader(data))
+				req.Header.Set("Content-Type", contentType)
+				if authenticated {
+					req.Header.Set("Authorization", "Bearer "+d.Config.APIKey)
+				}
+				res := httptest.NewRecorder()
+				NewHandler(d).ServeHTTP(res, req)
+				want := 401
+				if authenticated {
+					want = 200
+				}
+				if res.Code != want || strings.Contains(res.Body.String(), "123%3Afixture") || strings.Contains(res.Body.String(), "backup-password") || strings.Contains(res.Body.String(), "GEZDGNBV") {
+					t.Fatal(res.Code)
+				}
+			}
+			wantPassword := ""
+			if format == "json-combined" {
+				wantPassword = "backup-password"
+			}
+			if manager.calls != 1 || len(manager.accounts) != 1 || len(manager.accounts[0].Cookies) == 0 || manager.accounts[0].Password != wantPassword {
+				t.Fatal("cookie upload not mapped")
+			}
+		})
+	}
+}

@@ -16,9 +16,11 @@ import (
 const metadataLimit = 16 << 20
 
 type disposition struct {
-	retry    bool
-	disable  bool
-	cooldown time.Duration
+	authorization string
+	renew         bool
+	retry         bool
+	disable       bool
+	cooldown      time.Duration
 }
 
 func (p *Pool) Detail(ctx context.Context, mediaID string) (core.AppDetail, error) {
@@ -41,8 +43,22 @@ func (p *Pool) Detail(ctx context.Context, mediaID string) (core.AppDetail, erro
 			return core.AppDetail{}, err
 		}
 		tried[a.id] = true
-		data, state, err := p.lookup(ctx, a, mediaID)
+		data, state, err := p.lookupRecovering(ctx, a, mediaID)
+		// Renewal saves to the database before publishing its session in RAM.
+		// Wait for that transition before applying a response's health state.
+		guardSession := state.disable || state.cooldown > 0
+		if guardSession {
+			select {
+			case a.refreshGate <- struct{}{}:
+			case <-ctx.Done():
+				release()
+				return core.AppDetail{}, ctx.Err()
+			}
+		}
 		p.mu.Lock()
+		if state.authorization != a.authorization {
+			state.disable, state.cooldown = false, 0
+		}
 		if state.disable {
 			a.disabled = true
 			if p.options.Store != nil {
@@ -53,6 +69,9 @@ func (p *Pool) Detail(ctx context.Context, mediaID string) (core.AppDetail, erro
 			a.cooldown = time.Now().Add(state.cooldown)
 		}
 		p.mu.Unlock()
+		if guardSession {
+			<-a.refreshGate
+		}
 		release()
 		if state.disable && p.options.Store != nil {
 			saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -67,7 +86,8 @@ func (p *Pool) Detail(ctx context.Context, mediaID string) (core.AppDetail, erro
 			}
 		}
 		if err == nil {
-			return core.AppDetail{Response: data, IdentityID: a.id, UserAgent: a.device.userAgent()}, nil
+			_, device := p.session(a)
+			return core.AppDetail{Response: data, IdentityID: a.id, UserAgent: device.userAgent()}, nil
 		}
 		last = err
 		if ctx.Err() != nil {
@@ -89,13 +109,13 @@ func (p *Pool) Detail(ctx context.Context, mediaID string) (core.AppDetail, erro
 	return core.AppDetail{}, last
 }
 
-func (p *Pool) lookup(ctx context.Context, a *account, mediaID string) (map[string]any, disposition, error) {
+func (p *Pool) lookup(ctx context.Context, a *account, mediaID, auth string, device *DeviceIdentity) (map[string]any, disposition, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.apiOrigin+"/api/v1/media/"+mediaID+"/info/", nil)
 	if err != nil {
 		return nil, disposition{}, core.Upstream("Invalid Instagram API endpoint")
 	}
-	req.Header.Set("Authorization", a.authorization)
-	a.device.headers(req.Header)
+	req.Header.Set("Authorization", auth)
+	device.headers(req.Header)
 	req.Header.Set("X-IG-App-ID", AppID)
 	// net/http negotiates and decompresses gzip when Accept-Encoding is omitted.
 	response, err := a.client.Do(req)
@@ -111,7 +131,13 @@ func (p *Pool) lookup(ctx context.Context, a *account, mediaID string) (map[stri
 		return nil, disposition{retry: true, cooldown: retryAfter(response.Header.Get("Retry-After"))}, core.NewError("upstream_rate_limited", "Instagram account is rate limited", 429)
 	}
 	if response.StatusCode == 401 || response.StatusCode == 403 {
-		return nil, disposition{retry: true, disable: true}, core.NewError("upstream_authentication_error", "Instagram session requires renewal or verification", 502)
+		var record map[string]any
+		if readErr == nil && len(body) <= metadataLimit && json.Unmarshal(body, &record) == nil {
+			if state, err := apiFailure(record); err != nil && (state.disable || state.cooldown > 0) {
+				return nil, state, err
+			}
+		}
+		return nil, disposition{retry: true, disable: true, renew: response.StatusCode == 401}, core.NewError("upstream_authentication_error", "Instagram session requires renewal or verification", 502)
 	}
 	if response.StatusCode == 404 || response.StatusCode == 410 {
 		return nil, disposition{}, core.NewError("content_deleted", "Instagram post is unavailable", 404)
@@ -168,8 +194,11 @@ func (p *Pool) lookup(ctx context.Context, a *account, mediaID string) (map[stri
 
 func apiFailure(record map[string]any) (disposition, error) {
 	text := strings.ToLower(stringField(record, "message") + " " + stringField(record, "error_type") + " " + stringField(record, "error_title"))
-	if truthy(record["challenge_required"]) || truthy(record["checkpoint_required"]) || truthy(record["challenge"]) || strings.Contains(text, "login_required") || strings.Contains(text, "challenge") || strings.Contains(text, "checkpoint") || strings.Contains(text, "session_expired") {
+	if truthy(record["challenge_required"]) || truthy(record["checkpoint_required"]) || truthy(record["challenge"]) || strings.Contains(text, "challenge") || strings.Contains(text, "checkpoint") {
 		return disposition{retry: true, disable: true}, core.NewError("upstream_authentication_error", "Instagram session requires renewal or verification", 502)
+	}
+	if strings.Contains(text, "login_required") || strings.Contains(text, "session_expired") {
+		return disposition{retry: true, disable: true, renew: true}, core.NewError("upstream_authentication_error", "Instagram session requires renewal", 502)
 	}
 	if strings.Contains(text, "rate_limit") || strings.Contains(text, "throttl") || strings.Contains(text, "please wait") || strings.Contains(text, "feedback_required") {
 		return disposition{retry: true, cooldown: time.Minute}, core.NewError("upstream_rate_limited", "Instagram account is rate limited", 429)

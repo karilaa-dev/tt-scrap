@@ -91,12 +91,19 @@ func testEncryptedLogin(t *testing.T, method string) {
 	pub, _ := x509.MarshalPKIXPublicKey(&private.PublicKey)
 	encoded := base64.StdEncoding.EncodeToString(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pub}))
 	steps := 0
+	savedDevice, e := newDeviceIdentity("galaxy-s23-android-14")
+	if e != nil {
+		t.Fatal(e)
+	}
 	var device, phone string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		steps++
 		profile, _ := findDeviceProfile("galaxy-s23-android-14")
 		if r.Header.Get("User-Agent") != profile.userAgent() {
 			t.Error("selected device profile not used")
+		}
+		if r.Header.Get("X-IG-Device-ID") != savedDevice.DeviceID {
+			t.Error("re-login changed saved device identity")
 		}
 		if steps == 1 {
 			device = r.Header.Get("X-IG-Android-ID")
@@ -207,7 +214,7 @@ func testEncryptedLogin(t *testing.T, method string) {
 		}
 	}))
 	defer server.Close()
-	result, e := login(context.Background(), server.Client(), server.URL, Credentials{Username: "alice", Password: "fixture-password", TOTPSecret: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", DeviceProfile: "galaxy-s23-android-14"})
+	result, e := login(context.Background(), server.Client(), server.URL, Credentials{Username: "alice", Password: "fixture-password", TOTPSecret: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", DeviceProfile: "galaxy-s23-android-14", device: savedDevice})
 	wantSteps := 8
 	if method == "bloks" {
 		wantSteps = 11
@@ -219,7 +226,7 @@ func testEncryptedLogin(t *testing.T, method string) {
 		t.Fatal("login identity was not retained")
 	}
 }
-func TestLoginStopsAtRateLimitAndChallenge(t *testing.T) {
+func TestLoginStopsAtUpstreamFailure(t *testing.T) {
 	for _, test := range []struct {
 		name, body, code string
 		status           int
@@ -230,6 +237,10 @@ func TestLoginStopsAtRateLimitAndChallenge(t *testing.T) {
 		{"rate_limited_truncated", "", "upstream_rate_limited", 429, true},
 		{"forbidden_challenge", `{"challenge_required":true}`, "challenge_required", 403, false},
 		{"bad_request_challenge", `{"challenge_required":true}`, "challenge_required", 400, false},
+		{"server_error", `{"status":"fail"}`, "upstream_server_error", 500, false},
+		{"service_unavailable", `{"status":"fail"}`, "upstream_server_error", 503, false},
+		{"gateway_error_html", `<html>Bad Gateway</html>`, "upstream_server_error", 502, false},
+		{"server_error_truncated", "", "upstream_server_error", 503, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			calls := 0

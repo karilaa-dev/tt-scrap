@@ -95,6 +95,11 @@ func (s *loginSession) post(ctx context.Context, origin, path string, form url.V
 	if res.StatusCode == http.StatusTooManyRequests {
 		return loginResponse{}, loginFailure("upstream_rate_limited")
 	}
+	// An upstream outage is not a rejected credential. Recovery must retain
+	// the account and cool down, including when the error body is not JSON.
+	if res.StatusCode >= 500 && res.StatusCode < 600 {
+		return loginResponse{}, loginFailure("upstream_server_error")
+	}
 	raw, e := io.ReadAll(io.LimitReader(res.Body, metadataLimit+1))
 	if e != nil || len(raw) > metadataLimit {
 		return loginResponse{}, loginFailure("invalid_login_response")
@@ -270,6 +275,14 @@ func login(ctx context.Context, client *http.Client, origin string, c Credential
 	s, e := newLoginSession(client, origin, c.DeviceProfile)
 	if e != nil {
 		return loginResult{}, e
+	}
+	if c.device != nil {
+		if e = c.device.validate(); e != nil {
+			return loginResult{}, e
+		}
+		device := *c.device
+		s.identity = &device
+		s.guid, s.phone, s.device = device.DeviceID, device.FamilyID, device.AndroidID
 	}
 	if origin == "https://i.instagram.com" {
 		base, ok := client.Transport.(*http.Transport)

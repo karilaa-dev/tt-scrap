@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
-	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -19,7 +18,7 @@ import (
 const MaxImportAccounts = 100
 
 func invalidImport() error {
-	return core.NewError("invalid_account_import", "Supply up to 100 accounts with username, password and a valid TOTP secret", 422)
+	return core.NewError("invalid_account_import", "Supply up to 100 accounts with browser cookies and/or username, password and a valid TOTP secret", 422)
 }
 func ParseCSV(reader io.Reader) ([]Credentials, error) {
 	r := csv.NewReader(reader)
@@ -50,6 +49,9 @@ func ParseCSV(reader io.Reader) ([]Credentials, error) {
 			return nil, invalidImport()
 		}
 		c := Credentials{Username: row[columns["User ID / Email Address"]], Password: row[columns["Password"]], TOTPSecret: row[columns["First Secret Question"]]}
+		if column, ok := columns["Cookies"]; ok && strings.TrimSpace(row[column]) != "" {
+			c.Cookies = json.RawMessage(row[column])
+		}
 		if column, ok := columns["Device Profile"]; ok {
 			c.DeviceProfile = row[column]
 		}
@@ -71,6 +73,16 @@ func validateCredentials(accounts []Credentials) ([]Credentials, error) {
 		a.DeviceProfile = strings.TrimSpace(a.DeviceProfile)
 		if !validDeviceSelection(a.DeviceProfile) {
 			return nil, invalidDeviceProfile()
+		}
+		if a.Cookies != nil {
+			_, id, err := cookieSession(a.Cookies, a.Password != "")
+			if err != nil || seen["cookie:"+id] {
+				return nil, invalidImport()
+			}
+			seen["cookie:"+id] = true
+			if a.Username == "" && a.Password == "" && a.TOTPSecret == "" {
+				continue
+			}
 		}
 		key := strings.ToLower(a.Username)
 		if a.Username == "" || len(a.Username) > 254 || a.Password == "" || len(a.Password) > 1024 || len(a.TOTPSecret) > 2048 || seen[key] || strings.ContainsAny(a.Username, "\r\n\x00") {
@@ -163,11 +175,13 @@ func (m *AccountManager) Import(ctx context.Context, credentials []Credentials) 
 		return nil, e
 	}
 	known := map[string]string{}
+	knownIDs := map[string]string{}
 	counts := map[string]int{}
 	for _, a := range existing {
 		if err := m.pool.addAccount(a.accountConfig, a.Dead, a.Username, a.IP); err != nil {
 			return nil, err
 		}
+		knownIDs[a.UserID] = a.ID
 		if a.Username != "" {
 			known[strings.ToLower(a.Username)] = a.ID
 		}
@@ -182,10 +196,35 @@ func (m *AccountManager) Import(ctx context.Context, credentials []Credentials) 
 			return results, ctx.Err()
 		}
 		row := ImportResult{Row: n + 1}
-		if id := known[strings.ToLower(c.Username)]; id != "" {
+		id := known[strings.ToLower(c.Username)]
+		if c.Cookies != nil {
+			_, userID, _ := cookieSession(c.Cookies, true)
+			id = knownIDs[userID]
+		}
+		if id != "" {
 			row.AccountID = id
-			row.Status = "duplicate"
-			results = append(results, row)
+			for n := range existing {
+				if existing[n].ID == id {
+					wasDead := existing[n].Dead
+					row.Status, e = m.updateExisting(ctx, &existing[n], c)
+					if e == nil && wasDead && !existing[n].Dead {
+						counts[*existing[n].ProxyURL]++
+					}
+					break
+				}
+			}
+			if e != nil {
+				if errorCode(e) == "instagram_database_unavailable" || ctx.Err() != nil {
+					return results, e
+				}
+				var stop bool
+				results, stop = appendImportFailure(results, row, len(credentials), e)
+				if stop {
+					break
+				}
+			} else {
+				results = append(results, row)
+			}
 			continue
 		}
 		// Only routes are retried here; credentials are submitted on one checked
@@ -221,26 +260,39 @@ func (m *AccountManager) Import(ctx context.Context, credentials []Credentials) 
 			continue
 		}
 		loginCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-		session, err := m.login(loginCtx, client, m.pool.apiOrigin, c)
+		session, usedCookies, err := authenticateAccount(loginCtx, client, m.pool.apiOrigin, c, m.login)
 		cancel()
 		client.CloseIdleConnections()
 		if err != nil {
-			row.Status = "failed"
-			row.ErrorCode = "login_failed"
-			var failure *core.Error
-			if errors.As(err, &failure) {
-				row.ErrorCode = failure.Code
-			}
-			results = append(results, row)
-			if row.ErrorCode == "upstream_rate_limited" {
-				for rest := n + 1; rest < len(credentials); rest++ {
-					results = append(results, ImportResult{Row: rest + 1, Status: "skipped", ErrorCode: "batch_rate_limited"})
-				}
+			var stop bool
+			results, stop = appendImportFailure(results, row, len(credentials), err)
+			if stop {
 				break
 			}
 			continue
 		}
-		account := storedAccount{accountConfig: accountConfig{ID: core.NewID(), Authorization: session.Authorization, ProxyURL: &selected, Device: session.Device}, Username: strings.ToLower(session.Username), UserID: session.UserID, IP: ip}
+		// A renamed username or email can identify an existing cookie account
+		// only after login. Add its backup instead of losing it to a DB conflict.
+		if id := knownIDs[session.UserID]; id != "" {
+			row.AccountID = id
+			for n := range existing {
+				if existing[n].ID == id {
+					row.Status, e = m.updateExisting(ctx, &existing[n], Credentials{Username: c.Username, Password: c.Password, TOTPSecret: c.TOTPSecret})
+					break
+				}
+			}
+			if e != nil {
+				return results, e
+			}
+			known[strings.ToLower(c.Username)] = id
+			results = append(results, row)
+			continue
+		}
+		var cookies json.RawMessage
+		if usedCookies {
+			cookies = c.Cookies
+		}
+		account := storedAccount{accountConfig: accountConfig{ID: core.NewID(), Login: c.backup(session.UserID), Cookies: cookies, Authorization: session.Authorization, ProxyURL: &selected, Device: session.Device}, Username: strings.ToLower(session.Username), UserID: session.UserID, IP: ip}
 		inserted, err := m.store.Insert(ctx, account)
 		if err != nil {
 			return results, err
@@ -254,10 +306,29 @@ func (m *AccountManager) Import(ctx context.Context, credentials []Credentials) 
 			row.Status = "imported"
 			row.AccountID = account.ID
 			counts[selected]++
-			known[strings.ToLower(c.Username)] = account.ID
+			if c.Username != "" {
+				known[strings.ToLower(c.Username)] = account.ID
+			}
 			known[account.Username] = account.ID
+			knownIDs[account.UserID] = account.ID
+			existing = append(existing, account)
 		}
 		results = append(results, row)
 	}
 	return results, nil
+}
+
+func appendImportFailure(results []ImportResult, row ImportResult, total int, err error) ([]ImportResult, bool) {
+	row.Status, row.ErrorCode = "failed", errorCode(err)
+	if row.ErrorCode == "" {
+		row.ErrorCode = "login_failed"
+	}
+	results = append(results, row)
+	stop := row.ErrorCode == "upstream_rate_limited"
+	if stop {
+		for rest := row.Row + 1; rest <= total; rest++ {
+			results = append(results, ImportResult{Row: rest, Status: "skipped", ErrorCode: "batch_rate_limited"})
+		}
+	}
+	return results, stop
 }
