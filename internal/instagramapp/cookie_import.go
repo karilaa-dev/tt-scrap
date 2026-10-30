@@ -1,6 +1,7 @@
 package instagramapp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -21,8 +22,8 @@ func ParseImportFile(reader io.Reader) ([]Credentials, error) {
 	if err != nil || len(raw) > credentialLimit {
 		return nil, invalidImport()
 	}
-	raw = bytes.TrimSpace(bytes.TrimPrefix(raw, []byte("\xef\xbb\xbf")))
-	if !bytes.HasPrefix(raw, []byte("[")) {
+	detected := bytes.TrimSpace(bytes.TrimPrefix(raw, []byte("\xef\xbb\xbf")))
+	if !bytes.HasPrefix(detected, []byte("[")) {
 		return ParseCSV(bytes.NewReader(raw))
 	}
 	return ParseCookieExport(bytes.NewReader(raw))
@@ -31,7 +32,11 @@ func ParseImportFile(reader io.Reader) ([]Credentials, error) {
 // ParseCookieExport also accepts a single pretty-printed array. Cookie objects
 // stay intact for storage; browser-specific metadata is not an API credential.
 func ParseCookieExport(reader io.Reader) ([]Credentials, error) {
-	decoder := json.NewDecoder(reader)
+	buffered := bufio.NewReader(reader)
+	if prefix, _ := buffered.Peek(3); bytes.Equal(prefix, []byte("\xef\xbb\xbf")) {
+		_, _ = buffered.Discard(3)
+	}
+	decoder := json.NewDecoder(buffered)
 	var accounts []Credentials
 	for {
 		var raw json.RawMessage

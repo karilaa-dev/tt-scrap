@@ -114,25 +114,29 @@ func TestInstagramDeviceProfilesRequireAuthentication(t *testing.T) {
 
 func TestInstagramCookieImportRoutes(t *testing.T) {
 	cookies := `[{"domain":".instagram.com","path":"/","name":"sessionid","value":"123%3Afixture","secure":true},{"domain":".instagram.com","path":"/","name":"ds_user_id","value":"123","secure":true}]`
-	for _, format := range []string{"text/plain", "application/json", "json-envelope", "multipart/form-data"} {
+	for _, format := range []string{"text/plain", "text/plain-bom", "application/json", "json-envelope", "multipart/form-data", "multipart/form-data-bom"} {
 		t.Run(format, func(t *testing.T) {
 			d, _, _, _ := fixture(t)
 			manager := &fakeInstagramAccounts{}
 			d.InstagramAccounts = manager
 			var body bytes.Buffer
-			contentType := format
-			switch format {
+			contentType := strings.TrimSuffix(format, "-bom")
+			export := cookies
+			if strings.HasSuffix(format, "-bom") {
+				export = "\ufeff" + cookies
+			}
+			switch contentType {
 			case "json-envelope":
 				contentType = "application/json"
 				body.WriteString(`{"accounts":[{"cookies":` + cookies + `}]}`)
 			case "multipart/form-data":
 				mw := multipart.NewWriter(&body)
 				f, _ := mw.CreateFormFile("file", "accounts.txt")
-				f.Write([]byte(cookies))
+				f.Write([]byte(export))
 				mw.Close()
 				contentType = mw.FormDataContentType()
 			default:
-				body.WriteString(cookies)
+				body.WriteString(export)
 			}
 			data := append([]byte(nil), body.Bytes()...)
 			for _, authenticated := range []bool{false, true} {

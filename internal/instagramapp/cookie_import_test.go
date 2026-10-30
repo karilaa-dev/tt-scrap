@@ -180,3 +180,13 @@ func TestExpiredStoredCookiesDoNotBlockHealthyAccounts(t *testing.T) {
 		t.Fatal("expired session blocked healthy account")
 	}
 }
+
+func TestImportFilePreservesCSVPasswordWhitespace(t *testing.T) {
+	raw := "User ID / Email Address,First Secret Question,Password\nalice,, password  "
+	for _, prefix := range []string{"", "\ufeff"} {
+		accounts, err := ParseImportFile(strings.NewReader(prefix + raw))
+		if err != nil || len(accounts) != 1 || accounts[0].Password != " password  " {
+			t.Fatal("CSV password changed before login", err)
+		}
+	}
+}
