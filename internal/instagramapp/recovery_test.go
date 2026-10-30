@@ -238,6 +238,86 @@ func TestConcurrentSessionRecoveryPersistsBeforeReuse(t *testing.T) {
 	}
 }
 
+func TestOldAuthenticationFailureDoesNotDisableRenewedSession(t *testing.T) {
+	store, _ := testStore(t)
+	device, _ := newDeviceIdentity("galaxy-s23-android-14")
+	proxy := ""
+	seed := storedAccount{accountConfig: accountConfig{ID: "a", Cookies: cookieFixture("123"), Login: combinedFixture().backup("123"), Device: device, ProxyURL: &proxy}, Username: "alice", UserID: "123"}
+	if ok, err := store.Insert(context.Background(), seed); err != nil || !ok {
+		t.Fatal(err)
+	}
+	p, err := Open(Options{Store: store, PerAccountConcurrency: 2, MaxAttempts: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	oldStarted, returnOld := make(chan struct{}), make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer IGT:2:renewed" {
+			if r.URL.Path == "/api/v1/media/111/info/" {
+				close(oldStarted)
+				select {
+				case <-returnOld:
+				case <-r.Context().Done():
+					return
+				}
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path == "/api/v1/media/333/info/" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		fmt.Fprint(w, `{"status":"ok","items":[]}`)
+	}))
+	defer server.Close()
+	p.apiOrigin = server.URL
+	var logins atomic.Int32
+	p.login = func(context.Context, *http.Client, string, Credentials) (loginResult, error) {
+		logins.Add(1)
+		return loginResult{Authorization: "Bearer IGT:2:renewed", UserID: "123", Username: "alice", Device: device}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	oldDone := make(chan error, 1)
+	go func() { _, err := p.Detail(ctx, "111"); oldDone <- err }()
+	select {
+	case <-oldStarted:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if _, err = p.Detail(ctx, "222"); err != nil {
+		t.Fatal("session recovery failed", err)
+	}
+	close(returnOld)
+	select {
+	case err = <-oldDone:
+		if errorCode(err) != "upstream_authentication_error" {
+			t.Fatal("original request failure was hidden", err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	rows, err := store.Load(ctx)
+	if err != nil || len(rows) != 1 || rows[0].Dead || rows[0].Authorization != "Bearer IGT:2:renewed" {
+		t.Fatal("old authentication failure disabled the saved replacement", err)
+	}
+	if _, err = p.Detail(ctx, "222"); err != nil || logins.Load() != 1 {
+		t.Fatal("renewed session was disabled or logged in again", err)
+	}
+	// A rejection of the current session must still disable it.
+	if _, err = p.Detail(ctx, "333"); errorCode(err) != "upstream_authentication_error" {
+		t.Fatal("current session rejection was hidden", err)
+	}
+	rows, err = store.Load(ctx)
+	if err != nil || !rows[0].Dead {
+		t.Fatal("current session rejection did not persist dead state", err)
+	}
+}
+
 func TestRecoveryFailureHandling(t *testing.T) {
 	for _, tc := range []struct {
 		name       string

@@ -16,10 +16,11 @@ import (
 const metadataLimit = 16 << 20
 
 type disposition struct {
-	renew    bool
-	retry    bool
-	disable  bool
-	cooldown time.Duration
+	authorization string
+	renew         bool
+	retry         bool
+	disable       bool
+	cooldown      time.Duration
 }
 
 func (p *Pool) Detail(ctx context.Context, mediaID string) (core.AppDetail, error) {
@@ -43,7 +44,21 @@ func (p *Pool) Detail(ctx context.Context, mediaID string) (core.AppDetail, erro
 		}
 		tried[a.id] = true
 		data, state, err := p.lookupRecovering(ctx, a, mediaID)
+		// Renewal saves to the database before publishing its session in RAM.
+		// Wait for that transition before applying a response's health state.
+		guardSession := state.disable || state.cooldown > 0
+		if guardSession {
+			select {
+			case a.refreshGate <- struct{}{}:
+			case <-ctx.Done():
+				release()
+				return core.AppDetail{}, ctx.Err()
+			}
+		}
 		p.mu.Lock()
+		if state.authorization != a.authorization {
+			state.disable, state.cooldown = false, 0
+		}
 		if state.disable {
 			a.disabled = true
 			if p.options.Store != nil {
@@ -54,6 +69,9 @@ func (p *Pool) Detail(ctx context.Context, mediaID string) (core.AppDetail, erro
 			a.cooldown = time.Now().Add(state.cooldown)
 		}
 		p.mu.Unlock()
+		if guardSession {
+			<-a.refreshGate
+		}
 		release()
 		if state.disable && p.options.Store != nil {
 			saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)

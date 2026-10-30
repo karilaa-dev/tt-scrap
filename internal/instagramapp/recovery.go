@@ -96,10 +96,12 @@ func (p *Pool) session(a *account) (string, *DeviceIdentity) {
 	return a.authorization, a.device
 }
 
-func (p *Pool) lookupRecovering(ctx context.Context, a *account, mediaID string) (map[string]any, disposition, error) {
+func (p *Pool) lookupRecovering(ctx context.Context, a *account, mediaID string) (data map[string]any, state disposition, err error) {
 	auth, device := p.session(a)
-	var data map[string]any
-	state, err := disposition{renew: true, disable: true, retry: true}, error(loginFailure("session_expired"))
+	// Tag the final outcome with the session used by that request, including
+	// the retry after renewal, so late failures cannot disable its replacement.
+	defer func() { state.authorization = auth }()
+	state, err = disposition{renew: true, disable: true, retry: true}, loginFailure("session_expired")
 	if auth != "" {
 		data, state, err = p.lookup(ctx, a, mediaID, auth, device)
 	}
