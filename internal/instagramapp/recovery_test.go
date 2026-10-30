@@ -47,11 +47,14 @@ func TestCombinedCredentialsAndCookiePriority(t *testing.T) {
 		wantError string
 	}{
 		{"valid", 200, `{"status":"ok","user":{"username":"alice","pk":123}}`, false, false, ""},
-		{"rejected", 401, `{}`, false, true, ""},
+		{"bare_unauthorized", 401, `{}`, false, false, "session_check_failed"},
+		{"bare_forbidden", 403, `{}`, false, false, "session_check_failed"},
+		{"rejected", 401, `{"message":"login_required"}`, false, true, ""},
 		{"expired_at_import", 200, `{}`, true, true, ""},
 		{"expired_message", 400, `{"status":"fail","message":"login_required"}`, false, true, ""},
 		{"throttled", 429, `{}`, false, false, "upstream_rate_limited"},
 		{"server_error", 503, `{}`, false, false, "session_check_failed"},
+		{"server_error_with_challenge_body", 503, `{"challenge_required":true}`, false, false, "session_check_failed"},
 		{"challenge", 401, `{"challenge_required":true}`, false, false, "challenge_required"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -185,6 +188,7 @@ func TestConcurrentSessionRecoveryPersistsBeforeReuse(t *testing.T) {
 				return
 			}
 			w.WriteHeader(401)
+			fmt.Fprint(w, `{"message":"login_required"}`)
 			return
 		}
 		fmt.Fprint(w, `{"status":"ok","items":[]}`)
@@ -262,13 +266,16 @@ func TestOldAuthenticationFailureDoesNotDisableRenewedSession(t *testing.T) {
 					return
 				}
 				w.WriteHeader(http.StatusForbidden)
+				fmt.Fprint(w, `{"message":"challenge_required"}`)
 				return
 			}
 			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"message":"login_required"}`)
 			return
 		}
 		if r.URL.Path == "/api/v1/media/333/info/" {
 			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"message":"challenge_required"}`)
 			return
 		}
 		fmt.Fprint(w, `{"status":"ok","items":[]}`)
@@ -328,13 +335,17 @@ func TestRecoveryFailureHandling(t *testing.T) {
 		wantLogins int
 		dead       bool
 	}{
+		{"bare_unauthorized", 401, `{}`, "", "123", 0, false},
+		{"bare_forbidden", 403, `{}`, "", "123", 0, false},
+		{"login_unknown_failure", 401, `{"message":"login_required"}`, "invalid_login_response", "", 1, false},
+		{"login_session_check_failure", 401, `{"message":"login_required"}`, "session_check_failed", "", 1, false},
 		{"rate_limit", 429, `{}`, "", "123", 0, false},
 		{"server_error", 503, `{}`, "", "123", 0, false},
 		{"challenge", 400, `{"challenge_required":true}`, "", "123", 0, true},
-		{"bad_password", 401, `{}`, "login_rejected", "", 1, true},
-		{"login_throttled", 401, `{}`, "upstream_rate_limited", "", 1, false},
-		{"login_network_failure", 401, `{}`, "upstream_network_error", "", 1, false},
-		{"wrong_account", 401, `{}`, "", "456", 1, true},
+		{"bad_password", 401, `{"message":"login_required"}`, "login_rejected", "", 1, true},
+		{"login_throttled", 401, `{"message":"login_required"}`, "upstream_rate_limited", "", 1, false},
+		{"login_network_failure", 401, `{"message":"login_required"}`, "upstream_network_error", "", 1, false},
+		{"wrong_account", 401, `{"message":"login_required"}`, "", "456", 1, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p, err := Open(Options{MaxAttempts: 1})
@@ -397,6 +408,7 @@ func TestLoginBootstrapOutageKeepsRecoveryAccountHealthy(t *testing.T) {
 				switch r.URL.Path {
 				case "/api/v1/media/123/info/":
 					w.WriteHeader(http.StatusUnauthorized)
+					fmt.Fprint(w, `{"message":"login_required"}`)
 				case "/api/v1/launcher/mobileconfig/":
 					bootstrapCalls.Add(1)
 					w.WriteHeader(status)
@@ -507,7 +519,10 @@ func TestCookieRejectionAtImportSavesVerifiedPasswordSession(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer pool.Close()
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(401) }))
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(401)
+				fmt.Fprint(w, `{"message":"login_required"}`)
+			}))
 			defer server.Close()
 			pool.apiOrigin = server.URL
 			manager := NewAccountManager(pool, store, []string{""})

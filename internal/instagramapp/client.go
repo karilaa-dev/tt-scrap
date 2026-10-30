@@ -20,6 +20,7 @@ type disposition struct {
 	renew         bool
 	retry         bool
 	disable       bool
+	deadReason    string
 	cooldown      time.Duration
 }
 
@@ -75,7 +76,7 @@ func (p *Pool) Detail(ctx context.Context, mediaID string) (core.AppDetail, erro
 		release()
 		if state.disable && p.options.Store != nil {
 			saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			persistErr := p.options.Store.MarkDead(saveCtx, strings.TrimPrefix(a.id, IdentityPrefix), "authentication_or_challenge")
+			persistErr := p.options.Store.MarkDead(saveCtx, strings.TrimPrefix(a.id, IdentityPrefix), state.deadReason)
 			cancel()
 			p.mu.Lock()
 			p.pendingDeaths--
@@ -130,21 +131,13 @@ func (p *Pool) lookup(ctx context.Context, a *account, mediaID, auth string, dev
 	if response.StatusCode == 429 {
 		return nil, disposition{retry: true, cooldown: retryAfter(response.Header.Get("Retry-After"))}, core.NewError("upstream_rate_limited", "Instagram account is rate limited", 429)
 	}
-	if response.StatusCode == 401 || response.StatusCode == 403 {
-		var record map[string]any
-		if readErr == nil && len(body) <= metadataLimit && json.Unmarshal(body, &record) == nil {
-			if state, err := apiFailure(record); err != nil && (state.disable || state.cooldown > 0) {
-				return nil, state, err
-			}
-		}
-		return nil, disposition{retry: true, disable: true, renew: response.StatusCode == 401}, core.NewError("upstream_authentication_error", "Instagram session requires renewal or verification", 502)
-	}
 	if response.StatusCode == 404 || response.StatusCode == 410 {
 		return nil, disposition{}, core.NewError("content_deleted", "Instagram post is unavailable", 404)
 	}
 	// Instagram also reports unavailable media and session challenges as HTTP
-	// 400. Classify only known fields; never include upstream text in errors.
-	if response.StatusCode == http.StatusBadRequest && readErr == nil && len(body) <= metadataLimit {
+	// 400, 401 or 403. A status alone cannot prove an account is unusable.
+	// Classify only known fields; never include upstream text in errors.
+	if (response.StatusCode == http.StatusBadRequest || response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden) && readErr == nil && len(body) <= metadataLimit {
 		var record map[string]any
 		if json.Unmarshal(body, &record) == nil {
 			if state, err := apiFailure(record); err != nil {
@@ -153,7 +146,7 @@ func (p *Pool) lookup(ctx context.Context, a *account, mediaID, auth string, dev
 		}
 	}
 	if response.StatusCode != 200 {
-		return nil, disposition{retry: response.StatusCode >= 500}, core.Upstream("Instagram metadata returned an unsuccessful response")
+		return nil, disposition{retry: true}, core.Upstream("Instagram metadata returned an unsuccessful response")
 	}
 	if readErr != nil || len(body) > metadataLimit {
 		return nil, disposition{retry: true}, core.Upstream("Instagram metadata response is incomplete or too large")
@@ -169,7 +162,7 @@ func (p *Pool) lookup(ctx context.Context, a *account, mediaID, auth string, dev
 			break
 		}
 		if err != nil || record == nil {
-			return nil, disposition{}, core.Upstream("Instagram returned malformed metadata")
+			return nil, disposition{retry: true}, core.Upstream("Instagram returned malformed metadata")
 		}
 		count++
 		if state, err := apiFailure(record); err != nil {
@@ -187,18 +180,21 @@ func (p *Pool) lookup(ctx context.Context, a *account, mediaID, auth string, dev
 		}
 	}
 	if count == 0 {
-		return nil, disposition{}, core.Upstream("Instagram returned empty metadata")
+		return nil, disposition{retry: true}, core.Upstream("Instagram returned empty metadata")
 	}
 	return merged, disposition{}, nil
 }
 
 func apiFailure(record map[string]any) (disposition, error) {
 	text := strings.ToLower(stringField(record, "message") + " " + stringField(record, "error_type") + " " + stringField(record, "error_title"))
-	if truthy(record["challenge_required"]) || truthy(record["checkpoint_required"]) || truthy(record["challenge"]) || strings.Contains(text, "challenge") || strings.Contains(text, "checkpoint") {
-		return disposition{retry: true, disable: true}, core.NewError("upstream_authentication_error", "Instagram session requires renewal or verification", 502)
+	if truthy(record["challenge_required"]) || truthy(record["checkpoint_required"]) || truthy(record["challenge"]) || failureMarker(record, "challenge_required", "checkpoint_required", "checkpoint_challenge_required", "security_requirement") {
+		return disposition{retry: true, disable: true, deadReason: "challenge_required"}, core.NewError("upstream_authentication_error", "Instagram session requires renewal or verification", 502)
 	}
-	if strings.Contains(text, "login_required") || strings.Contains(text, "session_expired") {
-		return disposition{retry: true, disable: true, renew: true}, core.NewError("upstream_authentication_error", "Instagram session requires renewal", 502)
+	if failureMarker(record, "login_required", "session_expired") {
+		return disposition{retry: true, disable: true, renew: true, deadReason: "session_expired"}, core.NewError("upstream_authentication_error", "Instagram session requires renewal", 502)
+	}
+	if failureMarker(record, "account_disabled", "account_suspended", "inactive_user") {
+		return disposition{retry: true, disable: true, deadReason: "account_restricted"}, core.NewError("upstream_authentication_error", "Instagram account is restricted", 502)
 	}
 	if strings.Contains(text, "rate_limit") || strings.Contains(text, "throttl") || strings.Contains(text, "please wait") || strings.Contains(text, "feedback_required") {
 		return disposition{retry: true, cooldown: time.Minute}, core.NewError("upstream_rate_limited", "Instagram account is rate limited", 429)
@@ -208,10 +204,25 @@ func apiFailure(record map[string]any) (disposition, error) {
 		return disposition{}, core.NewError("content_deleted", "Instagram post is unavailable", 404)
 	}
 	if record["status"] == "fail" {
-		return disposition{}, core.Upstream("Instagram returned an API failure")
+		return disposition{retry: true}, core.Upstream("Instagram returned an API failure")
 	}
 	return disposition{}, nil
 }
+
+// Permanent account decisions require explicit API markers, not incidental
+// words in an error (for example, a proxy's "challenge service unavailable").
+func failureMarker(record map[string]any, markers ...string) bool {
+	for _, field := range []string{"message", "error_type", "error_title"} {
+		value := strings.ToLower(strings.TrimSpace(stringField(record, field)))
+		for _, marker := range markers {
+			if value == marker {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func stringField(m map[string]any, key string) string { value, _ := m[key].(string); return value }
 func truthy(value any) bool {
 	switch v := value.(type) {
@@ -220,9 +231,15 @@ func truthy(value any) bool {
 	case bool:
 		return v
 	case string:
-		return v != ""
+		return strings.EqualFold(v, "true") || v == "1"
+	case map[string]any:
+		return len(v) > 0
+	case json.Number:
+		return v == "1"
+	case float64:
+		return v == 1
 	default:
-		return true
+		return false
 	}
 }
 func retryAfter(value string) time.Duration {

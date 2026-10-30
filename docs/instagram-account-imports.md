@@ -262,7 +262,7 @@ The response contains `active_limit` and an oldest-first `accounts` list. Each a
 
 - `active`: one of the oldest healthy accounts selected by `INSTAGRAM_ACTIVE_ACCOUNTS`. It may temporarily be busy or cooling down.
 - `reserve`: healthy, but newer than the selected active accounts.
-- `dead`: excluded from metadata selection after an authentication failure or challenge; a verified replacement session can reactivate it.
+- `dead`: excluded from metadata selection after an explicit account restriction/challenge or unrecoverable session/credential failure; a verified replacement session can reactivate it.
 
 For example, with a limit of 10 and 15 healthy accounts, the oldest 10 serve metadata. If one becomes dead, the next oldest reserve replaces it. Temporary cooldowns and busy accounts do not promote reserves. Requests balance across available active accounts, with separate per-account limits for metadata and CDN downloads.
 
@@ -272,9 +272,9 @@ Re-importing only login credentials for a dead account returns `duplicate` or `u
 
 ## Automatic recovery
 
-When extraction encounters an expired or rejected session, the account attempts password/TOTP recovery on its existing proxy and device, then retries metadata once. Concurrent requests share the login attempt. The verified user ID must match the saved account, so a bad backup cannot switch it to another account. A successful replacement session is committed to PostgreSQL before use, and the rejected cookies are cleared. Subsequent requests and restarts reuse the replacement; login credentials remain available for future recovery. Network errors, rate limits, and challenges do not trigger password fallback.
+When extraction encounters locally expired cookies or an explicit `login_required`/`session_expired` response, the account attempts password/TOTP recovery on its existing proxy and device, then retries metadata once. Concurrent requests share the login attempt. The verified user ID must match the saved account, so a bad backup cannot switch it to another account. A successful replacement session is committed to PostgreSQL before use, and the rejected cookies are cleared. Subsequent requests and restarts reuse the replacement; login credentials remain available for future recovery. Bare HTTP 401/403 responses and unknown metadata errors retry a different eligible account without disabling the account or triggering password fallback. Network errors, rate limits, and challenges do not trigger password fallback.
 
-Temporary login/network/database failures during recovery cool down for at least one minute before retrying. Rejected passwords, unsupported 2FA, account mismatches and challenges disable the account. An expired cookie account with a saved backup can recover after restart unless it was already marked dead; cookie-only expired accounts remain disabled. Accounts imported before password-backup support have no saved password/TOTP: [re-import login credentials](#add-or-replace-password-and-2fa) to enable recovery. Login-only updates do not reactivate dead accounts; verified replacement sessions do.
+Temporary login/network/database failures and ambiguous login/bootstrap rejections during recovery cool down for at least one minute before retrying. Rejected passwords, unsupported 2FA, account mismatches and challenges disable the account. An expired cookie account with a saved backup can recover after restart unless it was already marked dead; cookie-only expired accounts remain disabled. Accounts imported before password-backup support have no saved password/TOTP: [re-import login credentials](#add-or-replace-password-and-2fa) to enable recovery. Login-only updates do not reactivate dead accounts; verified replacement sessions do.
 
 ## Troubleshooting
 
