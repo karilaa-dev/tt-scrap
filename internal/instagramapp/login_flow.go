@@ -95,6 +95,11 @@ func (s *loginSession) post(ctx context.Context, origin, path string, form url.V
 	if res.StatusCode == http.StatusTooManyRequests {
 		return loginResponse{}, loginFailure("upstream_rate_limited")
 	}
+	// An upstream outage is not a rejected credential. Recovery must retain
+	// the account and cool down, including when the error body is not JSON.
+	if res.StatusCode >= 500 && res.StatusCode < 600 {
+		return loginResponse{}, loginFailure("upstream_server_error")
+	}
 	raw, e := io.ReadAll(io.LimitReader(res.Body, metadataLimit+1))
 	if e != nil || len(raw) > metadataLimit {
 		return loginResponse{}, loginFailure("invalid_login_response")

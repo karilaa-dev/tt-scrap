@@ -373,6 +373,61 @@ func TestRecoveryFailureHandling(t *testing.T) {
 	}
 }
 
+func TestLoginBootstrapOutageKeepsRecoveryAccountHealthy(t *testing.T) {
+	for _, status := range []int{500, 503} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			store, _ := testStore(t)
+			device, _ := newDeviceIdentity("galaxy-s23-android-14")
+			proxy := ""
+			seed := storedAccount{accountConfig: accountConfig{ID: "a", Cookies: cookieFixture("123"), Login: combinedFixture().backup("123"), Device: device, ProxyURL: &proxy}, Username: "alice", UserID: "123"}
+			if ok, err := store.Insert(context.Background(), seed); err != nil || !ok {
+				t.Fatal(err)
+			}
+			before, err := store.Load(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := Open(Options{Store: store, MaxAttempts: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer p.Close()
+			var bootstrapCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v1/media/123/info/":
+					w.WriteHeader(http.StatusUnauthorized)
+				case "/api/v1/launcher/mobileconfig/":
+					bootstrapCalls.Add(1)
+					w.WriteHeader(status)
+					fmt.Fprint(w, `{"status":"fail"}`)
+				default:
+					t.Error("login continued after bootstrap failure")
+					w.WriteHeader(http.StatusInternalServerError)
+				}
+			}))
+			defer server.Close()
+			p.apiOrigin = server.URL
+			ctx := context.Background()
+			if _, err = p.Detail(ctx, "123"); errorCode(err) != "upstream_server_error" {
+				t.Fatal("bootstrap outage classified as a credential failure", err)
+			}
+			a := p.accounts[0]
+			if a.disabled || !a.cooldown.After(time.Now()) {
+				t.Fatal("bootstrap outage disabled the account instead of cooling down")
+			}
+			rows, err := store.Load(ctx)
+			if err != nil || !reflect.DeepEqual(rows, before) {
+				t.Fatal("bootstrap outage changed saved credentials or dead state", err)
+			}
+			auth, _ := p.session(a)
+			if err = p.renew(ctx, a, auth); errorCode(err) != "upstream_server_error" || bootstrapCalls.Load() != 1 {
+				t.Fatal("bootstrap outage retried during cooldown", err)
+			}
+		})
+	}
+}
+
 func TestRecoverySaveFailureDoesNotPublishSession(t *testing.T) {
 	store, _ := testStore(t)
 	p, err := Open(Options{Store: store})

@@ -226,7 +226,7 @@ func testEncryptedLogin(t *testing.T, method string) {
 		t.Fatal("login identity was not retained")
 	}
 }
-func TestLoginStopsAtRateLimitAndChallenge(t *testing.T) {
+func TestLoginStopsAtUpstreamFailure(t *testing.T) {
 	for _, test := range []struct {
 		name, body, code string
 		status           int
@@ -237,6 +237,10 @@ func TestLoginStopsAtRateLimitAndChallenge(t *testing.T) {
 		{"rate_limited_truncated", "", "upstream_rate_limited", 429, true},
 		{"forbidden_challenge", `{"challenge_required":true}`, "challenge_required", 403, false},
 		{"bad_request_challenge", `{"challenge_required":true}`, "challenge_required", 400, false},
+		{"server_error", `{"status":"fail"}`, "upstream_server_error", 500, false},
+		{"service_unavailable", `{"status":"fail"}`, "upstream_server_error", 503, false},
+		{"gateway_error_html", `<html>Bad Gateway</html>`, "upstream_server_error", 502, false},
+		{"server_error_truncated", "", "upstream_server_error", 503, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			calls := 0

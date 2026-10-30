@@ -286,6 +286,7 @@ Temporary login/network/database failures during recovery cool down for at least
 | `import_busy` / HTTP 409 | Wait for the current import to finish. |
 | `proxy_check_failed` | Check the configured proxy pool, credentials, and access to the HTTPS IP probe. No account password is submitted on a failed probe. |
 | `upstream_rate_limited`, `batch_rate_limited` | Stop immediate retries. Check the account/route state and retry later, after throttling clears. |
+| `upstream_server_error` | Instagram's login service returned HTTP 5xx. Retry later; automatic recovery cools down and keeps the account and saved credentials. |
 | `challenge_required` | Resolve the account's challenge through Instagram; the importer cannot complete interactive challenges. |
 | `unsupported_two_factor` | Check that authenticator TOTP is available and that the supplied seed belongs to this account. Other verification methods are unsupported. |
 | `login_rejected`, `login_session_not_returned` | Check account status and exact login credentials. The server did not obtain a usable bearer session. |
