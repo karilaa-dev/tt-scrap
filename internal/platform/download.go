@@ -23,6 +23,7 @@ import (
 type Downloader struct {
 	cfg       core.Config
 	app       core.AppBackend
+	instagram core.InstagramBackend
 	client    *http.Client
 	gate      *core.Limiter
 	store     *spool.Store
@@ -35,8 +36,12 @@ type Downloader struct {
 const firstPart = 1 << 20
 const minPart = 1 << 20
 
-func NewDownloader(cfg core.Config, backend core.AppBackend) *Downloader {
-	return &Downloader{cfg: cfg, app: backend, client: &http.Client{Transport: newTransport(cfg.HTTPMaxConnections)}, gate: core.NewLimiter(cfg.DownloadConcurrency, cfg.MaxQueuedRequests), store: spool.NewStore(cfg.TempDir, cfg.MediaMemoryFileBytes, cfg.MediaMemoryBudgetBytes), buffers: sync.Pool{New: func() any { buffer := make([]byte, 128<<10); return &buffer }}, newDigest: sha256.New}
+func NewDownloader(cfg core.Config, backend core.AppBackend, instagram ...core.InstagramBackend) *Downloader {
+	d := &Downloader{cfg: cfg, app: backend, client: &http.Client{Transport: newTransport(cfg.HTTPMaxConnections)}, gate: core.NewLimiter(cfg.DownloadConcurrency, cfg.MaxQueuedRequests), store: spool.NewStore(cfg.TempDir, cfg.MediaMemoryFileBytes, cfg.MediaMemoryBudgetBytes), buffers: sync.Pool{New: func() any { buffer := make([]byte, 128<<10); return &buffer }}, newDigest: sha256.New}
+	if len(instagram) > 0 {
+		d.instagram = instagram[0]
+	}
+	return d
 }
 func (d *Downloader) Close() { d.client.CloseIdleConnections() }
 
@@ -57,10 +62,7 @@ func (d *Downloader) withIdentity(ctx context.Context, id string, run func(core.
 			return d.downloadAsset(ctx, asset, maxBytes, nil, started, checksum)
 		})
 	}
-	if d.app == nil {
-		return core.Upstream("TikTok app backend is unavailable")
-	}
-	return d.app.WithMedia(ctx, id, func(open core.OpenAppMedia) error {
+	return d.withMedia(ctx, id, func(open core.OpenAppMedia) error {
 		return run(func(ctx context.Context, asset core.AssetContext, maxBytes int64, started func(*core.Downloaded)) (*core.Downloaded, error) {
 			if asset.IdentityID != id {
 				return nil, core.Upstream("Media does not belong to the leased identity")
@@ -69,6 +71,21 @@ func (d *Downloader) withIdentity(ctx context.Context, id string, run func(core.
 		})
 	})
 }
+
+// Identity namespaces keep Instagram routes separate from TikTok's identity pool.
+func (d *Downloader) withMedia(ctx context.Context, id string, run func(core.OpenAppMedia) error) error {
+	if strings.HasPrefix(id, "instagram:") {
+		if d.instagram == nil {
+			return core.Upstream("Instagram app backend is unavailable")
+		}
+		return d.instagram.WithMedia(ctx, id, run)
+	}
+	if d.app == nil {
+		return core.Upstream("TikTok app backend is unavailable")
+	}
+	return d.app.WithMedia(ctx, id, run)
+}
+
 func (d *Downloader) Download(ctx context.Context, asset core.AssetContext, maxBytes int64) (*core.Downloaded, error) {
 	return d.downloadAsset(ctx, asset, maxBytes, nil, nil, true)
 }
@@ -102,10 +119,7 @@ func (d *Downloader) downloadAsset(ctx context.Context, asset core.AssetContext,
 	if open != nil {
 		err = transfer(open)
 	} else if asset.IdentityID != "" {
-		if d.app == nil {
-			return nil, core.Upstream("TikTok app backend is unavailable")
-		}
-		err = d.app.WithMedia(ctx, asset.IdentityID, transfer)
+		err = d.withMedia(ctx, asset.IdentityID, transfer)
 	} else {
 		err = transfer(nil)
 	}
