@@ -147,8 +147,10 @@ func TestFailureClassificationAndRetryOtherAccount(t *testing.T) {
 	}{
 		{"login", "{\"message\":\"login_required\",\"status\":\"fail\"}", 200, true},
 		{"challenge", "{\"challenge_required\":true}", 200, true},
-		{"forbidden", "", 403, true},
+		{"forbidden_challenge", `{"message":"challenge_required"}`, 403, true},
 		{"rate", "", 429, false},
+		{"rate_with_challenge_body", `{"challenge_required":true}`, 429, false},
+		{"forbidden_feedback", `{"message":"feedback_required"}`, 403, false},
 		{"feedback", "{\"message\":\"feedback_required\",\"status\":\"fail\"}", 200, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -324,7 +326,7 @@ func TestUnavailableReadinessAndCancellation(t *testing.T) {
 }
 
 func TestUnavailableMediaIsNotRetriedOrLeaked(t *testing.T) {
-	for _, status := range []int{200, 400} {
+	for _, status := range []int{200, 400, 401, 403, 404, 410} {
 		for _, body := range []string{
 			`{"status":"fail","message":"Media not found or unavailable","debug":"private-upstream-detail"}`,
 			`{"status":"fail","error_type":"media_not_found"}`,

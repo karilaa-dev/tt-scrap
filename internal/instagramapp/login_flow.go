@@ -118,7 +118,11 @@ func (s *loginSession) post(ctx context.Context, origin, path string, form url.V
 }
 func requireLoginOK(r loginResponse) error {
 	if r.status != 200 || r.value["status"] == "fail" || r.value["errors"] != nil {
-		return loginFailure("login_rejected")
+		// Bootstrap/protocol failures are not evidence of bad credentials.
+		if failureMarker(r.value, "bad_password", "invalid_user", "invalid_credentials") {
+			return loginFailure("login_rejected")
+		}
+		return loginFailure("invalid_login_response")
 	}
 	return nil
 }

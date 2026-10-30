@@ -213,8 +213,13 @@ func loginCheck(r loginResponse) error {
 	if r.status == http.StatusTooManyRequests || strings.Contains(text, "rate_limit") || strings.Contains(text, "please wait") {
 		return loginFailure("upstream_rate_limited")
 	}
-	if truthy(r.value["challenge"]) || truthy(r.value["challenge_required"]) || truthy(r.value["checkpoint_required"]) || strings.Contains(text, "challenge") || strings.Contains(text, "checkpoint") || strings.Contains(text, "security_requirement") {
-		return loginFailure("challenge_required")
+	if state, err := apiFailure(r.value); err != nil {
+		if state.cooldown > 0 {
+			return loginFailure("upstream_rate_limited")
+		}
+		if state.disable {
+			return loginFailure(state.deadReason)
+		}
 	}
 	return nil
 }
@@ -236,6 +241,10 @@ func verifyLogin(ctx context.Context, client *http.Client, origin, auth string, 
 	if e != nil || len(body) > metadataLimit {
 		return loginResult{}, loginFailure("session_check_failed")
 	}
+	// Server outages cannot establish that the saved session is invalid.
+	if res.StatusCode >= 500 {
+		return loginResult{}, loginFailure("session_check_failed")
+	}
 	var failure map[string]any
 	_ = json.Unmarshal(body, &failure)
 	state, failureErr := apiFailure(failure)
@@ -243,9 +252,9 @@ func verifyLogin(ctx context.Context, client *http.Client, origin, auth string, 
 		return loginResult{}, loginFailure("upstream_rate_limited")
 	}
 	if state.disable && !state.renew {
-		return loginResult{}, loginFailure("challenge_required")
+		return loginResult{}, loginFailure(state.deadReason)
 	}
-	if state.renew || res.StatusCode == http.StatusUnauthorized {
+	if state.renew {
 		return loginResult{}, loginFailure("session_expired")
 	}
 	if res.StatusCode != 200 || failureErr != nil {

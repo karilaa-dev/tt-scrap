@@ -276,25 +276,24 @@ func (p *Pool) acquire(ctx context.Context, pinned string, avoid map[string]bool
 			}
 			chosen := -1
 			now := time.Now()
-			for pass := 0; pass < 2 && chosen < 0; pass++ {
-				for n := 0; n < eligibleEnd; n++ {
-					index := (p.next + n) % eligibleEnd
-					a := p.accounts[index]
-					if a.disabled || a.cooldown.After(now) {
-						continue
-					}
-					available = true
-					if a.updating || pass == 0 && avoid[a.id] || a.busy >= p.options.PerAccountConcurrency {
-						continue
-					}
-					if chosen < 0 || a.busy < p.accounts[chosen].busy ||
-						a.busy == p.accounts[chosen].busy && a.mediaBusy < p.accounts[chosen].mediaBusy {
-						chosen = index
-						if a.busy == 0 && a.mediaBusy == 0 {
-							// This is the minimum possible load; scan order already
-							// breaks ties fairly, so further accounts cannot win.
-							break
-						}
+			// A request never retries an account it has already tried.
+			for n := 0; n < eligibleEnd; n++ {
+				index := (p.next + n) % eligibleEnd
+				a := p.accounts[index]
+				if a.disabled || a.cooldown.After(now) || avoid[a.id] {
+					continue
+				}
+				available = true
+				if a.updating || a.busy >= p.options.PerAccountConcurrency {
+					continue
+				}
+				if chosen < 0 || a.busy < p.accounts[chosen].busy ||
+					a.busy == p.accounts[chosen].busy && a.mediaBusy < p.accounts[chosen].mediaBusy {
+					chosen = index
+					if a.busy == 0 && a.mediaBusy == 0 {
+						// This is the minimum possible load; scan order already
+						// breaks ties fairly, so further accounts cannot win.
+						break
 					}
 				}
 			}

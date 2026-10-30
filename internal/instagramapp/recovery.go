@@ -101,7 +101,7 @@ func (p *Pool) lookupRecovering(ctx context.Context, a *account, mediaID string)
 	// Tag the final outcome with the session used by that request, including
 	// the retry after renewal, so late failures cannot disable its replacement.
 	defer func() { state.authorization = auth }()
-	state, err = disposition{renew: true, disable: true, retry: true}, loginFailure("session_expired")
+	state, err = disposition{renew: true, disable: true, retry: true, deadReason: "session_expired"}, loginFailure("session_expired")
 	if auth != "" {
 		data, state, err = p.lookup(ctx, a, mediaID, auth, device)
 	}
@@ -114,8 +114,8 @@ func (p *Pool) lookupRecovering(ctx context.Context, a *account, mediaID string)
 	if err = p.renew(ctx, a, auth); err != nil {
 		state = disposition{retry: true, cooldown: time.Minute}
 		switch errorCode(err) {
-		case "session_expired", "account_mismatch", "login_rejected", "unsupported_two_factor", "challenge_required":
-			state = disposition{retry: true, disable: true}
+		case "session_expired", "account_mismatch", "login_rejected", "unsupported_two_factor", "challenge_required", "account_restricted":
+			state = disposition{retry: true, disable: true, deadReason: errorCode(err)}
 		}
 		if ctx.Err() != nil {
 			return nil, disposition{}, ctx.Err()

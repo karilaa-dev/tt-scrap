@@ -119,6 +119,7 @@ func TestImportBalancesSharedRoutesAndSurvivesRestart(t *testing.T) {
 		}
 		if r.Header.Get("Authorization") == "Bearer IGT:2:old" {
 			w.WriteHeader(401)
+			fmt.Fprint(w, `{"message":"login_required"}`)
 		} else {
 			fmt.Fprint(w, `{"status":"ok","items":[]}`)
 		}

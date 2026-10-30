@@ -223,6 +223,7 @@ func TestCookieUpdateWaitsForOldRequestsBeforeRevivingAccount(t *testing.T) {
 			close(oldStarted)
 			<-finishOld
 			w.WriteHeader(401)
+			fmt.Fprint(w, `{"message":"login_required"}`)
 			return
 		}
 		fmt.Fprint(w, `{"status":"ok","items":[]}`)
