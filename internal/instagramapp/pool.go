@@ -31,6 +31,7 @@ type Options struct {
 }
 
 type account struct {
+	updating      bool
 	login         *passwordCredentials
 	refreshGate   chan struct{}
 	refreshAfter  time.Time
@@ -56,6 +57,7 @@ type Pool struct {
 	next          int
 	queued        int
 	pendingDeaths int
+	updating      int
 	changed       chan struct{}
 	closed        bool
 	apiOrigin     string
@@ -210,7 +212,7 @@ func (p *Pool) Close() {
 	}
 }
 func (p *Pool) notify() {
-	if p.queued == 0 {
+	if p.queued == 0 && p.updating == 0 {
 		return
 	}
 	close(p.changed)
@@ -282,7 +284,7 @@ func (p *Pool) acquire(ctx context.Context, pinned string, avoid map[string]bool
 						continue
 					}
 					available = true
-					if pass == 0 && avoid[a.id] || a.busy >= p.options.PerAccountConcurrency {
+					if a.updating || pass == 0 && avoid[a.id] || a.busy >= p.options.PerAccountConcurrency {
 						continue
 					}
 					if chosen < 0 || a.busy < p.accounts[chosen].busy ||

@@ -116,9 +116,12 @@ func loginCookies(ctx context.Context, client *http.Client, origin string, c Cre
 	if err != nil {
 		return loginResult{}, err
 	}
-	device, err := newDeviceIdentity(c.DeviceProfile)
-	if err != nil {
-		return loginResult{}, err
+	device := c.device
+	if device == nil {
+		device, err = newDeviceIdentity(c.DeviceProfile)
+		if err != nil {
+			return loginResult{}, err
+		}
 	}
 	result, err := verifyLogin(ctx, client, origin, auth, device)
 	if err != nil {

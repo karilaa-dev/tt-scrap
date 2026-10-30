@@ -103,7 +103,19 @@ Cookies are verified first. A working cookie session skips password login. Expir
 
 Successful cookie imports store the original cookie JSON and the selected device/proxy in PostgreSQL. The Android bearer is derived from `sessionid` and `ds_user_id` only in memory, including after restart; the bearer column remains NULL. Supplied username/password/TOTP credentials are also saved privately in `login_credentials`, including for password-only imports. Treat this database column and backups as sensitive credential storage, just like session tokens. Password imports retain their bearer-session storage. Cookies and bearers are never returned by the account list or import response.
 
-Duplicate cookie accounts are detected by Instagram user ID. Re-importing a known account with new login credentials adds or replaces its password/TOTP backup and returns `updated`; unchanged credentials return `duplicate`. The active session, device, proxy and dead status are preserved. Re-submit both cookies and login fields to attach a backup to an existing cookie account. An update saves the backup without attempting password login; incorrect backups will fail when recovery is needed.
+Existing accounts are matched by Instagram user ID for cookie imports and by normalized username for password imports. An unfamiliar login name or email is matched by its verified Instagram user ID after login. Both import directions update the same account row and return the existing `account_id`:
+
+- **Cookies into an existing password account:** upload the cookie export normally. The importer verifies it on the account's saved proxy and device, then stores it as the preferred session while keeping the password/TOTP backup. A verified session update reactivates a dead account. Verification failure preserves the previous session and backup.
+- **Password/2FA into an existing cookie account:** submit only its username, password and TOTP secret; the cookies do not need to be sent again. A known username updates the backup without attempting password login or replacing working cookies. Incorrect backups fail when recovery is needed. Login-only updates do not reactivate dead accounts.
+- **Both together:** include both fields to update the session and backup together. Omitted login fields preserve the saved backup; omitted cookies preserve the session. Unchanged credentials return `duplicate`.
+
+For example, add a backup to an account previously imported using only cookies:
+
+```json
+{"accounts":[{"username":"example_account","password":"REPLACE_WITH_PASSWORD","totp_secret":"REPLACE_WITH_BASE32_SECRET"}]}
+```
+
+Use the same `POST /v1/instagram/accounts/imports` endpoint. Account ID, insertion order, proxy and device are preserved. Cookie replacement waits for older metadata requests and their health writes to finish, so an old authentication failure cannot disable the replacement session.
 
 Malformed cookies reject the batch before network requests. Expired cookies require a complete login backup; without it, they also reject the batch. Account-specific failures return per-row results, and rate limits skip remaining rows.
 
@@ -111,7 +123,7 @@ Malformed cookies reject the batch before network requests. Expired cookies requ
 
 When extraction encounters an expired or rejected session, the account attempts password/TOTP recovery on its existing proxy and device, then retries metadata once. Concurrent requests share the login attempt. The verified user ID must match the saved account, so a bad backup cannot switch it to another account. A successful replacement session is committed to PostgreSQL before use, and the rejected cookies are cleared. Subsequent requests and restarts reuse the replacement; login credentials remain available for future recovery.
 
-Temporary login/network/database failures cool down for at least one minute before retrying. Rejected passwords, unsupported 2FA, account mismatches and challenges disable the account as before. An expired cookie account with a saved backup can recover after restart; cookie-only expired accounts remain disabled. Existing accounts imported before this change have no saved password/TOTP: re-import login credentials to enable recovery. Dead accounts are not automatically reactivated by a credential update.
+Temporary login/network/database failures cool down for at least one minute before retrying. Rejected passwords, unsupported 2FA, account mismatches and challenges disable the account as before. An expired cookie account with a saved backup can recover after restart; cookie-only expired accounts remain disabled. Existing accounts imported before this change have no saved password/TOTP: re-import login credentials to enable recovery. Login-only updates do not reactivate dead accounts; verified replacement sessions do.
 
 ## 3. Submit the import
 
@@ -166,7 +178,7 @@ An HTTP 200 response can contain failures. Inspect every result; `curl --fail-wi
 | Status | Meaning |
 | --- | --- |
 | `imported` | Login and session verification succeeded; the account was saved and added to the pool. |
-| `updated` | Backup login credentials were saved for a known account; its current session and route were kept. |
+| `updated` | Credentials were added or replaced on the existing account; its ID, device and route were kept. |
 | `duplicate` | A matching account is already stored; no replacement session is written. Known usernames skip login entirely. A conflict discovered after login can also produce this status, without an `account_id`. |
 | `failed` | This account was not imported; inspect `error_code`. |
 | `skipped` | No attempt was made for this row because an earlier account was rate-limited. |
@@ -190,7 +202,7 @@ For example, with a limit of 10 and 15 healthy accounts, the oldest 10 serve met
 
 No restart is needed after import. After a normal service restart using the same database and schema, the saved accounts, device identities, routes, and dead status are restored. Supplied passwords and TOTP seeds are retained privately with the authenticated session for automatic recovery. They are not returned by account APIs. Changing or removing a seed file does not remove a stored account.
 
-Re-importing a stored dead username returns `duplicate` or `updated`; it does not reactivate the account. There is currently no account-reset, delete, or re-login API. Import replacement accounts with different usernames to replenish the reserve.
+Re-importing only login credentials for a dead account returns `duplicate` or `updated` and keeps it dead. Import a working cookie session for that account to verify and reactivate it. There is no account-delete API.
 
 ## Troubleshooting
 
