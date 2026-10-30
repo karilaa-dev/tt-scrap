@@ -808,13 +808,20 @@
             "HTTPBearer": []
           }
         ],
-        "description": "Validate a batch, choose least-assigned proxy routes, check egress, login with optional TOTP, verify each session and persist successful accounts. Accepts the G2G CSV format: User ID / Email Address, Password, First Secret Question (TOTP). At most 100 accounts / 1 MiB. Synchronous, sequential processing; successful rows survive subsequent failures. A login rate limit skips remaining rows. HTTP 200 contains per-row results, not a guarantee of successful login. Duplicate imports do not revive dead accounts. Passwords and TOTP secrets are not persisted. Imports are available even while Instagram readiness is false. New accounts select a device profile once (random by default); the generated device IDs and profile persist with the session. Unknown profiles reject the entire batch before contacting Instagram.",
+        "description": "Validate a batch, choose least-assigned proxy routes, check egress, login with optional TOTP, verify each session and persist successful accounts. Accepts the G2G CSV format: User ID / Email Address, Password, First Secret Question (TOTP). At most 100 accounts / 1 MiB. Synchronous, sequential processing; successful rows survive subsequent failures. A login rate limit skips remaining rows. HTTP 200 contains per-row results, not a guarantee of successful login. Duplicate imports do not revive dead accounts. Passwords and TOTP secrets are not persisted. Imports are available even while Instagram readiness is false. New accounts select a device profile once (random by default); the generated device IDs and profile persist with the session. Unknown profiles reject the entire batch before contacting Instagram. Browser-cookie imports accept one JSON cookie array per account (text/plain or multipart file), a single array as application/json, or accounts entries with cookies. Cookie entries require usable Instagram sessionid and ds_user_id cookies and must not include username/password/TOTP. Cookies are verified on the selected route, saved as JSON, and used to derive Android authorization in memory only.",
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/InstagramAccountImportRequest"
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/InstagramAccountImportRequest"
+                  },
+                  {
+                    "$ref": "#/components/schemas/InstagramCookieArray"
+                  }
+                ]
               }
             },
             "text/csv": {
@@ -836,6 +843,12 @@
                     "format": "binary"
                   }
                 }
+              }
+            },
+            "text/plain": {
+              "schema": {
+                "type": "string",
+                "description": "Browser export: one JSON array of cookie objects per account, separated by newlines. A single pretty-printed array is also accepted."
               }
             }
           }
@@ -2542,10 +2555,6 @@
       "InstagramAccountCredentials": {
         "type": "object",
         "additionalProperties": false,
-        "required": [
-          "username",
-          "password"
-        ],
         "properties": {
           "username": {
             "type": "string",
@@ -2571,8 +2580,48 @@
             "maxLength": 64,
             "description": "Optional profile ID from GET /v1/instagram/device-profiles. Omitted, empty or random selects a profile once for the new account. CSV accepts an optional Device Profile column.",
             "example": "galaxy-s23-android-14"
+          },
+          "cookies": {
+            "$ref": "#/components/schemas/InstagramCookieArray"
           }
-        }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "username",
+              "password"
+            ],
+            "not": {
+              "required": [
+                "cookies"
+              ]
+            }
+          },
+          {
+            "required": [
+              "cookies"
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "username"
+                  ]
+                },
+                {
+                  "required": [
+                    "password"
+                  ]
+                },
+                {
+                  "required": [
+                    "totp_secret"
+                  ]
+                }
+              ]
+            }
+          }
+        ]
       },
       "InstagramAccountImportRequest": {
         "type": "object",
@@ -2747,6 +2796,52 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/InstagramDeviceProfile"
+            }
+          }
+        }
+      },
+      "InstagramCookieArray": {
+        "type": "array",
+        "minItems": 1,
+        "writeOnly": true,
+        "description": "Original Instagram browser cookies, including domain/path, hostOnly, secure, session and expirationDate attributes. Requires unexpired sessionid and ds_user_id applicable to i.instagram.com/api/v1/accounts/current_user/. Browser metadata is preserved.",
+        "items": {
+          "type": "object",
+          "required": [
+            "name",
+            "value",
+            "domain",
+            "path"
+          ],
+          "additionalProperties": true,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string",
+              "writeOnly": true
+            },
+            "domain": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "hostOnly": {
+              "type": "boolean"
+            },
+            "secure": {
+              "type": "boolean"
+            },
+            "httpOnly": {
+              "type": "boolean"
+            },
+            "session": {
+              "type": "boolean"
+            },
+            "expirationDate": {
+              "type": "number"
             }
           }
         }

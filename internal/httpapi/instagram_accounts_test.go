@@ -111,3 +111,49 @@ func TestInstagramDeviceProfilesRequireAuthentication(t *testing.T) {
 		}
 	}
 }
+
+func TestInstagramCookieImportRoutes(t *testing.T) {
+	cookies := `[{"domain":".instagram.com","path":"/","name":"sessionid","value":"123%3Afixture","secure":true},{"domain":".instagram.com","path":"/","name":"ds_user_id","value":"123","secure":true}]`
+	for _, format := range []string{"text/plain", "application/json", "json-envelope", "multipart/form-data"} {
+		t.Run(format, func(t *testing.T) {
+			d, _, _, _ := fixture(t)
+			manager := &fakeInstagramAccounts{}
+			d.InstagramAccounts = manager
+			var body bytes.Buffer
+			contentType := format
+			switch format {
+			case "json-envelope":
+				contentType = "application/json"
+				body.WriteString(`{"accounts":[{"cookies":` + cookies + `}]}`)
+			case "multipart/form-data":
+				mw := multipart.NewWriter(&body)
+				f, _ := mw.CreateFormFile("file", "accounts.txt")
+				f.Write([]byte(cookies))
+				mw.Close()
+				contentType = mw.FormDataContentType()
+			default:
+				body.WriteString(cookies)
+			}
+			data := append([]byte(nil), body.Bytes()...)
+			for _, authenticated := range []bool{false, true} {
+				req := httptest.NewRequest("POST", instagramImportPath, bytes.NewReader(data))
+				req.Header.Set("Content-Type", contentType)
+				if authenticated {
+					req.Header.Set("Authorization", "Bearer "+d.Config.APIKey)
+				}
+				res := httptest.NewRecorder()
+				NewHandler(d).ServeHTTP(res, req)
+				want := 401
+				if authenticated {
+					want = 200
+				}
+				if res.Code != want || strings.Contains(res.Body.String(), "123%3Afixture") {
+					t.Fatal(res.Code)
+				}
+			}
+			if manager.calls != 1 || len(manager.accounts) != 1 || len(manager.accounts[0].Cookies) == 0 || manager.accounts[0].Password != "" {
+				t.Fatal("cookie upload not mapped")
+			}
+		})
+	}
+}

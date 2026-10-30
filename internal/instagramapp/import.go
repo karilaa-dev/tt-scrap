@@ -19,7 +19,7 @@ import (
 const MaxImportAccounts = 100
 
 func invalidImport() error {
-	return core.NewError("invalid_account_import", "Supply up to 100 accounts with username, password and a valid TOTP secret", 422)
+	return core.NewError("invalid_account_import", "Supply up to 100 accounts with browser cookies or username, password and a valid TOTP secret", 422)
 }
 func ParseCSV(reader io.Reader) ([]Credentials, error) {
 	r := csv.NewReader(reader)
@@ -71,6 +71,17 @@ func validateCredentials(accounts []Credentials) ([]Credentials, error) {
 		a.DeviceProfile = strings.TrimSpace(a.DeviceProfile)
 		if !validDeviceSelection(a.DeviceProfile) {
 			return nil, invalidDeviceProfile()
+		}
+		if a.Cookies != nil {
+			if a.Username != "" || a.Password != "" || a.TOTPSecret != "" {
+				return nil, invalidImport()
+			}
+			_, id, err := cookieAuthorization(a.Cookies)
+			if err != nil || seen["cookie:"+id] {
+				return nil, invalidImport()
+			}
+			seen["cookie:"+id] = true
+			continue
 		}
 		key := strings.ToLower(a.Username)
 		if a.Username == "" || len(a.Username) > 254 || a.Password == "" || len(a.Password) > 1024 || len(a.TOTPSecret) > 2048 || seen[key] || strings.ContainsAny(a.Username, "\r\n\x00") {
@@ -163,11 +174,13 @@ func (m *AccountManager) Import(ctx context.Context, credentials []Credentials) 
 		return nil, e
 	}
 	known := map[string]string{}
+	knownIDs := map[string]string{}
 	counts := map[string]int{}
 	for _, a := range existing {
 		if err := m.pool.addAccount(a.accountConfig, a.Dead, a.Username, a.IP); err != nil {
 			return nil, err
 		}
+		knownIDs[a.UserID] = a.ID
 		if a.Username != "" {
 			known[strings.ToLower(a.Username)] = a.ID
 		}
@@ -182,7 +195,12 @@ func (m *AccountManager) Import(ctx context.Context, credentials []Credentials) 
 			return results, ctx.Err()
 		}
 		row := ImportResult{Row: n + 1}
-		if id := known[strings.ToLower(c.Username)]; id != "" {
+		id := known[strings.ToLower(c.Username)]
+		if c.Cookies != nil {
+			_, userID, _ := cookieAuthorization(c.Cookies)
+			id = knownIDs[userID]
+		}
+		if id != "" {
 			row.AccountID = id
 			row.Status = "duplicate"
 			results = append(results, row)
@@ -221,7 +239,11 @@ func (m *AccountManager) Import(ctx context.Context, credentials []Credentials) 
 			continue
 		}
 		loginCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-		session, err := m.login(loginCtx, client, m.pool.apiOrigin, c)
+		authenticate := m.login
+		if c.Cookies != nil {
+			authenticate = loginCookies
+		}
+		session, err := authenticate(loginCtx, client, m.pool.apiOrigin, c)
 		cancel()
 		client.CloseIdleConnections()
 		if err != nil {
@@ -240,7 +262,7 @@ func (m *AccountManager) Import(ctx context.Context, credentials []Credentials) 
 			}
 			continue
 		}
-		account := storedAccount{accountConfig: accountConfig{ID: core.NewID(), Authorization: session.Authorization, ProxyURL: &selected, Device: session.Device}, Username: strings.ToLower(session.Username), UserID: session.UserID, IP: ip}
+		account := storedAccount{accountConfig: accountConfig{ID: core.NewID(), Cookies: c.Cookies, Authorization: session.Authorization, ProxyURL: &selected, Device: session.Device}, Username: strings.ToLower(session.Username), UserID: session.UserID, IP: ip}
 		inserted, err := m.store.Insert(ctx, account)
 		if err != nil {
 			return results, err
@@ -256,6 +278,7 @@ func (m *AccountManager) Import(ctx context.Context, credentials []Credentials) 
 			counts[selected]++
 			known[strings.ToLower(c.Username)] = account.ID
 			known[account.Username] = account.ID
+			knownIDs[account.UserID] = account.ID
 		}
 		results = append(results, row)
 	}

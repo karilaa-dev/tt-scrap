@@ -53,6 +53,9 @@ func OpenStore(ctx context.Context, cfg core.Config) (*Store, error) {
 		if _, e = db.Exec(ctx, `ALTER TABLE `+s.accounts+` ADD COLUMN IF NOT EXISTS device JSONB`); e != nil {
 			return e
 		}
+		if _, e = db.Exec(ctx, `ALTER TABLE `+s.accounts+` ADD COLUMN IF NOT EXISTS cookies JSONB, ALTER COLUMN android_authorization DROP NOT NULL`); e != nil {
+			return e
+		}
 		_, e = db.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+s.attempts+` (
    id UUID PRIMARY KEY, source_id TEXT NOT NULL, legacy_used BOOLEAN NOT NULL DEFAULT false,
    succeeded BOOLEAN, error_code TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(), finished_at TIMESTAMPTZ)`)
@@ -118,7 +121,7 @@ func (s *Store) Seed(ctx context.Context, configs []accountConfig) error {
 func (s *Store) Load(ctx context.Context) ([]storedAccount, error) {
 	result := []storedAccount{}
 	e := s.withDB(ctx, func(ctx context.Context, db *pgx.Conn) error {
-		rows, e := db.Query(ctx, `SELECT id,android_authorization,proxy_url,COALESCE(username,''),COALESCE(user_id,''),egress_ip,dead,device FROM `+s.accounts+` ORDER BY ordinal`)
+		rows, e := db.Query(ctx, `SELECT id,COALESCE(android_authorization,''),proxy_url,COALESCE(username,''),COALESCE(user_id,''),egress_ip,dead,device,cookies FROM `+s.accounts+` ORDER BY ordinal`)
 		if e != nil {
 			return e
 		}
@@ -127,7 +130,7 @@ func (s *Store) Load(ctx context.Context) ([]storedAccount, error) {
 			var a storedAccount
 			var proxy string
 			var device []byte
-			if e = rows.Scan(&a.ID, &a.Authorization, &proxy, &a.Username, &a.UserID, &a.IP, &a.Dead, &device); e != nil {
+			if e = rows.Scan(&a.ID, &a.Authorization, &proxy, &a.Username, &a.UserID, &a.IP, &a.Dead, &device, &a.Cookies); e != nil {
 				return e
 			}
 			if len(device) != 0 {
@@ -155,7 +158,7 @@ func (s *Store) Insert(ctx context.Context, a storedAccount) (bool, error) {
 	}
 	inserted := false
 	e := s.withDB(ctx, func(ctx context.Context, db *pgx.Conn) error {
-		tag, e := db.Exec(ctx, `INSERT INTO `+s.accounts+` (id,username,user_id,android_authorization,proxy_url,egress_ip,device) VALUES($1,lower($2),$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, a.ID, a.Username, a.UserID, a.Authorization, *a.ProxyURL, a.IP, device)
+		tag, e := db.Exec(ctx, `INSERT INTO `+s.accounts+` (id,username,user_id,android_authorization,proxy_url,egress_ip,device,cookies) VALUES($1,lower($2),$3,NULLIF($4,''),$5,$6,$7,$8) ON CONFLICT DO NOTHING`, a.ID, a.Username, a.UserID, a.Authorization, *a.ProxyURL, a.IP, device, a.Cookies)
 		inserted = tag.RowsAffected() == 1
 		return e
 	})

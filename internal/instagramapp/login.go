@@ -31,10 +31,11 @@ import (
 )
 
 type Credentials struct {
-	Username      string `json:"username"`
-	Password      string `json:"password"`
-	TOTPSecret    string `json:"totp_secret"`
-	DeviceProfile string `json:"device_profile,omitempty"`
+	Cookies       json.RawMessage `json:"cookies,omitempty"`
+	Username      string          `json:"username"`
+	Password      string          `json:"password"`
+	TOTPSecret    string          `json:"totp_secret"`
+	DeviceProfile string          `json:"device_profile,omitempty"`
 }
 type loginResult struct {
 	Authorization, Username, UserID string

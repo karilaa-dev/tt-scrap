@@ -111,7 +111,19 @@ func Open(options Options) (*Pool, error) {
 }
 
 func (p *Pool) addAccount(config accountConfig, dead bool, username, ip string) error {
-	if !accountIDPattern.MatchString(config.ID) || !validAuthorization(config.Authorization) {
+	if config.Cookies != nil {
+		if config.Authorization != "" {
+			return errors.New("invalid stored Instagram account")
+		}
+		auth, _, err := cookieAuthorization(config.Cookies)
+		if err != nil {
+			// An expired saved session must not prevent the other accounts from loading.
+			dead = true
+		} else {
+			config.Authorization = auth
+		}
+	}
+	if !accountIDPattern.MatchString(config.ID) || (config.Cookies == nil && !validAuthorization(config.Authorization)) {
 		return errors.New("invalid stored Instagram account")
 	}
 	if err := config.Device.validate(); err != nil {

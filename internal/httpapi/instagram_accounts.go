@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"mime"
@@ -17,6 +18,8 @@ func readInstagramImport(w http.ResponseWriter, r *http.Request) ([]instagramapp
 		return nil, invalidRequest()
 	}
 	switch kind {
+	case "text/plain":
+		return instagramapp.ParseCookieExport(r.Body)
 	case "text/csv":
 		return instagramapp.ParseCSV(r.Body)
 	case "multipart/form-data":
@@ -33,18 +36,28 @@ func readInstagramImport(w http.ResponseWriter, r *http.Request) ([]instagramapp
 			return nil, invalidRequest()
 		}
 		defer file.Close()
-		return instagramapp.ParseCSV(file)
+		return instagramapp.ParseImportFile(file)
 	case "application/json":
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, invalidRequest()
+		}
+		if bytes.HasPrefix(bytes.TrimSpace(raw), []byte("[")) {
+			if !json.Valid(raw) {
+				return nil, invalidRequest()
+			}
+			return instagramapp.ParseCookieExport(bytes.NewReader(raw))
+		}
 		var body struct {
 			Accounts []instagramapp.Credentials `json:"accounts"`
 		}
-		decoder := json.NewDecoder(r.Body)
+		decoder := json.NewDecoder(bytes.NewReader(raw))
 		decoder.DisallowUnknownFields()
 		if decoder.Decode(&body) != nil || decoder.Decode(new(any)) != io.EOF {
 			return nil, invalidRequest()
 		}
 		return body.Accounts, nil
 	default:
-		return nil, core.NewError("unsupported_media_type", "Use text/csv, multipart/form-data with file, or application/json", 415)
+		return nil, core.NewError("unsupported_media_type", "Use text/plain cookie exports, text/csv, multipart/form-data with file, or application/json", 415)
 	}
 }

@@ -1,6 +1,6 @@
 # Importing Instagram accounts
 
-This guide covers the native account importer in tt-scrap. Imports choose and check a proxy route, log in with the account's password and authenticator secret, verify the returned session, and save it in PostgreSQL. Saved accounts are available immediately and load again after restart. A phone, ADB, Python, and instagrapi are not required at runtime.
+This guide covers the native account importer in tt-scrap. Imports choose and check a proxy route, authenticate with browser cookies or the account's password and authenticator secret, verify the returned session, and save it in PostgreSQL. Saved accounts are available immediately and load again after restart. A phone, ADB, Python, and instagrapi are not required at runtime.
 
 ## 1. Prepare the service
 
@@ -27,7 +27,7 @@ curl --fail-with-body "$TT_SCRAP_BASE_URL/v1/instagram/accounts" \
 
 Use HTTPS when sending credentials to a remote service. Account administration works even when there are no healthy Instagram accounts and `/health/ready` returns 503; use a reachable service origin that allows those administration requests. The API process and its database/proxy initialization must have started successfully.
 
-## 2. Prepare a CSV or JSON file
+## 2. Prepare a CSV, JSON or cookie export file
 
 Keep the file private, for example with `chmod 600 /private/instagram-accounts.csv`. The examples below contain placeholders; replace them with the account's actual values.
 
@@ -68,7 +68,7 @@ Save this structure to a private file, such as `/private/instagram-accounts.json
 }
 ```
 
-`username` and `password` are required. `totp_secret` may be omitted for an account without authenticator 2FA. Both formats accept Base32 secrets with spaces or an `otpauth://totp/` URI using SHA-1, six digits, and a 30-second period. Keep the server clock synchronized: tt-scrap generates the code just before submitting it.
+For password imports, `username` and `password` are required. `totp_secret` may be omitted for an account without authenticator 2FA. Both formats accept Base32 secrets with spaces or an `otpauth://totp/` URI using SHA-1, six digits, and a 30-second period. Keep the server clock synchronized: tt-scrap generates the code just before submitting it.
 
 Discover supported profiles with:
 
@@ -78,6 +78,25 @@ curl --fail-with-body "$TT_SCRAP_BASE_URL/v1/instagram/device-profiles" \
 ```
 
 Omitting `device_profile`, leaving it blank, or using `random` selects a profile once during login. The generated device identity is persisted with the session and reused after restart. An unsupported profile rejects the entire batch before login begins.
+
+### Browser cookies
+
+Exported browser cookies are accepted directly, including `.txt` files with one JSON cookie array per account on separate lines. A single pretty-printed array is also accepted. Each array needs unexpired `sessionid` and `ds_user_id` cookies scoped for `i.instagram.com`; domain, path, host-only and expiration attributes are respected. Keep the file private: session cookies grant account access.
+
+Upload that file without converting it to passwords or bearer tokens:
+
+```sh
+curl --fail-with-body "$TT_SCRAP_BASE_URL/v1/instagram/accounts/imports" \
+  -H "Authorization: Bearer $TT_SCRAP_API_KEY" \
+  -H 'Content-Type: text/plain' \
+  --data-binary @/private/instagram-cookies.txt
+```
+
+Alternatively, use `-F 'file=@/private/instagram-cookies.txt;type=text/plain'`. For `application/json`, submit a single cookie array or `{"accounts":[{"cookies":[...],"device_profile":"random"}]}`. Do not combine cookies with username, password or TOTP fields on the same account. The username is discovered by verifying the session with Instagram; no password login is attempted.
+
+Successful cookie imports store the original cookie JSON and the selected device/proxy in PostgreSQL. The Android bearer is derived from `sessionid` and `ds_user_id` only in memory, including after restart; the bearer column remains NULL. Password imports keep their existing bearer-session storage. Cookies and bearers are never returned by the account list or import response.
+
+Duplicate cookie accounts are detected by Instagram user ID. Invalid or expired cookie input rejects the batch before network requests. Sessions rejected by Instagram produce per-row failures; rate limits skip remaining rows. A saved cookie session that has expired when the service restarts is excluded from use.
 
 ## 3. Submit the import
 
@@ -127,7 +146,7 @@ An HTTP 200 response can contain failures. Inspect every result; `curl --fail-wi
 }
 ```
 
-`row` is one-based and excludes the CSV header.
+`row` is one-based and excludes the CSV header. For cookie exports it counts account arrays.
 
 | Status | Meaning |
 | --- | --- |
@@ -153,7 +172,7 @@ The response contains `active_limit` and an oldest-first `accounts` list. Each a
 
 For example, with a limit of 10 and 15 healthy accounts, the oldest 10 serve metadata. If one becomes dead, the next oldest reserve replaces it. Temporary cooldowns and busy accounts do not promote reserves. Requests balance across available active accounts, with separate per-account limits for metadata and CDN downloads.
 
-No restart is needed after import. After a normal service restart using the same database and schema, the saved accounts, device identities, routes, and dead status are restored. Passwords and TOTP seeds are never stored; the database retains the authenticated session. Changing or removing a seed file does not remove a stored account.
+No restart is needed after import. After a normal service restart using the same database and schema, the saved accounts, device identities, routes, and dead status are restored. Passwords and TOTP seeds are never stored; the database retains the authenticated session (original cookies for cookie imports). Changing or removing a seed file does not remove a stored account.
 
 Re-importing a stored dead username returns `duplicate`; it does not reactivate the account. There is currently no account-reset, delete, or re-login API. Import replacement accounts with different usernames to replenish the reserve.
 
@@ -174,6 +193,12 @@ Re-importing a stored dead username returns `duplicate`; it does not reactivate 
 | `instagram_database_unavailable` / HTTP 503 | Restore database access, then check the account list for previously committed rows before retrying. |
 
 Legacy fallback applies to **media extraction**, not account login. `scrap_instagram_attempts.legacy_used` records extraction-method attempts; it is not an import-success flag. See [Instagram architecture and legacy measurements](instagram-app.md) for configuration and SQL examples.
+
+## Cookie-import verification
+
+On 2026-10-30, the last six accounts of a supplied browser export were submitted through the real HTTP import endpoint in an isolated temporary database schema. Five passed session verification and were persisted as cookies with NULL bearer columns; one failed session verification. Reopening the pool restored all five, and a photo extraction succeeded. Only those six accounts were attempted, and the temporary schema was removed afterward. This does not guarantee that every exported session remains usable.
+
+The schema migration adds a nullable `cookies` JSONB column and makes `android_authorization` nullable. Existing password-session rows remain unchanged. Older releases cannot load cookie-only rows; use this version or later after importing cookies.
 
 ## Verification and tt-bot compatibility
 

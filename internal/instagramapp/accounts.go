@@ -17,6 +17,7 @@ const credentialLimit = 4 << 20
 var accountIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 type accountConfig struct {
+	Cookies       json.RawMessage `json:"cookies,omitempty"`
 	ID            string          `json:"id"`
 	Authorization string          `json:"authorization"`
 	SessionFile   string          `json:"session_file"`
