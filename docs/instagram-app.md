@@ -31,6 +31,8 @@ Live validation on 2026-10-29: `galaxy-s23-android-14` completed fresh password 
 
 ## Account import API
 
+For CSV/JSON examples, provisioning steps, result handling, and troubleshooting, use the [account-import guide](instagram-account-imports.md).
+
 `POST /v1/instagram/accounts/imports` requires the existing `Authorization: Bearer <TT_SCRAP_API_KEY>` header and accepts:
 
 - `text/csv`: the CSV file as the entire request body.
