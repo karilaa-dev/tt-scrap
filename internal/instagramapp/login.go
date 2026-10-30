@@ -31,6 +31,7 @@ import (
 )
 
 type Credentials struct {
+	device        *DeviceIdentity
 	Cookies       json.RawMessage `json:"cookies,omitempty"`
 	Username      string          `json:"username"`
 	Password      string          `json:"password"`
@@ -232,7 +233,22 @@ func verifyLogin(ctx context.Context, client *http.Client, origin, auth string, 
 		return loginResult{}, loginFailure("upstream_rate_limited")
 	}
 	body, e := io.ReadAll(io.LimitReader(res.Body, metadataLimit+1))
-	if e != nil || len(body) > metadataLimit || res.StatusCode != 200 {
+	if e != nil || len(body) > metadataLimit {
+		return loginResult{}, loginFailure("session_check_failed")
+	}
+	var failure map[string]any
+	_ = json.Unmarshal(body, &failure)
+	state, failureErr := apiFailure(failure)
+	if state.cooldown > 0 {
+		return loginResult{}, loginFailure("upstream_rate_limited")
+	}
+	if state.disable && !state.renew {
+		return loginResult{}, loginFailure("challenge_required")
+	}
+	if state.renew || res.StatusCode == http.StatusUnauthorized {
+		return loginResult{}, loginFailure("session_expired")
+	}
+	if res.StatusCode != 200 || failureErr != nil {
 		return loginResult{}, loginFailure("session_check_failed")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))

@@ -31,6 +31,10 @@ type Options struct {
 }
 
 type account struct {
+	login         *passwordCredentials
+	refreshGate   chan struct{}
+	refreshAfter  time.Time
+	refreshErr    error
 	id            string
 	authorization string
 	client        *http.Client
@@ -44,6 +48,7 @@ type account struct {
 }
 
 type Pool struct {
+	login         passwordLogin
 	options       Options
 	mu            sync.Mutex
 	accounts      []*account
@@ -82,7 +87,7 @@ func Open(options Options) (*Pool, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &Pool{options: options, changed: make(chan struct{}), byID: make(map[string]*account), apiOrigin: "https://i.instagram.com"}
+	p := &Pool{login: login, options: options, changed: make(chan struct{}), byID: make(map[string]*account), apiOrigin: "https://i.instagram.com"}
 	if options.Store != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -118,7 +123,9 @@ func (p *Pool) addAccount(config accountConfig, dead bool, username, ip string) 
 		auth, _, err := cookieAuthorization(config.Cookies)
 		if err != nil {
 			// An expired saved session must not prevent the other accounts from loading.
-			dead = true
+			if config.Login == nil {
+				dead = true
+			}
 		} else {
 			config.Authorization = auth
 		}
@@ -150,7 +157,7 @@ func (p *Pool) addAccount(config accountConfig, dead bool, username, ip string) 
 		stripCredentials(req.Header)
 		return nil
 	}}
-	a := &account{id: IdentityPrefix + config.ID, authorization: config.Authorization, client: metadata, mediaClient: media}
+	a := &account{login: config.Login, refreshGate: make(chan struct{}, 1), id: IdentityPrefix + config.ID, authorization: config.Authorization, client: metadata, mediaClient: media}
 	if config.Device != nil {
 		device := *config.Device
 		a.device = &device
@@ -351,7 +358,8 @@ func (p *Pool) WithMedia(ctx context.Context, id string, run func(core.OpenAppMe
 			req.Header = make(http.Header)
 		}
 		stripCredentials(req.Header)
-		req.Header.Set("User-Agent", a.device.userAgent())
+		_, device := p.session(a)
+		req.Header.Set("User-Agent", device.userAgent())
 		response, err := a.mediaClient.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {

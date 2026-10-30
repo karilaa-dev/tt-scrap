@@ -1,6 +1,6 @@
 # Importing Instagram accounts
 
-This guide covers the native account importer in tt-scrap. Imports choose and check a proxy route, authenticate with browser cookies or the account's password and authenticator secret, verify the returned session, and save it in PostgreSQL. Saved accounts are available immediately and load again after restart. A phone, ADB, Python, and instagrapi are not required at runtime.
+This guide covers the native account importer in tt-scrap. Imports choose and check a proxy route, prefer browser cookies and fall back to the account's password and authenticator secret when the session expires, verify the returned session, and save it in PostgreSQL. Saved accounts are available immediately and load again after restart. A phone, ADB, Python, and instagrapi are not required at runtime.
 
 ## 1. Prepare the service
 
@@ -41,6 +41,7 @@ The importer recognizes these exact column names:
 | `Password` | Account password, preserved exactly |
 | `First Secret Question` | Authenticator **TOTP secret**, not a security question or a current six-digit code |
 | `Device Profile` | Optional device profile ID; blank or `random` selects one automatically |
+| `Cookies` | Optional JSON cookie array; use CSV quoting for embedded quotes |
 
 ```csv
 User ID / Email Address,Password,First Secret Question,Device Profile
@@ -81,7 +82,7 @@ Omitting `device_profile`, leaving it blank, or using `random` selects a profile
 
 ### Browser cookies
 
-Exported browser cookies are accepted directly, including `.txt` files with one JSON cookie array per account on separate lines. A single pretty-printed array is also accepted. Each array needs unexpired `sessionid` and `ds_user_id` cookies scoped for `i.instagram.com`; domain, path, host-only and expiration attributes are respected. Keep the file private: session cookies grant account access.
+Exported browser cookies are accepted directly, including `.txt` files with one JSON cookie array per account on separate lines. A single pretty-printed array is also accepted. Each array needs `sessionid` and `ds_user_id` cookies scoped for `i.instagram.com`; domain, path, host-only and expiration attributes are respected. Keep the file private: session cookies grant account access.
 
 Upload that file without converting it to passwords or bearer tokens:
 
@@ -92,11 +93,25 @@ curl --fail-with-body "$TT_SCRAP_BASE_URL/v1/instagram/accounts/imports" \
   --data-binary @/private/instagram-cookies.txt
 ```
 
-Alternatively, use `-F 'file=@/private/instagram-cookies.txt;type=text/plain'`. For `application/json`, submit a single cookie array or `{"accounts":[{"cookies":[...],"device_profile":"random"}]}`. Do not combine cookies with username, password or TOTP fields on the same account. The username is discovered by verifying the session with Instagram; no password login is attempted.
+Alternatively, use `-F 'file=@/private/instagram-cookies.txt;type=text/plain'`. For `application/json`, submit a single cookie array or `{"accounts":[{"cookies":[...],"device_profile":"random"}]}`. You can include `username`, `password`, and `totp_secret` alongside `cookies` on the same account:
 
-Successful cookie imports store the original cookie JSON and the selected device/proxy in PostgreSQL. The Android bearer is derived from `sessionid` and `ds_user_id` only in memory, including after restart; the bearer column remains NULL. Password imports keep their existing bearer-session storage. Cookies and bearers are never returned by the account list or import response.
+```json
+{"accounts":[{"cookies":[{"domain":".instagram.com","path":"/","name":"sessionid","value":"SESSION_VALUE"},{"domain":".instagram.com","path":"/","name":"ds_user_id","value":"123"}],"username":"example_account","password":"REPLACE_WITH_PASSWORD","totp_secret":"REPLACE_WITH_BASE32_SECRET"}]}
+```
 
-Duplicate cookie accounts are detected by Instagram user ID. Invalid or expired cookie input rejects the batch before network requests. Sessions rejected by Instagram produce per-row failures; rate limits skip remaining rows. A saved cookie session that has expired when the service restarts is excluded from use.
+Cookies are verified first. A working cookie session skips password login. Expired cookies or an explicit `login_required`/`session_expired` response trigger one password login with TOTP if needed. The verified account ID must match the cookie account. Partial login credentials are rejected. Rate limits, challenges, network errors, and other service failures do not trigger password fallback.
+
+Successful cookie imports store the original cookie JSON and the selected device/proxy in PostgreSQL. The Android bearer is derived from `sessionid` and `ds_user_id` only in memory, including after restart; the bearer column remains NULL. Supplied username/password/TOTP credentials are also saved privately in `login_credentials`, including for password-only imports. Treat this database column and backups as sensitive credential storage, just like session tokens. Password imports retain their bearer-session storage. Cookies and bearers are never returned by the account list or import response.
+
+Duplicate cookie accounts are detected by Instagram user ID. Re-importing a known account with new login credentials adds or replaces its password/TOTP backup and returns `updated`; unchanged credentials return `duplicate`. The active session, device, proxy and dead status are preserved. Re-submit both cookies and login fields to attach a backup to an existing cookie account. An update saves the backup without attempting password login; incorrect backups will fail when recovery is needed.
+
+Malformed cookies reject the batch before network requests. Expired cookies require a complete login backup; without it, they also reject the batch. Account-specific failures return per-row results, and rate limits skip remaining rows.
+
+### Automatic recovery
+
+When extraction encounters an expired or rejected session, the account attempts password/TOTP recovery on its existing proxy and device, then retries metadata once. Concurrent requests share the login attempt. The verified user ID must match the saved account, so a bad backup cannot switch it to another account. A successful replacement session is committed to PostgreSQL before use, and the rejected cookies are cleared. Subsequent requests and restarts reuse the replacement; login credentials remain available for future recovery.
+
+Temporary login/network/database failures cool down for at least one minute before retrying. Rejected passwords, unsupported 2FA, account mismatches and challenges disable the account as before. An expired cookie account with a saved backup can recover after restart; cookie-only expired accounts remain disabled. Existing accounts imported before this change have no saved password/TOTP: re-import login credentials to enable recovery. Dead accounts are not automatically reactivated by a credential update.
 
 ## 3. Submit the import
 
@@ -151,6 +166,7 @@ An HTTP 200 response can contain failures. Inspect every result; `curl --fail-wi
 | Status | Meaning |
 | --- | --- |
 | `imported` | Login and session verification succeeded; the account was saved and added to the pool. |
+| `updated` | Backup login credentials were saved for a known account; its current session and route were kept. |
 | `duplicate` | A matching account is already stored; no replacement session is written. Known usernames skip login entirely. A conflict discovered after login can also produce this status, without an `account_id`. |
 | `failed` | This account was not imported; inspect `error_code`. |
 | `skipped` | No attempt was made for this row because an earlier account was rate-limited. |
@@ -172,9 +188,9 @@ The response contains `active_limit` and an oldest-first `accounts` list. Each a
 
 For example, with a limit of 10 and 15 healthy accounts, the oldest 10 serve metadata. If one becomes dead, the next oldest reserve replaces it. Temporary cooldowns and busy accounts do not promote reserves. Requests balance across available active accounts, with separate per-account limits for metadata and CDN downloads.
 
-No restart is needed after import. After a normal service restart using the same database and schema, the saved accounts, device identities, routes, and dead status are restored. Passwords and TOTP seeds are never stored; the database retains the authenticated session (original cookies for cookie imports). Changing or removing a seed file does not remove a stored account.
+No restart is needed after import. After a normal service restart using the same database and schema, the saved accounts, device identities, routes, and dead status are restored. Supplied passwords and TOTP seeds are retained privately with the authenticated session for automatic recovery. They are not returned by account APIs. Changing or removing a seed file does not remove a stored account.
 
-Re-importing a stored dead username returns `duplicate`; it does not reactivate the account. There is currently no account-reset, delete, or re-login API. Import replacement accounts with different usernames to replenish the reserve.
+Re-importing a stored dead username returns `duplicate` or `updated`; it does not reactivate the account. There is currently no account-reset, delete, or re-login API. Import replacement accounts with different usernames to replenish the reserve.
 
 ## Troubleshooting
 
@@ -198,7 +214,7 @@ Legacy fallback applies to **media extraction**, not account login. `scrap_insta
 
 On 2026-10-30, the last six accounts of a supplied browser export were submitted through the real HTTP import endpoint in an isolated temporary database schema. Five passed session verification and were persisted as cookies with NULL bearer columns; one failed session verification. Reopening the pool restored all five, and a photo extraction succeeded. Only those six accounts were attempted, and the temporary schema was removed afterward. This does not guarantee that every exported session remains usable.
 
-The schema migration adds a nullable `cookies` JSONB column and makes `android_authorization` nullable. Existing password-session rows remain unchanged. Older releases cannot load cookie-only rows; use this version or later after importing cookies.
+The schema migration adds nullable `cookies` and `login_credentials` JSONB columns and makes `android_authorization` nullable. Existing password-session rows remain unchanged. Older releases cannot load cookie-only rows; use this version or later after importing cookies.
 
 ## Verification and tt-bot compatibility
 

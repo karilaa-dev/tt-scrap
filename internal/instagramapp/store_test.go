@@ -105,6 +105,10 @@ func TestImportBalancesSharedRoutesAndSurvivesRestart(t *testing.T) {
 			t.Fatal("reserve used prematurely")
 		}
 	}
+	// The saved password is rejected as well, so the failed account is replaced.
+	p.login = func(context.Context, *http.Client, string, Credentials) (loginResult, error) {
+		return loginResult{}, loginFailure("login_rejected")
+	}
 	// Exercise real HTTP failure classification and durable automatic replacement.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		username := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer IGT:2:")

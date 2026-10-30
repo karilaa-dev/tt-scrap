@@ -55,6 +55,11 @@ func ParseCookieExport(reader io.Reader) ([]Credentials, error) {
 // cookieAuthorization bridges a browser session to Android API authorization
 // in RAM only. The original cookies, never this derived bearer, are persisted.
 func cookieAuthorization(raw json.RawMessage) (string, string, error) {
+	return cookieSession(raw, false)
+}
+
+// allowExpired is for validation and identity matching only, never for requests.
+func cookieSession(raw json.RawMessage, allowExpired bool) (string, string, error) {
 	var cookies []struct {
 		Name           string  `json:"name"`
 		Value          string  `json:"value"`
@@ -82,7 +87,7 @@ func cookieAuthorization(raw json.RawMessage) (string, string, error) {
 		if c.HostOnly {
 			cookie.Domain = ""
 		}
-		if !c.Session && c.ExpirationDate != 0 {
+		if !allowExpired && !c.Session && c.ExpirationDate != 0 {
 			cookie.Expires = time.Unix(int64(c.ExpirationDate), 0)
 		}
 		jar.SetCookies(&url.URL{Scheme: "https", Host: domain, Path: "/"}, []*http.Cookie{cookie})

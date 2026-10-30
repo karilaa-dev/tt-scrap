@@ -91,12 +91,19 @@ func testEncryptedLogin(t *testing.T, method string) {
 	pub, _ := x509.MarshalPKIXPublicKey(&private.PublicKey)
 	encoded := base64.StdEncoding.EncodeToString(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pub}))
 	steps := 0
+	savedDevice, e := newDeviceIdentity("galaxy-s23-android-14")
+	if e != nil {
+		t.Fatal(e)
+	}
 	var device, phone string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		steps++
 		profile, _ := findDeviceProfile("galaxy-s23-android-14")
 		if r.Header.Get("User-Agent") != profile.userAgent() {
 			t.Error("selected device profile not used")
+		}
+		if r.Header.Get("X-IG-Device-ID") != savedDevice.DeviceID {
+			t.Error("re-login changed saved device identity")
 		}
 		if steps == 1 {
 			device = r.Header.Get("X-IG-Android-ID")
@@ -207,7 +214,7 @@ func testEncryptedLogin(t *testing.T, method string) {
 		}
 	}))
 	defer server.Close()
-	result, e := login(context.Background(), server.Client(), server.URL, Credentials{Username: "alice", Password: "fixture-password", TOTPSecret: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", DeviceProfile: "galaxy-s23-android-14"})
+	result, e := login(context.Background(), server.Client(), server.URL, Credentials{Username: "alice", Password: "fixture-password", TOTPSecret: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", DeviceProfile: "galaxy-s23-android-14", device: savedDevice})
 	wantSteps := 8
 	if method == "bloks" {
 		wantSteps = 11

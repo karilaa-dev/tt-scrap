@@ -808,7 +808,7 @@
             "HTTPBearer": []
           }
         ],
-        "description": "Validate a batch, choose least-assigned proxy routes, check egress, login with optional TOTP, verify each session and persist successful accounts. Accepts the G2G CSV format: User ID / Email Address, Password, First Secret Question (TOTP). At most 100 accounts / 1 MiB. Synchronous, sequential processing; successful rows survive subsequent failures. A login rate limit skips remaining rows. HTTP 200 contains per-row results, not a guarantee of successful login. Duplicate imports do not revive dead accounts. Passwords and TOTP secrets are not persisted. Imports are available even while Instagram readiness is false. New accounts select a device profile once (random by default); the generated device IDs and profile persist with the session. Unknown profiles reject the entire batch before contacting Instagram. Browser-cookie imports accept one JSON cookie array per account (text/plain or multipart file), a single array as application/json, or accounts entries with cookies. Cookie entries require usable Instagram sessionid and ds_user_id cookies and must not include username/password/TOTP. Cookies are verified on the selected route, saved as JSON, and used to derive Android authorization in memory only.",
+        "description": "Validate a batch, choose least-assigned proxy routes, check egress, login with optional TOTP, verify each session and persist successful accounts. Accepts the G2G CSV format: User ID / Email Address, Password, First Secret Question (TOTP). At most 100 accounts / 1 MiB. Synchronous, sequential processing; successful rows survive subsequent failures. A login rate limit skips remaining rows. HTTP 200 contains per-row results, not a guarantee of successful login. Duplicate imports do not revive dead accounts. Supplied username/password/TOTP credentials are retained privately for automatic session recovery; re-importing changed login credentials for a known account returns updated and keeps its working session and route. Imports are available even while Instagram readiness is false. New accounts select a device profile once (random by default); the generated device IDs and profile persist with the session. Unknown profiles reject the entire batch before contacting Instagram. CSV accepts an optional Cookies column containing a JSON cookie array. Browser-cookie imports accept one JSON cookie array per account (text/plain or multipart file), a single array as application/json, or accounts entries with cookies. Cookie entries require Instagram sessionid and ds_user_id cookies and may also include username/password/TOTP. Cookies are preferred; expired or explicitly rejected sessions fall back to the supplied login credentials. Network errors, rate limits and challenges do not trigger password fallback. Cookies are verified on the selected route, saved as JSON, and used to derive Android authorization in memory only.",
         "requestBody": {
           "required": true,
           "content": {
@@ -2566,7 +2566,8 @@
             "format": "password",
             "writeOnly": true,
             "minLength": 1,
-            "maxLength": 1024
+            "maxLength": 1024,
+            "description": "Retained privately for automatic password/TOTP recovery when the session expires."
           },
           "totp_secret": {
             "type": "string",
@@ -2590,12 +2591,7 @@
             "required": [
               "username",
               "password"
-            ],
-            "not": {
-              "required": [
-                "cookies"
-              ]
-            }
+            ]
           },
           {
             "required": [
@@ -2661,7 +2657,8 @@
               "imported",
               "duplicate",
               "failed",
-              "skipped"
+              "skipped",
+              "updated"
             ]
           },
           "error_code": {
@@ -2804,7 +2801,7 @@
         "type": "array",
         "minItems": 1,
         "writeOnly": true,
-        "description": "Original Instagram browser cookies, including domain/path, hostOnly, secure, session and expirationDate attributes. Requires unexpired sessionid and ds_user_id applicable to i.instagram.com/api/v1/accounts/current_user/. Browser metadata is preserved.",
+        "description": "Original Instagram browser cookies, including domain/path, hostOnly, secure, session and expirationDate attributes. Requires sessionid and ds_user_id applicable to i.instagram.com/api/v1/accounts/current_user/. Browser metadata is preserved. Expired cookies require complete username/password fallback credentials.",
         "items": {
           "type": "object",
           "required": [

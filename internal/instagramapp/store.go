@@ -53,7 +53,7 @@ func OpenStore(ctx context.Context, cfg core.Config) (*Store, error) {
 		if _, e = db.Exec(ctx, `ALTER TABLE `+s.accounts+` ADD COLUMN IF NOT EXISTS device JSONB`); e != nil {
 			return e
 		}
-		if _, e = db.Exec(ctx, `ALTER TABLE `+s.accounts+` ADD COLUMN IF NOT EXISTS cookies JSONB, ALTER COLUMN android_authorization DROP NOT NULL`); e != nil {
+		if _, e = db.Exec(ctx, `ALTER TABLE `+s.accounts+` ADD COLUMN IF NOT EXISTS cookies JSONB, ADD COLUMN IF NOT EXISTS login_credentials JSONB, ALTER COLUMN android_authorization DROP NOT NULL`); e != nil {
 			return e
 		}
 		_, e = db.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+s.attempts+` (
@@ -121,7 +121,7 @@ func (s *Store) Seed(ctx context.Context, configs []accountConfig) error {
 func (s *Store) Load(ctx context.Context) ([]storedAccount, error) {
 	result := []storedAccount{}
 	e := s.withDB(ctx, func(ctx context.Context, db *pgx.Conn) error {
-		rows, e := db.Query(ctx, `SELECT id,COALESCE(android_authorization,''),proxy_url,COALESCE(username,''),COALESCE(user_id,''),egress_ip,dead,device,cookies FROM `+s.accounts+` ORDER BY ordinal`)
+		rows, e := db.Query(ctx, `SELECT id,COALESCE(android_authorization,''),proxy_url,COALESCE(username,''),COALESCE(user_id,''),egress_ip,dead,device,cookies,login_credentials FROM `+s.accounts+` ORDER BY ordinal`)
 		if e != nil {
 			return e
 		}
@@ -129,8 +129,8 @@ func (s *Store) Load(ctx context.Context) ([]storedAccount, error) {
 		for rows.Next() {
 			var a storedAccount
 			var proxy string
-			var device []byte
-			if e = rows.Scan(&a.ID, &a.Authorization, &proxy, &a.Username, &a.UserID, &a.IP, &a.Dead, &device, &a.Cookies); e != nil {
+			var device, backup []byte
+			if e = rows.Scan(&a.ID, &a.Authorization, &proxy, &a.Username, &a.UserID, &a.IP, &a.Dead, &device, &a.Cookies, &backup); e != nil {
 				return e
 			}
 			if len(device) != 0 {
@@ -142,6 +142,14 @@ func (s *Store) Load(ctx context.Context) ([]storedAccount, error) {
 				}
 				if e = a.Device.validate(); e != nil {
 					return e
+				}
+			}
+			if len(backup) != 0 {
+				if e = json.Unmarshal(backup, &a.Login); e != nil {
+					return e
+				}
+				if a.Login != nil && (a.Login.Username == "" || a.Login.Password == "" || a.Login.UserID != a.UserID) {
+					return errors.New("invalid stored Instagram login credentials")
 				}
 			}
 			a.ProxyURL = &proxy
@@ -156,9 +164,16 @@ func (s *Store) Insert(ctx context.Context, a storedAccount) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	var backup []byte
+	if a.Login != nil {
+		backup, err = json.Marshal(a.Login)
+		if err != nil {
+			return false, err
+		}
+	}
 	inserted := false
 	e := s.withDB(ctx, func(ctx context.Context, db *pgx.Conn) error {
-		tag, e := db.Exec(ctx, `INSERT INTO `+s.accounts+` (id,username,user_id,android_authorization,proxy_url,egress_ip,device,cookies) VALUES($1,lower($2),$3,NULLIF($4,''),$5,$6,$7,$8) ON CONFLICT DO NOTHING`, a.ID, a.Username, a.UserID, a.Authorization, *a.ProxyURL, a.IP, device, a.Cookies)
+		tag, e := db.Exec(ctx, `INSERT INTO `+s.accounts+` (id,username,user_id,android_authorization,proxy_url,egress_ip,device,cookies,login_credentials) VALUES($1,lower($2),$3,NULLIF($4,''),$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING`, a.ID, a.Username, a.UserID, a.Authorization, *a.ProxyURL, a.IP, device, a.Cookies, backup)
 		inserted = tag.RowsAffected() == 1
 		return e
 	})

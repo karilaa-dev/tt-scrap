@@ -19,7 +19,7 @@ import (
 const MaxImportAccounts = 100
 
 func invalidImport() error {
-	return core.NewError("invalid_account_import", "Supply up to 100 accounts with browser cookies or username, password and a valid TOTP secret", 422)
+	return core.NewError("invalid_account_import", "Supply up to 100 accounts with browser cookies and/or username, password and a valid TOTP secret", 422)
 }
 func ParseCSV(reader io.Reader) ([]Credentials, error) {
 	r := csv.NewReader(reader)
@@ -50,6 +50,9 @@ func ParseCSV(reader io.Reader) ([]Credentials, error) {
 			return nil, invalidImport()
 		}
 		c := Credentials{Username: row[columns["User ID / Email Address"]], Password: row[columns["Password"]], TOTPSecret: row[columns["First Secret Question"]]}
+		if column, ok := columns["Cookies"]; ok && strings.TrimSpace(row[column]) != "" {
+			c.Cookies = json.RawMessage(row[column])
+		}
 		if column, ok := columns["Device Profile"]; ok {
 			c.DeviceProfile = row[column]
 		}
@@ -73,15 +76,14 @@ func validateCredentials(accounts []Credentials) ([]Credentials, error) {
 			return nil, invalidDeviceProfile()
 		}
 		if a.Cookies != nil {
-			if a.Username != "" || a.Password != "" || a.TOTPSecret != "" {
-				return nil, invalidImport()
-			}
-			_, id, err := cookieAuthorization(a.Cookies)
+			_, id, err := cookieSession(a.Cookies, a.Password != "")
 			if err != nil || seen["cookie:"+id] {
 				return nil, invalidImport()
 			}
 			seen["cookie:"+id] = true
-			continue
+			if a.Username == "" && a.Password == "" && a.TOTPSecret == "" {
+				continue
+			}
 		}
 		key := strings.ToLower(a.Username)
 		if a.Username == "" || len(a.Username) > 254 || a.Password == "" || len(a.Password) > 1024 || len(a.TOTPSecret) > 2048 || seen[key] || strings.ContainsAny(a.Username, "\r\n\x00") {
@@ -197,12 +199,31 @@ func (m *AccountManager) Import(ctx context.Context, credentials []Credentials) 
 		row := ImportResult{Row: n + 1}
 		id := known[strings.ToLower(c.Username)]
 		if c.Cookies != nil {
-			_, userID, _ := cookieAuthorization(c.Cookies)
+			_, userID, _ := cookieSession(c.Cookies, true)
 			id = knownIDs[userID]
 		}
 		if id != "" {
-			row.AccountID = id
-			row.Status = "duplicate"
+			row.AccountID, row.Status = id, "duplicate"
+			if c.Password != "" {
+				// Account administration may attach/replace backup credentials
+				// without disturbing the working session or reviving a dead row.
+				for _, a := range existing {
+					if a.ID == id {
+						backup := c.backup(a.UserID)
+						if a.Login != nil && *a.Login == *backup {
+							break
+						}
+						if err := m.store.SetLogin(ctx, id, backup); err != nil {
+							return results, err
+						}
+						m.pool.mu.Lock()
+						m.pool.byID[IdentityPrefix+id].login = backup
+						m.pool.mu.Unlock()
+						row.Status = "updated"
+						break
+					}
+				}
+			}
 			results = append(results, row)
 			continue
 		}
@@ -239,11 +260,7 @@ func (m *AccountManager) Import(ctx context.Context, credentials []Credentials) 
 			continue
 		}
 		loginCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-		authenticate := m.login
-		if c.Cookies != nil {
-			authenticate = loginCookies
-		}
-		session, err := authenticate(loginCtx, client, m.pool.apiOrigin, c)
+		session, usedCookies, err := authenticateAccount(loginCtx, client, m.pool.apiOrigin, c, m.login)
 		cancel()
 		client.CloseIdleConnections()
 		if err != nil {
@@ -262,7 +279,11 @@ func (m *AccountManager) Import(ctx context.Context, credentials []Credentials) 
 			}
 			continue
 		}
-		account := storedAccount{accountConfig: accountConfig{ID: core.NewID(), Cookies: c.Cookies, Authorization: session.Authorization, ProxyURL: &selected, Device: session.Device}, Username: strings.ToLower(session.Username), UserID: session.UserID, IP: ip}
+		var cookies json.RawMessage
+		if usedCookies {
+			cookies = c.Cookies
+		}
+		account := storedAccount{accountConfig: accountConfig{ID: core.NewID(), Login: c.backup(session.UserID), Cookies: cookies, Authorization: session.Authorization, ProxyURL: &selected, Device: session.Device}, Username: strings.ToLower(session.Username), UserID: session.UserID, IP: ip}
 		inserted, err := m.store.Insert(ctx, account)
 		if err != nil {
 			return results, err
@@ -276,9 +297,12 @@ func (m *AccountManager) Import(ctx context.Context, credentials []Credentials) 
 			row.Status = "imported"
 			row.AccountID = account.ID
 			counts[selected]++
-			known[strings.ToLower(c.Username)] = account.ID
+			if c.Username != "" {
+				known[strings.ToLower(c.Username)] = account.ID
+			}
 			known[account.Username] = account.ID
 			knownIDs[account.UserID] = account.ID
+			existing = append(existing, account)
 		}
 		results = append(results, row)
 	}

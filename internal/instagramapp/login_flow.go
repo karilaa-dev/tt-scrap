@@ -271,6 +271,14 @@ func login(ctx context.Context, client *http.Client, origin string, c Credential
 	if e != nil {
 		return loginResult{}, e
 	}
+	if c.device != nil {
+		if e = c.device.validate(); e != nil {
+			return loginResult{}, e
+		}
+		device := *c.device
+		s.identity = &device
+		s.guid, s.phone, s.device = device.DeviceID, device.FamilyID, device.AndroidID
+	}
 	if origin == "https://i.instagram.com" {
 		base, ok := client.Transport.(*http.Transport)
 		if !ok {
