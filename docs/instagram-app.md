@@ -64,9 +64,48 @@ Each account gets at most one password submission and one TOTP submission. The l
 
 `GET /v1/instagram/accounts` returns `active_limit` and accounts in oldest-first order, with `id`, optional `username`, optional `egress_ip`, and `state` (`active`, `reserve`, or `dead`) and `device_profile`. Active accounts can temporarily be cooling down or busy. Neither endpoint exposes authorization tokens, passwords, TOTP seeds or proxy credentials. Account management remains available with no ready Instagram account, allowing an empty service to be provisioned.
 
+## Session continuity
+
+Password login, session verification, and metadata requests retain account-scoped,
+server-issued cookies plus MID, WWW claim, and RUR. The private `session_state`
+JSONB column stores this context alongside the authorization and device. Private
+session files use the same `session_state` field; manifests inherit it from
+`session_file`. Cookie domains, paths, secure flags, and absolute expiry survive
+restart. A restart does not extend a cookie's lifetime.
+
+Metadata checkpoints changed context before returning. Failed checkpoints return
+a database error and leave the in-memory change available for a later checkpoint.
+Renewal replaces the entire context; late responses from the old session cannot
+overwrite it. No session jar or MID/WWW claim/RUR headers are sent to CDN hosts.
+Only the two Instagram API origins receive this state. The public account API
+does not expose it.
+
+This preserves ancillary session context; it does not rotate authorization,
+extend imported browser-session expiry, solve challenges, or reproduce hardware
+attestation. Cookie imports still derive authorization from the provided
+`sessionid` and `ds_user_id` and then collect mobile API response state.
+
+Login, verification, and metadata use the same Android TLS/HTTP/2 profile on
+the account's fixed proxy. CDN transfers keep their ordinary transport without
+the account's session context. A closed or draining HTTP/2 connection is replaced
+for a later request; a failed password/TOTP submission is never replayed by the
+transport. The profile comes from the existing Pixel 7 capture and is not a claim
+of complete phone emulation.
+
+The implementation follows the session-continuity behavior visible in
+[instagram-private-api's request handling](https://github.com/dilame/instagram-private-api/blob/master/src/core/request.ts)
+and [Instagrapi's saved settings](https://github.com/subzeroid/instagrapi/blob/master/instagrapi/mixins/auth.py).
+Transport continuity is also documented in
+[Instagrapi's private HTTP/2 transport](https://github.com/subzeroid/instagrapi/blob/master/docs/usage-guide/interactions.md).
+These projects do not establish that preserving this state prevents detection.
+[Instaloader's rate guidance](https://instaloader.github.io/troubleshooting.html)
+also cautions that simultaneous clients and restarts can invalidate workload
+accounting. This patch does not yet implement durable rolling request budgets or
+aggregate traffic from accounts sharing one proxy.
+
 ## Database and legacy measurements
 
-Startup creates `scrap_instagram_accounts` and `scrap_instagram_attempts` in `DB_SCHEMA`. The existing schema ownership lock still permits only one service instance. Account records contain `ordinal`, `username`, `user_id`, nullable `android_authorization`, `proxy_url`, `egress_ip`, `dead`, `dead_reason`, `dead_at`, `created_at`, and nullable JSONB columns `device`, `cookies`, and `login_credentials`. Cookie-authenticated accounts keep `android_authorization` NULL. Password/TOTP backups, session data, and proxy fields are sensitive; restrict access to the database and its backups. Older releases cannot load cookie-only rows.
+Startup creates `scrap_instagram_accounts` and `scrap_instagram_attempts` in `DB_SCHEMA`. The existing schema ownership lock still permits only one service instance. Account records contain `ordinal`, `username`, `user_id`, nullable `android_authorization`, `proxy_url`, `egress_ip`, `dead`, `dead_reason`, `dead_at`, `created_at`, nullable `cooldown_until`, and nullable JSONB columns `device`, `cookies`, `login_credentials`, and `session_state`. Cookie-authenticated accounts keep `android_authorization` NULL. Password/TOTP backups, session data, and proxy fields are sensitive; restrict access to the database and its backups. Older releases cannot load cookie-only rows or retain the new context updates.
 
 **`scrap_instagram_attempts.legacy_used` is true for every legacy method invocation**, whether selected directly or reached through fallback, including failed legacy invocations. An app attempt has `legacy_used=false`. Fallback produces two rows: the failed app attempt and the legacy attempt. This is upstream method-attempt history, not per-caller or per-download history: cache hits and callers sharing in-flight work add no rows. Each row records `source_id`, `created_at`, `finished_at`, nullable `succeeded`, and safe `error_code`. A null outcome means an interrupted or unrecorded completion, not success. No upstream URLs, credentials, or response bodies are stored.
 
@@ -131,11 +170,21 @@ Metadata capacity is the number of active healthy accounts, capped by `INSTAGRAM
 
 `INSTAGRAM_MAX_ATTEMPTS` bounds metadata attempts across distinct eligible accounts; a request does not reuse an account it already tried (apart from one metadata retry after successful session renewal). Bare HTTP 401/403 responses, unknown API failures, network errors, incomplete/malformed responses and upstream outages retry another eligible account without marking the failed account dead or triggering password login. Known unavailable/deleted media stops without an account penalty.
 
-Account/session failures and rate limits affect the relevant account instead of changing its proxy. Explicit challenge/checkpoint or account restriction responses mark the account dead. Explicit `login_required`/`session_expired` responses first attempt saved password recovery when available; an unrecoverable session is marked dead.
+Account/session failures and rate limits affect the relevant account instead of changing its proxy. Explicit challenge/checkpoint, `feedback_required`, or account restriction responses freeze the account (reported as `dead`) and end the current metadata operation without trying another account. They do not trigger password recovery. The same rule applies when session renewal encounters one of these responses. Resolve the restriction through Instagram, then import a verified replacement session before using the account again. Later independent requests can still use healthy accounts. Explicit `login_required`/`session_expired` responses first attempt saved password recovery when available; an unrecoverable session is marked dead.
 
-New death records store a specific safe reason such as `challenge_required`, `account_restricted`, `session_expired`, or `login_rejected`, never the raw upstream response. Existing dead records retain their status until a verified replacement session is imported. Duplicate imports do not revive dead accounts. Death writes are completed before replacement admission; if persistence fails, metadata admission pauses while retaining the pending update for the next request to retry. Shutdown also attempts to flush pending death writes.
+New death records store a specific safe reason such as `challenge_required`, `feedback_required`, `account_restricted`, `session_expired`, or `login_rejected`, never the raw upstream response. Existing dead records retain their status until a verified replacement session is imported. Duplicate imports do not revive dead accounts. Death writes are completed before replacement admission; if persistence fails, metadata admission pauses while retaining the pending update for the next request to retry. Shutdown also attempts to flush pending death writes.
 
-Temporary upstream failures and rate limits allow bounded retries on available accounts. HTTP 429 respects `Retry-After`; absent a usable value, the account cools down for one minute. Cooldowns are capped at 24 hours.
+Temporary upstream failures and rate limits allow bounded retries on available accounts. Metadata, login, and session verification retain `Retry-After`, including HTTP dates and delays longer than 24 hours. Recognized throttle payloads honor this header even when returned with HTTP 200 or 400. Missing or invalid delays default to one minute; values too large for a Go duration saturate instead of overflowing or causing an early retry. Concurrent responses cannot shorten a deadline.
+
+A complete, explicit challenge/feedback/restriction response takes precedence over generic throttling, including HTTP 429 or incidental "please wait" text. When the response also carries a retry deadline, the account retains both its restriction and its cooldown. Malformed or truncated HTTP 429 bodies still apply the header's deadline, without guessing that the account requires verification.
+
+Cooldowns are absolute deadlines saved in PostgreSQL and restored before account admission. Failed health writes remain pending and block new metadata admission until saved; already issued CDN transfers remain available. A restart or session replacement does not clear a cooldown, and replacement-cookie verification waits until that deadline has passed. Password-backup updates that make no upstream requests can still proceed. Expired cooldowns become eligible normally without a cleanup job. The nullable column is added automatically; older binaries ignore it on rollback, so they do not preserve these admission guarantees.
+
+Caller cancellation stops request work but does not discard an already observed restriction or cooldown. Recording that health may wait for an in-progress renewal's bounded timeout before its own five-second persistence budget. A renewal waiter rechecks the current session's health before reusing it, and late authentication failures from replaced sessions cannot disable their replacement. Throttle deadlines still apply to the account even when the response used a replaced session.
+
+Account imports stop the remaining batch after a challenge, feedback restriction, or account restriction, returning `batch_verification_required` for unattempted rows. A rate limit instead returns `batch_rate_limited` for unattempted rows. Check the failed account before starting another batch.
+
+Disabling an account or extending its cooldown emits a warning with its account ID and a fixed reason code. Cooldown warnings include the deadline. These events contain no credentials, usernames, proxy addresses, or raw upstream responses.
 
 Downloads use the account route recorded by extraction, with no Android bearer token or app headers sent to the CDN. A download batch shares one CDN slot on its pinned account across its media and parallel range requests. Metadata and CDN work share the bounded waiting queue but have independent active limits; neither rotates the account’s route. The existing global download, memory, and parallel-range limits still apply.
 

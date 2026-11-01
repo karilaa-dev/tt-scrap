@@ -28,7 +28,7 @@ func TestLiveInstagramExtractionDownload(t *testing.T) {
 	cfg.InstagramAccountsDir = os.Getenv("INSTAGRAM_ACCOUNTS_DIR")
 	cfg.TempDir = t.TempDir()
 	cfg.DownloadTimeout = 90 * time.Second
-	pool, err := instagramapp.Open(instagramapp.Options{AccountsFile: cfg.InstagramAccountsFile, AccountsDir: cfg.InstagramAccountsDir, PerAccountConcurrency: 1, MaxQueuedRequests: 16, Timeout: 20 * time.Second, MaxAttempts: 2, RetryDelay: time.Second, HTTPMaxConnections: 16})
+	pool, err := instagramapp.Open(instagramapp.Options{AccountsFile: cfg.InstagramAccountsFile, AccountsDir: cfg.InstagramAccountsDir, PerAccountConcurrency: 1, MaxQueuedRequests: 16, Timeout: 20 * time.Second, MaxAttempts: 1, HTTPMaxConnections: 16})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,6 +51,9 @@ func TestLiveInstagramExtractionDownload(t *testing.T) {
 		{"De50be8t8Ln", "image", 1},
 		{carouselCode, "carousel", 0},
 	} {
+		if kind := os.Getenv("TT_SCRAP_LIVE_INSTAGRAM_KIND"); kind != "" && kind != test.kind {
+			continue
+		}
 		t.Run(test.kind, func(t *testing.T) {
 			post, err := service.ExtractURL(ctx, "https://www.instagram.com/p/"+test.code+"/", true)
 			if err != nil {
@@ -92,5 +95,8 @@ func TestLiveInstagramExtractionDownload(t *testing.T) {
 			}
 			t.Logf("accounts=%d kind=%s assets=%d bytes=%d metadata_dimensions=%t likes_present=%t", pool.Count(), test.kind, len(post.Media), total, post.Width != nil && post.Height != nil, post.Likes != nil)
 		})
+		if t.Failed() {
+			return // Do not continue a live batch after any upstream failure.
+		}
 	}
 }

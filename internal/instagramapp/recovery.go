@@ -81,8 +81,12 @@ func (s *Store) SaveSession(ctx context.Context, id, userID string, session logi
 	if err != nil {
 		return err
 	}
+	state, err := storedSessionJSON(session.Session)
+	if err != nil {
+		return err
+	}
 	return s.withDB(ctx, func(ctx context.Context, db *pgx.Conn) error {
-		tag, err := db.Exec(ctx, `UPDATE `+s.accounts+` SET android_authorization=$3,cookies=NULL,device=$4 WHERE id=$1 AND user_id=$2 AND NOT dead`, id, userID, session.Authorization, device)
+		tag, err := db.Exec(ctx, `UPDATE `+s.accounts+` SET android_authorization=$3,cookies=NULL,device=$4,session_state=$5 WHERE id=$1 AND user_id=$2 AND NOT dead`, id, userID, session.Authorization, device, state)
 		if err == nil && tag.RowsAffected() != 1 {
 			return errors.New("missing Instagram account")
 		}
@@ -96,14 +100,23 @@ func (p *Pool) session(a *account) (string, *DeviceIdentity) {
 	return a.authorization, a.device
 }
 
+func (p *Pool) sessionContext(a *account) (string, *DeviceIdentity, *sessionContext) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return a.authorization, a.device, a.sessionState
+}
+
 func (p *Pool) lookupRecovering(ctx context.Context, a *account, mediaID string) (data map[string]any, state disposition, err error) {
-	auth, device := p.session(a)
+	auth, device, sessionState := p.sessionContext(a)
 	// Tag the final outcome with the session used by that request, including
 	// the retry after renewal, so late failures cannot disable its replacement.
 	defer func() { state.authorization = auth }()
 	state, err = disposition{renew: true, disable: true, retry: true, deadReason: "session_expired"}, loginFailure("session_expired")
+	if blocked := p.accountUnavailable(a); blocked != nil {
+		return nil, recoveryDisposition(blocked), blocked
+	}
 	if auth != "" {
-		data, state, err = p.lookup(ctx, a, mediaID, auth, device)
+		data, state, err = p.lookup(ctx, a, mediaID, auth, device, sessionState)
 	}
 	p.mu.Lock()
 	canRenew := a.login != nil
@@ -112,18 +125,53 @@ func (p *Pool) lookupRecovering(ctx context.Context, a *account, mediaID string)
 		return data, state, err
 	}
 	if err = p.renew(ctx, a, auth); err != nil {
-		state = disposition{retry: true, cooldown: time.Minute}
-		switch errorCode(err) {
-		case "session_expired", "account_mismatch", "login_rejected", "unsupported_two_factor", "challenge_required", "account_restricted":
-			state = disposition{retry: true, disable: true, deadReason: errorCode(err)}
+		// A cancellation before receiving an upstream outcome establishes no
+		// health state. A received restriction remains evidence after cancellation.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, disposition{}, err
 		}
-		if ctx.Err() != nil {
-			return nil, disposition{}, ctx.Err()
-		}
-		return nil, state, err
+		return nil, recoveryDisposition(err), err
 	}
-	auth, device = p.session(a)
-	return p.lookup(ctx, a, mediaID, auth, device)
+	auth, device, sessionState = p.sessionContext(a)
+	if blocked := p.accountUnavailable(a); blocked != nil {
+		return nil, recoveryDisposition(blocked), blocked
+	}
+	return p.lookup(ctx, a, mediaID, auth, device, sessionState)
+}
+
+func recoveryDisposition(err error) disposition {
+	delay := failureCooldown(err)
+	if delay <= 0 {
+		delay = time.Minute
+	}
+	state := disposition{retry: true, cooldown: delay}
+	switch errorCode(err) {
+	case "session_expired", "account_mismatch", "login_rejected", "unsupported_two_factor":
+		state = disposition{retry: true, disable: true, deadReason: errorCode(err)}
+	case "challenge_required", "feedback_required", "account_restricted":
+		state = disposition{disable: true, deadReason: errorCode(err), cooldown: failureCooldown(err)}
+	}
+	return state
+}
+
+func (p *Pool) accountUnavailable(a *account) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return accountUnavailableLocked(a)
+}
+
+func accountUnavailableLocked(a *account) error {
+	if a.disabled {
+		reason := a.deadReason
+		if reason == "" {
+			reason = "session_expired"
+		}
+		return loginFailure(reason)
+	}
+	if remaining := time.Until(a.cooldown); remaining > 0 {
+		return rateLimitFailure(remaining)
+	}
+	return nil
 }
 
 // One login per rejected session, even with concurrent metadata requests. Waiters
@@ -137,12 +185,16 @@ func (p *Pool) renew(ctx context.Context, a *account, rejected string) error {
 		return ctx.Err()
 	}
 	p.mu.Lock()
-	auth, backup, device, disabled := a.authorization, a.login, a.device, a.disabled
+	auth, backup, device := a.authorization, a.login, a.device
+	blocked := accountUnavailableLocked(a)
 	p.mu.Unlock()
+	if blocked != nil {
+		return blocked
+	}
 	if auth != rejected {
 		return nil
 	}
-	if disabled || backup == nil {
+	if backup == nil {
 		return loginFailure("session_expired")
 	}
 	if time.Now().Before(a.refreshAfter) {
@@ -155,16 +207,22 @@ func (p *Pool) renew(ctx context.Context, a *account, rejected string) error {
 	if err == nil && (session.UserID != backup.UserID || !validAuthorization(session.Authorization)) {
 		err = loginFailure("account_mismatch")
 	}
+	var nextState *sessionContext
+	if err == nil {
+		nextState, err = newSessionContext(session.Session, p.apiOrigin)
+	}
 	if err == nil && p.options.Store != nil {
 		err = p.options.Store.SaveSession(loginCtx, strings.TrimPrefix(a.id, IdentityPrefix), backup.UserID, session)
 	}
 	if err == nil {
 		p.mu.Lock()
 		a.authorization, a.device = session.Authorization, session.Device
+		a.sessionState = nextState
+		a.sessionSaved = jsonText(nextState.Snapshot())
 		p.mu.Unlock()
 	}
-	if ctx.Err() == nil {
-		a.refreshAfter = time.Now().Add(time.Minute)
+	if ctx.Err() == nil || (err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) {
+		a.refreshAfter = time.Now().Add(max(time.Minute, failureCooldown(err)))
 		a.refreshErr = err
 		if err == nil {
 			a.refreshErr = loginFailure("session_expired")

@@ -56,6 +56,7 @@ func TestCombinedCredentialsAndCookiePriority(t *testing.T) {
 		{"server_error", 503, `{}`, false, false, "session_check_failed"},
 		{"server_error_with_challenge_body", 503, `{"challenge_required":true}`, false, false, "session_check_failed"},
 		{"challenge", 401, `{"challenge_required":true}`, false, false, "challenge_required"},
+		{"feedback", 403, `{"message":"feedback_required"}`, false, false, "feedback_required"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := combinedFixture()
@@ -342,6 +343,10 @@ func TestRecoveryFailureHandling(t *testing.T) {
 		{"rate_limit", 429, `{}`, "", "123", 0, false},
 		{"server_error", 503, `{}`, "", "123", 0, false},
 		{"challenge", 400, `{"challenge_required":true}`, "", "123", 0, true},
+		{"feedback", 403, `{"message":"feedback_required"}`, "", "123", 0, true},
+		{"login_challenge", 401, `{"message":"login_required"}`, "challenge_required", "", 1, true},
+		{"login_feedback", 401, `{"message":"login_required"}`, "feedback_required", "", 1, true},
+		{"login_restriction", 401, `{"message":"login_required"}`, "account_restricted", "", 1, true},
 		{"bad_password", 401, `{"message":"login_required"}`, "login_rejected", "", 1, true},
 		{"login_throttled", 401, `{"message":"login_required"}`, "upstream_rate_limited", "", 1, false},
 		{"login_network_failure", 401, `{"message":"login_required"}`, "upstream_network_error", "", 1, false},
@@ -429,11 +434,15 @@ func TestLoginBootstrapOutageKeepsRecoveryAccountHealthy(t *testing.T) {
 				t.Fatal("bootstrap outage disabled the account instead of cooling down")
 			}
 			rows, err := store.Load(ctx)
-			if err != nil || !reflect.DeepEqual(rows, before) {
-				t.Fatal("bootstrap outage changed saved credentials or dead state", err)
+			if err != nil || len(rows) != 1 || time.Until(rows[0].CooldownUntil) < 50*time.Second {
+				t.Fatal("bootstrap outage lost durable cooldown", err)
+			}
+			rows[0].CooldownUntil = before[0].CooldownUntil
+			if !reflect.DeepEqual(rows, before) {
+				t.Fatal("bootstrap outage changed saved credentials or dead state")
 			}
 			auth, _ := p.session(a)
-			if err = p.renew(ctx, a, auth); errorCode(err) != "upstream_server_error" || bootstrapCalls.Load() != 1 {
+			if err = p.renew(ctx, a, auth); errorCode(err) != "upstream_rate_limited" || bootstrapCalls.Load() != 1 {
 				t.Fatal("bootstrap outage retried during cooldown", err)
 			}
 		})
@@ -551,6 +560,35 @@ func TestCookieRejectionAtImportSavesVerifiedPasswordSession(t *testing.T) {
 				}
 			} else if results[0].Status != "imported" || len(rows) != 1 || rows[0].Cookies != nil || rows[0].Authorization != "Bearer IGT:2:password-session" || rows[0].Login == nil {
 				t.Fatal("fallback persisted rejected cookies or lost backup")
+			}
+		})
+	}
+}
+
+func TestRecoveryRestrictionDoesNotTryAnotherAccount(t *testing.T) {
+	for _, code := range []string{"challenge_required", "feedback_required", "account_restricted"} {
+		t.Run(code, func(t *testing.T) {
+			p := newTestPool(t, 2, 1)
+			p.accounts[0].login = combinedFixture().backup("123")
+			var metadata, logins atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				metadata.Add(1)
+				if r.Header.Get("Authorization") != "Bearer IGT:2:a" {
+					t.Error("renewal restriction retried another account")
+				}
+				w.WriteHeader(http.StatusUnauthorized)
+				fmt.Fprint(w, `{"message":"login_required"}`)
+			}))
+			defer server.Close()
+			p.apiOrigin = server.URL
+			p.login = func(context.Context, *http.Client, string, Credentials) (loginResult, error) {
+				logins.Add(1)
+				return loginResult{}, loginFailure(code)
+			}
+			_, err := p.Detail(context.Background(), "123")
+			assertCode(t, err, code)
+			if metadata.Load() != 1 || logins.Load() != 1 || !p.accounts[0].disabled || p.accounts[1].disabled {
+				t.Fatal("renewal restriction did not freeze just the failed account")
 			}
 		})
 	}

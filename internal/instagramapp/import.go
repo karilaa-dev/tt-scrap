@@ -178,7 +178,7 @@ func (m *AccountManager) Import(ctx context.Context, credentials []Credentials) 
 	knownIDs := map[string]string{}
 	counts := map[string]int{}
 	for _, a := range existing {
-		if err := m.pool.addAccount(a.accountConfig, a.Dead, a.Username, a.IP); err != nil {
+		if err := m.pool.addStoredAccount(a); err != nil {
 			return nil, err
 		}
 		knownIDs[a.UserID] = a.ID
@@ -292,7 +292,7 @@ func (m *AccountManager) Import(ctx context.Context, credentials []Credentials) 
 		if usedCookies {
 			cookies = c.Cookies
 		}
-		account := storedAccount{accountConfig: accountConfig{ID: core.NewID(), Login: c.backup(session.UserID), Cookies: cookies, Authorization: session.Authorization, ProxyURL: &selected, Device: session.Device}, Username: strings.ToLower(session.Username), UserID: session.UserID, IP: ip}
+		account := storedAccount{accountConfig: accountConfig{ID: core.NewID(), Login: c.backup(session.UserID), Cookies: cookies, Authorization: session.Authorization, ProxyURL: &selected, Device: session.Device, Session: session.Session}, Username: strings.ToLower(session.Username), UserID: session.UserID, IP: ip}
 		inserted, err := m.store.Insert(ctx, account)
 		if err != nil {
 			return results, err
@@ -324,11 +324,17 @@ func appendImportFailure(results []ImportResult, row ImportResult, total int, er
 		row.ErrorCode = "login_failed"
 	}
 	results = append(results, row)
-	stop := row.ErrorCode == "upstream_rate_limited"
-	if stop {
+	skippedCode := ""
+	switch row.ErrorCode {
+	case "upstream_rate_limited":
+		skippedCode = "batch_rate_limited"
+	case "challenge_required", "feedback_required", "account_restricted":
+		skippedCode = "batch_verification_required"
+	}
+	if skippedCode != "" {
 		for rest := row.Row + 1; rest <= total; rest++ {
-			results = append(results, ImportResult{Row: rest, Status: "skipped", ErrorCode: "batch_rate_limited"})
+			results = append(results, ImportResult{Row: rest, Status: "skipped", ErrorCode: skippedCode})
 		}
 	}
-	return results, stop
+	return results, skippedCode != ""
 }

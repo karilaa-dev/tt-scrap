@@ -24,6 +24,7 @@ type accountConfig struct {
 	SessionFile   string               `json:"session_file"`
 	ProxyURL      *string              `json:"proxy_url"`
 	Device        *DeviceIdentity      `json:"device,omitempty"`
+	Session       *SessionState        `json:"session_state,omitempty"`
 }
 
 func readPrivateJSON(path string, out any) error {
@@ -65,6 +66,9 @@ func loadAccounts(options Options) ([]accountConfig, error) {
 					return nil, errors.New("account must use authorization or session_file, not both")
 				}
 				entry.Authorization = session.Authorization
+				if entry.Session == nil {
+					entry.Session = session.Session
+				}
 				if entry.Device == nil {
 					entry.Device = session.Device
 				}

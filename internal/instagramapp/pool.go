@@ -43,24 +43,27 @@ type account struct {
 	busy          int
 	mediaBusy     int
 	disabled      bool
+	deadReason    string
 	cooldown      time.Time
 	username, ip  string
 	device        *DeviceIdentity
+	sessionState  *sessionContext
+	sessionSaved  string
 }
 
 type Pool struct {
-	login         passwordLogin
-	options       Options
-	mu            sync.Mutex
-	accounts      []*account
-	byID          map[string]*account
-	next          int
-	queued        int
-	pendingDeaths int
-	updating      int
-	changed       chan struct{}
-	closed        bool
-	apiOrigin     string
+	login               passwordLogin
+	options             Options
+	mu                  sync.Mutex
+	accounts            []*account
+	byID                map[string]*account
+	next                int
+	queued              int
+	pendingHealthWrites int
+	updating            int
+	changed             chan struct{}
+	closed              bool
+	apiOrigin           string
 }
 
 func Open(options Options) (*Pool, error) {
@@ -101,7 +104,7 @@ func Open(options Options) (*Pool, error) {
 			return nil, e
 		}
 		for _, a := range saved {
-			if err = p.addAccount(a.accountConfig, a.Dead, a.Username, a.IP); err != nil {
+			if err = p.addStoredAccount(a); err != nil {
 				p.Close()
 				return nil, err
 			}
@@ -118,6 +121,11 @@ func Open(options Options) (*Pool, error) {
 }
 
 func (p *Pool) addAccount(config accountConfig, dead bool, username, ip string) error {
+	return p.addStoredAccount(storedAccount{accountConfig: config, Dead: dead, Username: username, IP: ip})
+}
+
+func (p *Pool) addStoredAccount(saved storedAccount) error {
+	config, dead := saved.accountConfig, saved.Dead
 	if config.Cookies != nil {
 		if config.Authorization != "" {
 			return errors.New("invalid stored Instagram account")
@@ -127,6 +135,9 @@ func (p *Pool) addAccount(config accountConfig, dead bool, username, ip string) 
 			// An expired saved session must not prevent the other accounts from loading.
 			if config.Login == nil {
 				dead = true
+				if saved.DeadReason == "" {
+					saved.DeadReason = "session_expired"
+				}
 			}
 		} else {
 			config.Authorization = auth
@@ -136,6 +147,10 @@ func (p *Pool) addAccount(config accountConfig, dead bool, username, ip string) 
 		return errors.New("invalid stored Instagram account")
 	}
 	if err := config.Device.validate(); err != nil {
+		return err
+	}
+	sessionState, err := newSessionContext(config.Session, p.apiOrigin)
+	if err != nil {
 		return err
 	}
 
@@ -148,7 +163,7 @@ func (p *Pool) addAccount(config accountConfig, dead bool, username, ip string) 
 		return errors.New("invalid Instagram account proxy configuration")
 	}
 	// Metadata never follows redirects: bearer credentials remain at the API origin.
-	metadata := &http.Client{Transport: transport, Timeout: p.options.Timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	metadata := &http.Client{Transport: newAPITransport(transport), Timeout: p.options.Timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	media := &http.Client{Transport: transport, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 10 {
 			return errors.New("media redirect limit exceeded for Instagram")
@@ -159,7 +174,8 @@ func (p *Pool) addAccount(config accountConfig, dead bool, username, ip string) 
 		stripCredentials(req.Header)
 		return nil
 	}}
-	a := &account{login: config.Login, refreshGate: make(chan struct{}, 1), id: IdentityPrefix + config.ID, authorization: config.Authorization, client: metadata, mediaClient: media}
+	a := &account{login: config.Login, refreshGate: make(chan struct{}, 1), id: IdentityPrefix + config.ID, authorization: config.Authorization, client: metadata, mediaClient: media, sessionState: sessionState}
+	a.sessionSaved = jsonText(sessionState.Snapshot())
 	if config.Device != nil {
 		device := *config.Device
 		a.device = &device
@@ -175,8 +191,10 @@ func (p *Pool) addAccount(config accountConfig, dead bool, username, ip string) 
 		return nil
 	}
 	a.disabled = dead
-	a.username = username
-	a.ip = ip
+	a.deadReason = saved.DeadReason
+	a.cooldown = saved.CooldownUntil
+	a.username = saved.Username
+	a.ip = saved.IP
 	p.accounts = append(p.accounts, a)
 	p.byID[a.id] = a
 	p.notify()
@@ -189,7 +207,7 @@ func (p *Pool) Count() int { p.mu.Lock(); defer p.mu.Unlock(); return len(p.acco
 func (p *Pool) Ready() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed || p.pendingDeaths > 0 || (p.options.Store != nil && p.options.Store.dirty.Load()) {
+	if p.closed || p.pendingHealthWrites > 0 || (p.options.Store != nil && p.options.Store.dirty.Load()) {
 		return false
 	}
 	for _, a := range p.accounts {
@@ -238,7 +256,7 @@ func (p *Pool) acquire(ctx context.Context, pinned string, avoid map[string]bool
 		if p.closed {
 			return nil, nil, core.NewError("service_not_configured", "Instagram account pool is closed", 503)
 		}
-		if pinned == "" && (p.pendingDeaths > 0 || (p.options.Store != nil && p.options.Store.dirty.Load())) {
+		if pinned == "" && (p.pendingHealthWrites > 0 || (p.options.Store != nil && p.options.Store.dirty.Load())) {
 			return nil, nil, dbFailure()
 		}
 		if len(p.accounts) == 0 {
@@ -332,7 +350,7 @@ func (p *Pool) acquire(ctx context.Context, pinned string, avoid map[string]bool
 func stripCredentials(h http.Header) {
 	for k := range h {
 		lower := strings.ToLower(k)
-		if lower == "authorization" || lower == "proxy-authorization" || lower == "cookie" || strings.HasPrefix(lower, "x-ig-") || strings.HasPrefix(lower, "ig-") {
+		if lower == "authorization" || lower == "proxy-authorization" || lower == "cookie" || lower == "x-mid" || strings.HasPrefix(lower, "x-ig-") || strings.HasPrefix(lower, "ig-") {
 			delete(h, k)
 		}
 	}

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,7 +21,8 @@ import (
 
 // Pixel 7 / Instagram 452.1.0.53.64, captured on 2026-10-29. These are
 // protocol settings, not device secrets. Each handshake generates fresh keys.
-// Login requires this ClientHello; ordinary metadata/CDN clients stay unchanged.
+// Keep the same private API transport across login and authenticated requests.
+// CDN transfers retain the ordinary transport and receive no account context.
 func loginClientHello() *utls.ClientHelloSpec {
 	return &utls.ClientHelloSpec{
 		TLSVersMin: utls.VersionTLS13, TLSVersMax: utls.VersionTLS13,
@@ -42,12 +44,41 @@ type loginTransport struct {
 	mu   sync.Mutex
 	//lint:ignore SA1019 Keep the verified HTTP/2 wire profile and explicit single-attempt connection API.
 	connections map[string]*http2.ClientConn
-	closed      bool
+	// Connections draining after GOAWAY remain owned until all streams finish.
+	//lint:ignore SA1019 Preserve single-attempt HTTP/2 connection ownership.
+	retired map[*http2.ClientConn]struct{}
+	closed  bool
 }
 
 func newLoginTransport(base *http.Transport) *loginTransport {
 	//lint:ignore SA1019 Keep the verified HTTP/2 wire profile and explicit single-attempt connection API.
-	return &loginTransport{base: base, connections: make(map[string]*http2.ClientConn)}
+	return &loginTransport{base: base, connections: make(map[string]*http2.ClientConn), retired: make(map[*http2.ClientConn]struct{})}
+}
+
+// apiTransport uses the account's Android transport only for the two fixed
+// private API origins. Fixtures, public URLs and CDN transfers use base.
+type apiTransport struct {
+	base   *http.Transport
+	mobile *loginTransport
+}
+
+func newAPITransport(base *http.Transport) *apiTransport {
+	return &apiTransport{base: base, mobile: newLoginTransport(base)}
+}
+
+func (t *apiTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req != nil && req.URL != nil && req.URL.Scheme == "https" && req.URL.User == nil && (req.URL.Port() == "" || req.URL.Port() == "443") {
+		host := strings.ToLower(req.URL.Hostname())
+		if host == "i.instagram.com" || host == "b.i.instagram.com" {
+			return t.mobile.RoundTrip(req)
+		}
+	}
+	return t.base.RoundTrip(req)
+}
+
+func (t *apiTransport) CloseIdleConnections() {
+	t.mobile.CloseIdleConnections()
+	t.base.CloseIdleConnections()
 }
 
 func (t *loginTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -65,6 +96,18 @@ func (t *loginTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, errors.New("login transport closed")
 	}
 	conn := t.connections[address]
+	for old := range t.retired {
+		if old.State().Closed {
+			delete(t.retired, old)
+		}
+	}
+	if conn != nil {
+		state := conn.State()
+		if state.Closed || state.Closing {
+			t.retireLocked(address, conn)
+			conn = nil
+		}
+	}
 	if conn == nil {
 		wire, err := t.dial(req.Context(), req.URL, address)
 		if err != nil {
@@ -72,7 +115,7 @@ func (t *loginTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return nil, err
 		}
 		//lint:ignore SA1019 Keep the verified HTTP/2 wire profile; ClientConn.RoundTrip never retries credential POSTs.
-		conn, err = (&http2.Transport{}).NewClientConn(wire)
+		conn, err = (&http2.Transport{StrictMaxConcurrentStreams: true}).NewClientConn(wire)
 		if err != nil {
 			wire.Close()
 			t.mu.Unlock()
@@ -83,7 +126,32 @@ func (t *loginTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.mu.Unlock()
 	// ClientConn sends once. Transport.RoundTrip's retry loop must not replay a
 	// password or TOTP POST after a lost connection / REFUSED_STREAM / GOAWAY.
-	return conn.RoundTrip(req)
+	response, err := conn.RoundTrip(req)
+	if err != nil {
+		t.mu.Lock()
+		state := conn.State()
+		if state.Closed || state.Closing {
+			t.retireLocked(address, conn)
+		}
+		t.mu.Unlock()
+	}
+	return response, err
+}
+
+// Do not close a draining connection while another request still owns a stream.
+// Its GOAWAY/close handling will finish it; transport shutdown also owns it.
+//
+//lint:ignore SA1019 Preserve single-attempt HTTP/2 connection ownership.
+func (t *loginTransport) retireLocked(address string, conn *http2.ClientConn) {
+	if t.connections[address] == conn {
+		delete(t.connections, address)
+	}
+	state := conn.State()
+	if state.StreamsActive == 0 && state.StreamsPending == 0 && state.StreamsReserved == 0 {
+		_ = conn.Close()
+	} else if !state.Closed {
+		t.retired[conn] = struct{}{}
+	}
 }
 
 func (t *loginTransport) CloseIdleConnections() {
@@ -93,6 +161,11 @@ func (t *loginTransport) CloseIdleConnections() {
 	for _, conn := range t.connections {
 		_ = conn.Close()
 	}
+	for conn := range t.retired {
+		_ = conn.Close()
+	}
+	clear(t.connections)
+	clear(t.retired)
 }
 
 type contextDialer struct {
