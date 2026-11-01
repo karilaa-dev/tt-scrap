@@ -111,6 +111,9 @@ func (s *loginSession) post(ctx context.Context, origin, path string, form url.V
 		if throttle != nil {
 			return loginResponse{}, throttle
 		}
+		if e != nil && ctx.Err() != nil {
+			return loginResponse{}, ctx.Err()
+		}
 		return loginResponse{}, loginFailure("invalid_login_response")
 	}
 	if throttle != nil && !json.Valid(raw) {

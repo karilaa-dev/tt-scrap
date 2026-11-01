@@ -55,8 +55,12 @@ func TestExpiredRenewalDeadlineBlocksReplacementAfterRestart(t *testing.T) {
 	}
 }
 
-func TestCanceledRenewalVerificationDoesNotInventHealth(t *testing.T) {
-	for _, status := range []int{0, 200, 429} {
+func TestCanceledRenewalResponseDoesNotInventHealth(t *testing.T) {
+	for _, tc := range []struct {
+		post   bool
+		status int
+	}{{false, 0}, {false, 200}, {false, 429}, {true, 0}, {true, 200}, {true, 429}} {
+		status := tc.status
 		store, _ := testStore(t)
 		p, err := Open(Options{Store: store, AccountsFile: newTestPool(t, 1, 1).options.AccountsFile, MaxAttempts: 1})
 		if err != nil {
@@ -83,6 +87,11 @@ func TestCanceledRenewalVerificationDoesNotInventHealth(t *testing.T) {
 			if calls > 1 {
 				return loginResult{}, loginFailure("login_session_not_returned")
 			}
+			if tc.post {
+				s := &loginSession{client: verifyClient}
+				_, err := s.post(ctx, origin, "/api/v1/accounts/login/", nil, nil)
+				return loginResult{}, err
+			}
 			return verifyLogin(ctx, verifyClient, origin, "Bearer IGT:2:candidate", nil)
 		}
 		_, err = p.Detail(ctx, "123")
@@ -99,11 +108,11 @@ func TestCanceledRenewalVerificationDoesNotInventHealth(t *testing.T) {
 			}
 		} else {
 			if !rows[0].CooldownUntil.IsZero() || !a.cooldown.IsZero() || !a.refreshAfter.IsZero() {
-				t.Errorf("status %d: cancellation invented cooldown or cached renewal failure", status)
+				t.Errorf("POST=%t status %d: cancellation invented cooldown or cached renewal failure", tc.post, status)
 			}
 			_ = p.renew(context.Background(), a, a.authorization)
 			if calls != 2 {
-				t.Errorf("status %d: next caller could not retry canceled verification", status)
+				t.Errorf("POST=%t status %d: next caller could not retry canceled response", tc.post, status)
 			}
 		}
 	}
