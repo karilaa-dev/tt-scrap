@@ -24,6 +24,7 @@ func TestLoginHealthClassificationAndRetryDeadlines(t *testing.T) {
 		{"feedback_429", `{"message":"feedback_required"}`, "feedback_required", 429, false},
 		{"restricted_429", `{"error_type":"account_disabled"}`, "account_restricted", 429, false},
 		{"expired_429", `{"message":"login_required"}`, "upstream_rate_limited", 429, false},
+		{"expired_401", `{"message":"login_required"}`, "session_expired", 401, false},
 		{"feedback_with_wait_text", `{"message":"Please wait a few minutes","error_type":"feedback_required"}`, "feedback_required", 400, false},
 		{"challenge_with_rate_text", `{"message":"rate_limit","error_type":"challenge_required"}`, "challenge_required", 400, false},
 		{"api_throttle_400", `{"message":"Please wait a few minutes"}`, "upstream_rate_limited", 400, false},

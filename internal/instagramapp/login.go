@@ -275,6 +275,9 @@ func verifyLogin(ctx context.Context, client *http.Client, origin, auth string, 
 	}
 	res, e := client.Do(req)
 	if e != nil {
+		if ctx.Err() != nil {
+			return loginResult{}, ctx.Err()
+		}
 		return loginResult{}, loginFailure("session_check_failed")
 	}
 	defer res.Body.Close()
@@ -289,6 +292,9 @@ func verifyLogin(ctx context.Context, client *http.Client, origin, auth string, 
 	if e != nil || len(body) > metadataLimit {
 		if throttle != nil {
 			return loginResult{}, throttle
+		}
+		if e != nil && ctx.Err() != nil {
+			return loginResult{}, ctx.Err()
 		}
 		return loginResult{}, loginFailure("session_check_failed")
 	}
@@ -311,7 +317,7 @@ func verifyLogin(ctx context.Context, client *http.Client, origin, auth string, 
 		return loginResult{}, loginThrottle(res.Header)
 	}
 	if health.renew {
-		return loginResult{}, loginFailure("session_expired")
+		return loginResult{}, restrictionDeadline(loginFailure("session_expired"), res.StatusCode, res.Header)
 	}
 	if res.StatusCode != 200 || failureErr != nil {
 		return loginResult{}, loginFailure("session_check_failed")

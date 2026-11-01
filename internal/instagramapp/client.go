@@ -172,7 +172,7 @@ func (p *Pool) lookup(ctx context.Context, a *account, mediaID, auth string, dev
 	classify := func(record map[string]any) (disposition, error) {
 		state, err := apiFailure(record)
 		if (state.cooldown > 0 || state.disable && !state.renew) && response.Header.Get("Retry-After") != "" {
-			state.cooldown = max(state.cooldown, retryAfter(response.Header.Get("Retry-After")))
+			state.cooldown = retryAfter(response.Header.Get("Retry-After"))
 		}
 		return state, err
 	}

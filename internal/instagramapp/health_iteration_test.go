@@ -175,15 +175,19 @@ func TestRenewalRetainsServerThrottleDeadline(t *testing.T) {
 }
 
 func TestMetadataThrottlePayloadHonorsRetryAfter(t *testing.T) {
-	for _, status := range []int{200, 400, 401, 403, 429} {
-		p := newTestPool(t, 1, 1)
-		p.accounts[0].client.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: status, Header: http.Header{"Retry-After": {"172800"}}, Body: io.NopCloser(strings.NewReader(`{"message":"Please wait before trying again","status":"fail"}`))}, nil
-		})
-		_, err := p.Detail(context.Background(), "123")
-		assertCode(t, err, "upstream_rate_limited")
-		if time.Until(p.accounts[0].cooldown) < 47*time.Hour {
-			t.Fatalf("status %d shortened Retry-After", status)
+	for _, delay := range []string{"10", "172800"} {
+		for _, status := range []int{200, 400, 401, 403, 429} {
+			p := newTestPool(t, 1, 1)
+			p.accounts[0].client.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: status, Header: http.Header{"Retry-After": {delay}}, Body: io.NopCloser(strings.NewReader(`{"message":"Please wait before trying again","status":"fail"}`))}, nil
+			})
+			_, err := p.Detail(context.Background(), "123")
+			assertCode(t, err, "upstream_rate_limited")
+			remaining := time.Until(p.accounts[0].cooldown)
+			want := retryAfter(delay)
+			if remaining < want-time.Second || remaining > want {
+				t.Errorf("status %d changed Retry-After %s: remaining %v", status, delay, remaining)
+			}
 		}
 	}
 }

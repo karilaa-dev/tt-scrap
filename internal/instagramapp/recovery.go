@@ -147,7 +147,7 @@ func recoveryDisposition(err error) disposition {
 	state := disposition{retry: true, cooldown: delay}
 	switch errorCode(err) {
 	case "session_expired", "account_mismatch", "login_rejected", "unsupported_two_factor":
-		state = disposition{retry: true, disable: true, deadReason: errorCode(err)}
+		state = disposition{retry: true, disable: true, deadReason: errorCode(err), cooldown: failureCooldown(err)}
 	case "challenge_required", "feedback_required", "account_restricted":
 		state = disposition{disable: true, deadReason: errorCode(err), cooldown: failureCooldown(err)}
 	}
