@@ -24,7 +24,7 @@ func (p *Pool) beginUpdate(ctx context.Context, a *account) (func(), error) {
 	p.updating++
 	p.notify()
 	done := func() { p.mu.Lock(); a.updating = false; p.updating--; p.notify(); p.mu.Unlock() }
-	for a.busy > 0 || p.pendingDeaths > 0 {
+	for a.busy > 0 || p.pendingHealthWrites > 0 {
 		changed := p.changed
 		p.mu.Unlock()
 		select {
@@ -64,7 +64,7 @@ func (m *AccountManager) updateExisting(ctx context.Context, saved *storedAccoun
 		return "", ctx.Err()
 	}
 	p.mu.Lock()
-	currentLogin, device, dead, auth := a.login, a.device, a.disabled, a.authorization
+	currentLogin, device, dead, auth, cooldown := a.login, a.device, a.disabled, a.authorization, a.cooldown
 	p.mu.Unlock()
 	backup := c.backup(saved.UserID)
 	backupChanged := backup != nil && (currentLogin == nil || *backup != *currentLogin)
@@ -74,15 +74,47 @@ func (m *AccountManager) updateExisting(ctx context.Context, saved *storedAccoun
 		return "duplicate", nil
 	}
 	if sessionChanged {
+		// A new session does not erase an account-level Retry-After. Do not even
+		// verify replacement credentials while the account is cooling down.
+		if cooldown.After(time.Now()) {
+			return "", loginFailure("upstream_rate_limited")
+		}
 		verifyCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 		defer cancel()
 		c.device, c.DeviceProfile = device, device.profileID()
 		session, usedCookies, err := authenticateAccount(verifyCtx, a.client, p.apiOrigin, c, m.login)
 		if err != nil {
+			// Candidate credentials may be rejected without invalidating the old
+			// session, but an observed account throttle still applies to its route.
+			if delay := failureCooldown(err); delay > 0 {
+				until := time.Now().Add(delay)
+				p.mu.Lock()
+				if until.After(a.cooldown) {
+					a.cooldown = until
+				}
+				until = a.cooldown
+				p.pendingHealthWrites++
+				p.mu.Unlock()
+				saveCtx, saveCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				persistErr := m.store.MarkCooldown(saveCtx, saved.ID, until)
+				saveCancel()
+				p.mu.Lock()
+				p.pendingHealthWrites--
+				p.notify()
+				p.mu.Unlock()
+				if persistErr != nil {
+					return "", persistErr
+				}
+				saved.CooldownUntil = until
+			}
 			return "", err
 		}
 		if session.UserID != saved.UserID {
 			return "", loginFailure("account_mismatch")
+		}
+		nextState, err := newSessionContext(session.Session, p.apiOrigin)
+		if err != nil {
+			return "", err
 		}
 		var cookies json.RawMessage
 		newAuth := session.Authorization
@@ -98,12 +130,15 @@ func (m *AccountManager) updateExisting(ctx context.Context, saved *storedAccoun
 		}
 		p.mu.Lock()
 		a.authorization, a.device = newAuth, session.Device
-		a.disabled, a.cooldown = false, time.Time{}
+		a.sessionState = nextState
+		a.sessionSaved = jsonText(nextState.Snapshot())
+		a.disabled, a.deadReason = false, ""
 		if backup != nil {
 			a.login = backup
 		}
 		p.mu.Unlock()
-		saved.Cookies, saved.Authorization, saved.Device, saved.Dead = cookies, session.Authorization, session.Device, false
+		saved.Cookies, saved.Authorization, saved.Device, saved.Dead, saved.DeadReason = cookies, session.Authorization, session.Device, false, ""
+		saved.Session = session.Session
 	} else {
 		if err = m.store.SetLogin(ctx, saved.ID, backup); err != nil {
 			return "", err
@@ -124,6 +159,10 @@ func (s *Store) ReplaceSession(ctx context.Context, id, userID string, session l
 	if err != nil {
 		return err
 	}
+	state, err := storedSessionJSON(session.Session)
+	if err != nil {
+		return err
+	}
 	var loginJSON []byte
 	if backup != nil {
 		loginJSON, err = json.Marshal(backup)
@@ -132,7 +171,7 @@ func (s *Store) ReplaceSession(ctx context.Context, id, userID string, session l
 		}
 	}
 	return s.withDB(ctx, func(ctx context.Context, db *pgx.Conn) error {
-		tag, err := db.Exec(ctx, `UPDATE `+s.accounts+` SET android_authorization=NULLIF($3,''),cookies=$4,device=$5,login_credentials=COALESCE($6::jsonb,login_credentials),dead=false,dead_reason=NULL,dead_at=NULL WHERE id=$1 AND user_id=$2`, id, userID, session.Authorization, cookies, device, loginJSON)
+		tag, err := db.Exec(ctx, `UPDATE `+s.accounts+` SET android_authorization=NULLIF($3,''),cookies=$4,device=$5,login_credentials=COALESCE($6::jsonb,login_credentials),session_state=$7,dead=false,dead_reason=NULL,dead_at=NULL WHERE id=$1 AND user_id=$2`, id, userID, session.Authorization, cookies, device, loginJSON, state)
 		if err == nil && tag.RowsAffected() != 1 {
 			return errors.New("missing Instagram account")
 		}

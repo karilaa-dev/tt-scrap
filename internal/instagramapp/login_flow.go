@@ -15,14 +15,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/karilaa-dev/tt-scrap/internal/core"
-	"golang.org/x/net/publicsuffix"
 )
 
 const caaProcess = "com.bloks.www.bloks.caa.login.process_client_data_and_redirect"
@@ -39,6 +37,7 @@ type loginSession struct {
 	keyID                                  byte
 	passwordKey                            string
 	identity                               *DeviceIdentity
+	state                                  *sessionContext
 }
 
 func jsonText(value any) string { b, _ := json.Marshal(value); return string(b) }
@@ -48,12 +47,16 @@ func signedForm(value any) url.Values {
 func newLoginSession(client *http.Client, origin, selection string) (*loginSession, error) {
 	isolated := *client
 	isolated.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	isolated.Jar, _ = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	state, e := newSessionContext(nil, origin)
+	if e != nil {
+		return nil, e
+	}
+	isolated.Jar = state
 	identity, e := newDeviceIdentity(selection)
 	if e != nil {
 		return nil, e
 	}
-	s := &loginSession{client: &isolated, origin: origin, bootstrapOrigin: origin, guid: identity.DeviceID, phone: identity.FamilyID, device: identity.AndroidID, identity: identity, waterfall: core.NewID(), pigeon: "UFS-" + core.NewID() + "-1"}
+	s := &loginSession{client: &isolated, state: state, origin: origin, bootstrapOrigin: origin, guid: identity.DeviceID, phone: identity.FamilyID, device: identity.AndroidID, identity: identity, waterfall: core.NewID(), pigeon: "UFS-" + core.NewID() + "-1"}
 	if origin == "https://i.instagram.com" {
 		s.bootstrapOrigin = "https://b.i.instagram.com"
 	}
@@ -79,6 +82,7 @@ func (s *loginSession) post(ctx context.Context, origin, path string, form url.V
 		return loginResponse{}, loginFailure("invalid_login_request")
 	}
 	req.Header = s.headers()
+	s.state.Apply(req)
 	for k, v := range extra {
 		req.Header[k] = v
 	}
@@ -90,10 +94,12 @@ func (s *loginSession) post(ctx context.Context, origin, path string, form url.V
 		return loginResponse{}, loginFailure("upstream_network_error")
 	}
 	defer res.Body.Close()
-	// Throttling must stop the import batch even if the body is a challenge,
-	// malformed, or cut off before it can be parsed.
+	s.state.Observe(req.URL, res.Header)
+	// A parsed explicit restriction freezes the account. Even if a throttle's
+	// body is malformed or cut off, retain the server's retry deadline.
+	var throttle error
 	if res.StatusCode == http.StatusTooManyRequests {
-		return loginResponse{}, loginFailure("upstream_rate_limited")
+		throttle = loginThrottle(res.Header)
 	}
 	// An upstream outage is not a rejected credential. Recovery must retain
 	// the account and cool down, including when the error body is not JSON.
@@ -102,16 +108,34 @@ func (s *loginSession) post(ctx context.Context, origin, path string, form url.V
 	}
 	raw, e := io.ReadAll(io.LimitReader(res.Body, metadataLimit+1))
 	if e != nil || len(raw) > metadataLimit {
+		if throttle != nil {
+			return loginResponse{}, throttle
+		}
+		if e != nil && ctx.Err() != nil {
+			return loginResponse{}, ctx.Err()
+		}
 		return loginResponse{}, loginFailure("invalid_login_response")
+	}
+	if throttle != nil && !json.Valid(raw) {
+		return loginResponse{}, throttle
 	}
 	if mid := res.Header.Get("ig-set-x-mid"); mid != "" {
 		s.mid = mid
 	}
 	result, e := parseLogin(res.StatusCode, res.Header, raw)
 	if e != nil {
+		if throttle != nil {
+			return result, throttle
+		}
 		return result, e
 	}
+	// CAA can return session headers inside its parsed payload.
+	s.state.Observe(req.URL, result.header)
+	s.state.SetCookies(req.URL, result.nestedCookies)
 	if e = loginCheck(result); e != nil {
+		if throttle != nil && errorCode(e) == "upstream_rate_limited" {
+			return result, throttle
+		}
 		return result, e
 	}
 	return result, nil
@@ -289,13 +313,17 @@ func login(ctx context.Context, client *http.Client, origin string, c Credential
 		s.guid, s.phone, s.device = device.DeviceID, device.FamilyID, device.AndroidID
 	}
 	if origin == "https://i.instagram.com" {
-		base, ok := client.Transport.(*http.Transport)
-		if !ok {
+		switch transport := client.Transport.(type) {
+		case *apiTransport:
+			// Keep the account's private API connections and proxy through renewal.
+			s.client.Transport = transport
+		case *http.Transport:
+			isolatedTransport := newAPITransport(transport)
+			defer isolatedTransport.CloseIdleConnections()
+			s.client.Transport = isolatedTransport
+		default:
 			return loginResult{}, loginFailure("invalid_login_transport")
 		}
-		transport := newLoginTransport(base)
-		defer transport.CloseIdleConnections()
-		s.client.Transport = transport
 	}
 	if e = s.prepare(ctx, c.Username); e != nil {
 		return loginResult{}, e
@@ -330,7 +358,7 @@ func login(ctx context.Context, client *http.Client, origin string, c Credential
 	if !validAuthorization(auth) {
 		return loginResult{}, loginFailure("login_session_not_returned")
 	}
-	// Verify with the persisted device headers and ordinary transport, without
-	// login cookies or temporary device proofs: this is the route used after restart.
-	return verifyLogin(ctx, client, origin, auth, s.identity)
+	// Retain transport and server-issued context through verification. The
+	// verification request itself never includes temporary login proofs.
+	return verifyLogin(ctx, s.client, origin, auth, s.identity)
 }

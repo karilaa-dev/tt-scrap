@@ -116,6 +116,8 @@ func testEncryptedLogin(t *testing.T, method string) {
 			w.Header().Set("ig-set-password-encryption-key-id", "23")
 			w.Header().Set("ig-set-password-encryption-pub-key", encoded)
 			w.Header().Set("ig-set-x-mid", "machine")
+			w.Header().Set("x-ig-set-www-claim", "login-claim")
+			http.SetCookie(w, &http.Cookie{Name: "login_context", Value: "fixture-cookie", Path: "/"})
 			fmt.Fprint(w, `{"status":"ok"}`)
 		case "/graphql_www":
 			if r.Header.Get("X-Meta-Usdid") == "" {
@@ -187,7 +189,7 @@ func testEncryptedLogin(t *testing.T, method string) {
 				if params.Client["code"] != totp(key, time.Now()) {
 					t.Error("incorrect authenticator code")
 				}
-				fmt.Fprint(w, `{"payload":{"login_response":"{\"status\":\"ok\"}","headers":{"ig-set-authorization":"Bearer IGT:2:fixture"}}}`)
+				fmt.Fprint(w, `{"payload":{"login_response":"{\"status\":\"ok\"}","headers":{"ig-set-authorization":"Bearer IGT:2:fixture","Set-Cookie":"nested_login=verified; Path=/"}}}`)
 			} else {
 				fmt.Fprint(w, `{"status":"ok"}`)
 			}
@@ -199,7 +201,7 @@ func testEncryptedLogin(t *testing.T, method string) {
 			if values["phone_id"] != phone || values["device_id"] != device || values["two_factor_identifier"] != "fixture-id" || values["verification_code"] != totp(key, time.Now()) {
 				t.Error("2FA payload mismatch")
 			}
-			payload := map[string]any{"login_response": `{"status":"ok","logged_in_user":{"username":"alice","pk":"123"}}`, "headers": map[string]string{"ig-set-authorization": "Bearer IGT:2:fixture"}}
+			payload := map[string]any{"login_response": `{"status":"ok","logged_in_user":{"username":"alice","pk":"123"}}`, "headers": map[string]string{"ig-set-authorization": "Bearer IGT:2:fixture", "Set-Cookie": "nested_login=verified; Path=/"}}
 			encoded, _ := json.Marshal(payload)
 			literal, _ := json.Marshal(string(encoded))
 			json.NewEncoder(w).Encode(map[string]any{"layout": map[string]any{"bloks_payload": map[string]any{"action": "(action " + string(literal) + ")"}}})
@@ -207,6 +209,14 @@ func testEncryptedLogin(t *testing.T, method string) {
 			if r.Header.Get("Authorization") != "Bearer IGT:2:fixture" {
 				t.Error("session check missing")
 			}
+			cookie, err := r.Cookie("login_context")
+			if err != nil || cookie.Value != "fixture-cookie" || r.Header.Get("X-MID") != "machine" || r.Header.Get("X-IG-WWW-Claim") != "login-claim" {
+				t.Error("session verification discarded login context")
+			}
+			if nested, err := r.Cookie("nested_login"); err != nil || nested.Value != "verified" {
+				t.Error("nested CAA cookie was discarded")
+			}
+			w.Header().Set("ig-set-ig-u-rur", "verified-rur")
 			fmt.Fprint(w, `{"status":"ok","user":{"username":"alice","pk":123}}`)
 		default:
 			t.Error("unexpected path")
@@ -225,6 +235,9 @@ func testEncryptedLogin(t *testing.T, method string) {
 	if result.Device == nil || result.Device.ProfileID != "galaxy-s23-android-14" || result.Device.AndroidID != device || result.Device.FamilyID != phone {
 		t.Fatal("login identity was not retained")
 	}
+	if result.Session == nil || result.Session.MID != "machine" || result.Session.WWWClaim != "login-claim" || result.Session.RUR != "verified-rur" || len(result.Session.Cookies) != 2 {
+		t.Fatal("verified session did not retain server context")
+	}
 }
 func TestLoginStopsAtUpstreamFailure(t *testing.T) {
 	for _, test := range []struct {
@@ -232,7 +245,7 @@ func TestLoginStopsAtUpstreamFailure(t *testing.T) {
 		status           int
 		truncated        bool
 	}{
-		{"rate_limited_challenge", `{"status":"fail","challenge_required":true}`, "upstream_rate_limited", 429, false},
+		{"rate_limited_challenge", `{"status":"fail","challenge_required":true}`, "challenge_required", 429, false},
 		{"rate_limited_nested_error", `{"payload":"invalid JSON"}`, "upstream_rate_limited", 429, false},
 		{"rate_limited_truncated", "", "upstream_rate_limited", 429, true},
 		{"bare_unauthorized", `{}`, "invalid_login_response", 401, false},
@@ -242,6 +255,7 @@ func TestLoginStopsAtUpstreamFailure(t *testing.T) {
 		{"suspended_account", `{"status":"fail","error_type":"account_suspended"}`, "account_restricted", 403, false},
 		{"forbidden_challenge", `{"challenge_required":true}`, "challenge_required", 403, false},
 		{"bad_request_challenge", `{"challenge_required":true}`, "challenge_required", 400, false},
+		{"feedback", `{"message":"feedback_required"}`, "feedback_required", 400, false},
 		{"server_error", `{"status":"fail"}`, "upstream_server_error", 500, false},
 		{"service_unavailable", `{"status":"fail"}`, "upstream_server_error", 503, false},
 		{"gateway_error_html", `<html>Bad Gateway</html>`, "upstream_server_error", 502, false},

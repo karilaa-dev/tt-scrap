@@ -17,6 +17,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,11 +42,13 @@ type Credentials struct {
 type loginResult struct {
 	Authorization, Username, UserID string
 	Device                          *DeviceIdentity
+	Session                         *SessionState
 }
 type loginResponse struct {
-	status int
-	header http.Header
-	value  map[string]any
+	status        int
+	header        http.Header
+	value         map[string]any
+	nestedCookies []*http.Cookie
 }
 
 const bloksVersion = "1dad8c6870f627b89627678d48ae07b89573dd4beb9cce4e6c7b4c56e60bf78d"
@@ -54,6 +57,39 @@ var bloksStrings = regexp.MustCompile(`"(?:\\.|[^"\\])*"`)
 
 func loginFailure(code string) error {
 	return core.NewError(code, "Instagram account login failed; check account status before retrying", 502)
+}
+
+// Keep only a parsed deadline, never the response body or headers. Wrapping the
+// public error preserves its existing safe code through errors.As.
+type loginCooldownError struct {
+	cause error
+	until time.Time
+}
+
+func (e *loginCooldownError) Error() string { return e.cause.Error() }
+func (e *loginCooldownError) Unwrap() error { return e.cause }
+
+func rateLimitFailure(delay time.Duration) error {
+	return &loginCooldownError{cause: core.NewError("upstream_rate_limited", "Instagram account is rate limited", 429), until: time.Now().Add(delay)}
+}
+
+func loginThrottle(header http.Header) error {
+	return &loginCooldownError{cause: loginFailure("upstream_rate_limited"), until: time.Now().Add(retryAfter(header.Get("Retry-After")))}
+}
+
+func restrictionDeadline(err error, status int, header http.Header) error {
+	if status == http.StatusTooManyRequests || header.Get("Retry-After") != "" {
+		return &loginCooldownError{cause: err, until: time.Now().Add(retryAfter(header.Get("Retry-After")))}
+	}
+	return err
+}
+
+func failureCooldown(err error) time.Duration {
+	var limited *loginCooldownError
+	if errors.As(err, &limited) {
+		return max(0, time.Until(limited.until))
+	}
+	return 0
 }
 
 func totpKey(input string) ([]byte, error) {
@@ -154,7 +190,7 @@ func parseLogin(status int, header http.Header, body []byte) (loginResponse, err
 	value, e := jsonObject(string(body))
 	if e != nil {
 		if status == 429 {
-			return loginResponse{}, loginFailure("upstream_rate_limited")
+			return loginResponse{}, loginThrottle(header)
 		}
 		return loginResponse{}, e
 	}
@@ -182,6 +218,7 @@ func parseLogin(status int, header http.Header, body []byte) (loginResponse, err
 		}
 	}
 	header = header.Clone()
+	var nestedCookies []*http.Cookie
 	if payload != nil {
 		nested, e := jsonObject(payload)
 		if e != nil {
@@ -195,6 +232,9 @@ func parseLogin(status int, header http.Header, body []byte) (loginResponse, err
 			for k, v := range headers {
 				if s, ok := v.(string); ok {
 					header.Set(k, s)
+					if strings.EqualFold(k, "Set-Cookie") {
+						nestedCookies = (&http.Response{Header: http.Header{"Set-Cookie": {s}}}).Cookies()
+					}
 				}
 			}
 		}
@@ -206,20 +246,20 @@ func parseLogin(status int, header http.Header, body []byte) (loginResponse, err
 			}
 		}
 	}
-	return loginResponse{status, header, value}, nil
+	return loginResponse{status: status, header: header, value: value, nestedCookies: nestedCookies}, nil
 }
 func loginCheck(r loginResponse) error {
-	text := strings.ToLower(stringField(r.value, "message") + " " + stringField(r.value, "error_type"))
-	if r.status == http.StatusTooManyRequests || strings.Contains(text, "rate_limit") || strings.Contains(text, "please wait") {
-		return loginFailure("upstream_rate_limited")
+	state, err := apiFailure(r.value)
+	// An explicit restriction is stronger evidence than incidental "please
+	// wait" text or a 429 status. Session expiry alone is not a restriction.
+	if err != nil && state.disable && !state.renew {
+		return restrictionDeadline(loginFailure(state.deadReason), r.status, r.header)
 	}
-	if state, err := apiFailure(r.value); err != nil {
-		if state.cooldown > 0 {
-			return loginFailure("upstream_rate_limited")
-		}
-		if state.disable {
-			return loginFailure(state.deadReason)
-		}
+	if r.status == http.StatusTooManyRequests || state.cooldown > 0 {
+		return loginThrottle(r.header)
+	}
+	if err != nil && state.disable {
+		return restrictionDeadline(loginFailure(state.deadReason), r.status, r.header)
 	}
 	return nil
 }
@@ -229,16 +269,33 @@ func verifyLogin(ctx context.Context, client *http.Client, origin, auth string, 
 	req.Header.Set("Authorization", auth)
 	device.headers(req.Header)
 	req.Header.Set("X-IG-App-ID", AppID)
+	state, _ := client.Jar.(*sessionContext)
+	if state != nil {
+		state.Apply(req)
+	}
 	res, e := client.Do(req)
 	if e != nil {
+		if ctx.Err() != nil {
+			return loginResult{}, ctx.Err()
+		}
 		return loginResult{}, loginFailure("session_check_failed")
 	}
 	defer res.Body.Close()
+	if state != nil {
+		state.Observe(req.URL, res.Header)
+	}
+	var throttle error
 	if res.StatusCode == http.StatusTooManyRequests {
-		return loginResult{}, loginFailure("upstream_rate_limited")
+		throttle = loginThrottle(res.Header)
 	}
 	body, e := io.ReadAll(io.LimitReader(res.Body, metadataLimit+1))
 	if e != nil || len(body) > metadataLimit {
+		if throttle != nil {
+			return loginResult{}, throttle
+		}
+		if e != nil && ctx.Err() != nil {
+			return loginResult{}, ctx.Err()
+		}
 		return loginResult{}, loginFailure("session_check_failed")
 	}
 	// Server outages cannot establish that the saved session is invalid.
@@ -246,16 +303,21 @@ func verifyLogin(ctx context.Context, client *http.Client, origin, auth string, 
 		return loginResult{}, loginFailure("session_check_failed")
 	}
 	var failure map[string]any
-	_ = json.Unmarshal(body, &failure)
-	state, failureErr := apiFailure(failure)
-	if state.cooldown > 0 {
-		return loginResult{}, loginFailure("upstream_rate_limited")
+	if json.Unmarshal(body, &failure) != nil {
+		failure = nil
 	}
-	if state.disable && !state.renew {
-		return loginResult{}, loginFailure(state.deadReason)
+	health, failureErr := apiFailure(failure)
+	if health.disable && !health.renew {
+		return loginResult{}, restrictionDeadline(loginFailure(health.deadReason), res.StatusCode, res.Header)
 	}
-	if state.renew {
-		return loginResult{}, loginFailure("session_expired")
+	if throttle != nil {
+		return loginResult{}, throttle
+	}
+	if health.cooldown > 0 {
+		return loginResult{}, loginThrottle(res.Header)
+	}
+	if health.renew {
+		return loginResult{}, restrictionDeadline(loginFailure("session_expired"), res.StatusCode, res.Header)
 	}
 	if res.StatusCode != 200 || failureErr != nil {
 		return loginResult{}, loginFailure("session_check_failed")
@@ -272,7 +334,11 @@ func verifyLogin(ctx context.Context, client *http.Client, origin, auth string, 
 	if decoder.Decode(&verified) != nil || verified.Status != "ok" || verified.User.Username == "" || verified.User.PK == "" {
 		return loginResult{}, loginFailure("session_check_failed")
 	}
-	return loginResult{Authorization: auth, Username: verified.User.Username, UserID: verified.User.PK.String(), Device: device}, nil
+	result := loginResult{Authorization: auth, Username: verified.User.Username, UserID: verified.User.PK.String(), Device: device}
+	if state != nil {
+		result.Session = state.Snapshot()
+	}
+	return result, nil
 }
 func validAuthorization(auth string) bool {
 	if !strings.HasPrefix(auth, "Bearer IGT:2:") || len(auth) <= len("Bearer IGT:2:") {

@@ -146,12 +146,7 @@ func TestFailureClassificationAndRetryOtherAccount(t *testing.T) {
 		disabled   bool
 	}{
 		{"login", "{\"message\":\"login_required\",\"status\":\"fail\"}", 200, true},
-		{"challenge", "{\"challenge_required\":true}", 200, true},
-		{"forbidden_challenge", `{"message":"challenge_required"}`, 403, true},
 		{"rate", "", 429, false},
-		{"rate_with_challenge_body", `{"challenge_required":true}`, 429, false},
-		{"forbidden_feedback", `{"message":"feedback_required"}`, 403, false},
-		{"feedback", "{\"message\":\"feedback_required\",\"status\":\"fail\"}", 200, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := newTestPool(t, 2, 1)

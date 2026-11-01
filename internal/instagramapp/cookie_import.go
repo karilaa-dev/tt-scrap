@@ -123,7 +123,22 @@ func loginCookies(ctx context.Context, client *http.Client, origin string, c Cre
 			return loginResult{}, err
 		}
 	}
-	result, err := verifyLogin(ctx, client, origin, auth, device)
+	// Cookie imports receive their own mobile API response context too. Do not
+	// inherit a currently active account's jar while verifying its replacement.
+	state, err := newSessionContext(nil, origin)
+	if err != nil {
+		return loginResult{}, err
+	}
+	isolated := *client
+	isolated.Jar = state
+	if origin == "https://i.instagram.com" {
+		if base, ok := client.Transport.(*http.Transport); ok {
+			transport := newAPITransport(base)
+			defer transport.CloseIdleConnections()
+			isolated.Transport = transport
+		}
+	}
+	result, err := verifyLogin(ctx, &isolated, origin, auth, device)
 	if err != nil {
 		return loginResult{}, err
 	}

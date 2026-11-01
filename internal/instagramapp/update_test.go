@@ -162,8 +162,17 @@ func TestCookieUpdateFailureKeepsExistingCredentials(t *testing.T) {
 				t.Fatal("rate-limited update continued batch")
 			}
 			rows, err := store.Load(context.Background())
-			if err != nil || len(rows) != 1 || !reflect.DeepEqual(rows[0], seed) {
-				t.Fatal("failed update changed saved credentials", err)
+			if err != nil || len(rows) != 1 {
+				t.Fatal("failed to read saved credentials", err)
+			}
+			if status == 429 {
+				if time.Until(rows[0].CooldownUntil) < 50*time.Second {
+					t.Fatal("replacement verification throttle was not persisted")
+				}
+				rows[0].CooldownUntil = time.Time{}
+			}
+			if !reflect.DeepEqual(rows[0], seed) {
+				t.Fatal("failed update changed saved credentials")
 			}
 			auth, _ := p.session(p.accounts[0])
 			if auth != seed.Authorization {

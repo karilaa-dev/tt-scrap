@@ -281,3 +281,42 @@ func TestImportStopsBatchOnSessionRateLimitAndSkipsBrokenProxy(t *testing.T) {
 		t.Fatal("failed login saved", e)
 	}
 }
+
+func TestImportStopsBatchOnExplicitRestriction(t *testing.T) {
+	for _, code := range []string{"challenge_required", "feedback_required", "account_restricted"} {
+		t.Run(code, func(t *testing.T) {
+			store, _ := testStore(t)
+			p, err := Open(Options{Store: store})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer p.Close()
+			manager := NewAccountManager(p, store, []string{"http://route.invalid:80"})
+			probes, logins := 0, 0
+			manager.probe = func(context.Context, *http.Client) (string, error) {
+				probes++
+				return "192.0.2.1", nil
+			}
+			manager.login = func(context.Context, *http.Client, string, Credentials) (loginResult, error) {
+				logins++
+				return loginResult{}, loginFailure(code)
+			}
+			result, err := manager.Import(context.Background(), []Credentials{{Username: "a", Password: "x"}, {Username: "b", Password: "y"}, {Username: "c", Password: "z"}})
+			if err != nil || len(result) != 3 || logins != 1 || probes != 1 || p.Count() != 0 {
+				t.Fatal("restriction did not stop import batch", err, result, logins, probes)
+			}
+			if result[0].Status != "failed" || result[0].ErrorCode != code {
+				t.Fatal("lost restriction reason", result)
+			}
+			for n, row := range result[1:] {
+				if row.Row != n+2 || row.Status != "skipped" || row.ErrorCode != "batch_verification_required" {
+					t.Fatal("unattempted row not reported", row)
+				}
+			}
+			rows, err := store.Load(context.Background())
+			if err != nil || len(rows) != 0 {
+				t.Fatal("failed import persisted an account", err)
+			}
+		})
+	}
+}

@@ -51,11 +51,13 @@ func TestLivePasswordLogin(t *testing.T) {
 	defer cancel()
 	result, e := login(ctx, client, "https://i.instagram.com", c)
 	if e != nil {
-		t.Fatal(e)
+		// Error() deliberately hides upstream details. Preserve the fixed public
+		// code here so an opt-in canary can be diagnosed without another login.
+		t.Fatalf("password login/session verification failed: code=%s", errorCode(e))
 	}
 	path = os.Getenv("TT_SCRAP_LIVE_LOGIN_OUTPUT")
 	if path != "" {
-		data, _ := json.Marshal(map[string]any{"authorization": result.Authorization, "username": result.Username, "user_id": result.UserID, "proxy_url": route.Proxy, "device": result.Device})
+		data, _ := json.Marshal(map[string]any{"authorization": result.Authorization, "username": result.Username, "user_id": result.UserID, "proxy_url": route.Proxy, "device": result.Device, "session_state": result.Session})
 		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		if err != nil {
 			t.Fatal("cannot create private session file")
@@ -66,4 +68,7 @@ func TestLivePasswordLogin(t *testing.T) {
 		}
 	}
 	t.Logf("password login and session verification succeeded with device profile %s", result.Device.profileID())
+	if result.Session != nil {
+		t.Logf("saved server context: cookies=%d mid=%t www_claim=%t rur=%t", len(result.Session.Cookies), result.Session.MID != "", result.Session.WWWClaim != "", result.Session.RUR != "")
+	}
 }
