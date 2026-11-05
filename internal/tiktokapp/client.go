@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/karilaa-dev/tt-scrap/internal/nettransport"
 )
 
 type Doer interface {
@@ -208,7 +210,7 @@ func (c *Client) requestWithAccount(ctx context.Context, original *url.URL, meth
 			doer = c.mediaTransport
 		}
 		observeRoute(ctx, media && !appHost && c.mediaTransport != nil)
-		response, e := doer.Do(req)
+		response, e := nettransport.ExchangeMedia(ctx, func() (*http.Response, error) { return doer.Do(req) })
 		if e != nil {
 			return nil, e
 		}

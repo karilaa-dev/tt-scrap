@@ -101,7 +101,12 @@ func (b *mediaBatch) open(ctx context.Context, address string, headers http.Head
 		b.mu.Lock()
 		b.recordLocked(accountingErr)
 		b.mu.Unlock()
-		return nil, publicError(err)
+		public := publicError(err)
+		var failure *tiktokapp.UpstreamError
+		if core.OperationFrom(ctx) != nil && errors.As(err, &failure) && failure.Recovery != tiktokapp.RecoveryNone {
+			public = &core.MediaRecoveryError{Err: public}
+		}
+		return nil, public
 	}
 	body := &leasedBody{ReadCloser: response.Body}
 	body.finish = func(err error) {

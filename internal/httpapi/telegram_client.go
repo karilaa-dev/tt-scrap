@@ -129,7 +129,7 @@ func (c *telegramClient) call(ctx context.Context, method string, parameters fie
 	var value any
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
-	if decoder.Decode(&value) != nil {
+	if !json.Valid(data) || decoder.Decode(&value) != nil {
 		value = string(data)
 	}
 	switch value.(type) {

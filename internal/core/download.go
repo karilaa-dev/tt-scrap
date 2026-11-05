@@ -25,3 +25,10 @@ func DiagnosticLogger(ctx context.Context) *slog.Logger {
 	}
 	return slog.Default()
 }
+
+// MediaRecoveryError returns control to the identity owner before source retries
+// consume the shared operation allowance on a session that needs repair.
+type MediaRecoveryError struct{ Err error }
+
+func (e *MediaRecoveryError) Error() string { return e.Err.Error() }
+func (e *MediaRecoveryError) Unwrap() error { return e.Err }

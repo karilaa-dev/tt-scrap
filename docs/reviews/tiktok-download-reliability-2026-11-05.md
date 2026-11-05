@@ -113,8 +113,9 @@ requiring explicit live flags were not enabled.
   or post-deployment claims are made.
 - Ten-second normal stall limits and the three-second operation cap are policy
   choices. A path that makes no observable read progress for longer is retried;
-  deployment telemetry should inform tuning. Header timeout covers the entire
-  open operation, including redirects/bootstrap, and trace phases are coarse
+  deployment telemetry should inform tuning. TikTok media opens now guard each underlying HTTP exchange before the backend
+  inspects response bytes, including redirects/bootstrap. Opaque backends without
+  the exchange hook retain the outer open guard. Trace phases remain coarse
   diagnostics rather than a full packet timeline.
 - Fifteen seconds cannot guarantee three attempts or successful large downloads.
   Queueing/extraction or a progressing transfer may consume the whole allowance.
@@ -130,3 +131,25 @@ requiring explicit live flags were not enabled.
 - MESSAGE_ID_INVALID is a bot destination issue; user deletion is context, not a
   universal diagnosis. Same-message text, counter edits, Try again UI and stopping
   edits after destination loss belong to the companion tt-bot change.
+
+## Review follow-up
+
+Repository review identified four additional cases, each reproduced by a failing
+regression before fixing it:
+
+- Telegram replies containing a valid JSON prefix followed by trailing garbage
+  or another JSON value could be classified as conclusive. The full response must
+  now be valid JSON before success/rejection accounting; malformed replies remain
+  unknown after commit.
+- An event write deadline left armed during preparation reset an HTTP/2 stream
+  after one second, even with a promptly reading client. The deadline is now cleared
+  after every successful flush. A real TLS/HTTP2 fixture verifies a longer quiet
+  interval followed by a successful terminal event.
+- TikTok's initial 512-byte body inspection happened under the outer header timer.
+  A context-scoped exchange hook now installs body idle timing immediately when
+  headers arrive, before redirects, prefix inspection or JSON classification read
+  any body. A slowly progressing prefix survives a shorter header timeout.
+- Repeating a signing/device-rejected source could spend all three attempts before
+  identity recovery. Opted-in recovery-bearing failures now return directly to the
+  identity owner, which repairs the session and owns the next retry epoch. Tests
+  cover signing refresh and device recreation using local fixture sessions only.

@@ -288,3 +288,66 @@ func TestOperationDisconnectBeforeCommitCancelsUpload(t *testing.T) {
 		t.Fatal("failed event committed an upload", w.failed, complete.Load(), d.leaked())
 	}
 }
+
+func TestOperationRejectsTrailingTelegramResponseData(t *testing.T) {
+	for _, body := range []string{`{"ok":false,"error_code":400}garbage`, `{"ok":false,"error_code":400}{"ok":true}`, `{"ok":true}garbage`} {
+		t.Run(body, func(t *testing.T) {
+			cfg := core.DefaultConfig()
+			cfg.TelegramBotToken = "fixture"
+			op := core.NewOperation(1)
+			ctx := core.WithOperation(context.Background(), op)
+			client := newTelegramClient(cfg, deliveryDoer(func(r *http.Request) (*http.Response, error) {
+				io.Copy(io.Discard, r.Body)
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+			}))
+			call, err := client.call(ctx, "sendVideo", nil, nil)
+			event := &DeliveryEvent{}
+			event.record(call)
+			event.finish(err)
+			terminal := operationTerminal(op, response{status: call.Status, data: call.Body, delivery: event}, err)
+			if terminal.SafeToRetry || terminal.DeliveryState != "unknown" {
+				t.Fatalf("malformed reply classified as conclusive: %+v", terminal)
+			}
+		})
+	}
+}
+
+func TestOperationHTTP2SurvivesGapBetweenEvents(t *testing.T) {
+	dependencies, tt, _, _ := fixture(t)
+	tt.resolve = func(ctx context.Context) error {
+		select {
+		case <-time.After(1200 * time.Millisecond):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	server := httptest.NewUnstartedServer(NewHandler(dependencies))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+	r, _ := http.NewRequest("POST", server.URL+"/v1/tiktok/resolutions", strings.NewReader(`{"url":"https://www.tiktok.com/@x/video/123"}`))
+	r.Header.Set("Authorization", "Bearer "+dependencies.Config.APIKey)
+	r.Header.Set("Accept", "application/x-ndjson")
+	r.Header.Set("X-TT-Operation-Budget-Ms", "5000")
+	response, err := server.Client().Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.ProtoMajor != 2 {
+		t.Fatal("fixture did not use HTTP/2")
+	}
+	decoder := json.NewDecoder(response.Body)
+	var initial core.AttemptProgress
+	if err := decoder.Decode(&initial); err != nil {
+		t.Fatal(err)
+	}
+	var terminal terminalEvent
+	if err := decoder.Decode(&terminal); err != nil {
+		t.Fatalf("quiet preparation reset the stream: %v", err)
+	}
+	if terminal.Type != "terminal" || terminal.Status != 200 {
+		t.Fatal(terminal)
+	}
+}

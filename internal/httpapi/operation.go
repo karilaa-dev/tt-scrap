@@ -125,6 +125,11 @@ func (h *handler) operationStream(r *http.Request, body []byte) response {
 			if err == nil {
 				err = controller.Flush()
 			}
+			if err == nil {
+				// Bound writes, not the quiet preparation interval (HTTP/2 resets
+				// streams when an armed write deadline expires even without I/O).
+				_ = controller.SetWriteDeadline(time.Time{})
+			}
 			if err != nil {
 				cancel()
 			}

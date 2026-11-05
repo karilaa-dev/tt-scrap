@@ -159,6 +159,10 @@ func (d *Downloader) download(ctx context.Context, asset core.AssetContext, maxi
 			return result, nil
 		}
 		last = e
+		var recovery *core.MediaRecoveryError
+		if errors.As(e, &recovery) {
+			return nil, e
+		}
 		var api *core.Error
 		if errors.As(e, &api) && (api.Code == "asset_too_large" || api.Code == "service_not_configured") {
 			return nil, e
@@ -555,6 +559,10 @@ func (j *rangeJob) fetch(start, end int64) error {
 			return last
 		}
 		if last = j.fetchOnce(writer, j.sources[attempt%len(j.sources)], end); last == nil || last == errChanged {
+			return last
+		}
+		var recovery *core.MediaRecoveryError
+		if errors.As(last, &recovery) {
 			return last
 		}
 		if j.ctx.Err() != nil {

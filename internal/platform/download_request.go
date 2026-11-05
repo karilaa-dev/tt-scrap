@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/karilaa-dev/tt-scrap/internal/core"
+	"github.com/karilaa-dev/tt-scrap/internal/nettransport"
 )
 
 // requestTrace records fixed phase names only. HTTP trace callbacks may run
@@ -55,7 +57,27 @@ func (d *Downloader) openTimed(ctx context.Context, asset core.AssetContext, sou
 	trace := &requestTrace{phase: "headers"}
 	ctx = httptrace.WithClientTrace(ctx, trace.hooks())
 	started := time.Now()
-	stop := stallTimer(core.OperationStallLimit(ctx, d.cfg.DownloadHeaderTimeout), cancel, trace.get)
+	headerLimit := core.OperationStallLimit(ctx, d.cfg.DownloadHeaderTimeout)
+	idleLimit := core.OperationStallLimit(ctx, d.cfg.DownloadIdleTimeout)
+	// Backends that expose exchanges switch to body timing before inspecting
+	// prefixes. Keep the outer guard for implementations without that hook.
+	stop := sync.OnceFunc(stallTimer(headerLimit, cancel, trace.get))
+	var guarded atomic.Bool
+	ctx = nettransport.WithMediaExchange(ctx, func(next func() (*http.Response, error)) (*http.Response, error) {
+		stop()
+		guarded.Store(true)
+		trace.set("headers")
+		stopHeaders := stallTimer(headerLimit, cancel, trace.get)
+		response, err := next()
+		stopHeaders()
+		if response != nil {
+			trace.set("body")
+			// Redirect bodies share this open context; closing one must not cancel
+			// the subsequent exchange. The final outer body owns cancellation.
+			response.Body = &idleBody{ReadCloser: response.Body, ctx: ctx, parent: parent, cancel: cancel, timeout: idleLimit, keepContext: true}
+		}
+		return response, err
+	})
 	res, err := d.open(ctx, asset, source, byteRange, ifRange, open)
 	stop()
 	if err != nil || ctx.Err() != nil {
@@ -71,8 +93,12 @@ func (d *Downloader) openTimed(ctx context.Context, asset core.AssetContext, sou
 		core.DiagnosticLogger(ctx).Warn("media request failed", "phase", trace.get(), "elapsed_ms", time.Since(started).Milliseconds(), "error_code", downloadErrorCode(err))
 		return nil, err
 	}
-	core.DiagnosticLogger(ctx).Debug("media headers received", "phase", "headers", "elapsed_ms", time.Since(started).Milliseconds(), "status", res.StatusCode, "ranged", byteRange != "")
-	res.Body = &idleBody{ReadCloser: res.Body, ctx: ctx, parent: parent, cancel: cancel, timeout: core.OperationStallLimit(ctx, d.cfg.DownloadIdleTimeout)}
+	core.DiagnosticLogger(ctx).Debug("media open completed", "phase", trace.get(), "elapsed_ms", time.Since(started).Milliseconds(), "status", res.StatusCode, "ranged", byteRange != "")
+	if guarded.Load() {
+		res.Body = &cancelBody{ReadCloser: res.Body, cancel: cancel}
+	} else {
+		res.Body = &idleBody{ReadCloser: res.Body, ctx: ctx, parent: parent, cancel: cancel, timeout: idleLimit}
+	}
 	return res, nil
 }
 
@@ -81,6 +107,7 @@ type idleBody struct {
 	ctx, parent context.Context
 	cancel      context.CancelCauseFunc
 	timeout     time.Duration
+	keepContext bool
 }
 
 func (b *idleBody) Read(p []byte) (int, error) {
@@ -108,7 +135,9 @@ func (b *idleBody) Close() error {
 	// Close the leased body before cancelling a successful request, so the
 	// identity batch can distinguish completed responses from abandoned ones.
 	err := b.ReadCloser.Close()
-	b.cancel(nil)
+	if !b.keepContext {
+		b.cancel(nil)
+	}
 	return err
 }
 func downloadErrorCode(err error) string {
@@ -127,3 +156,11 @@ func downloadErrorCode(err error) string {
 	}
 	return "upstream_network_error"
 }
+
+// cancelBody closes the lease first, preserving successful completion accounting.
+type cancelBody struct {
+	io.ReadCloser
+	cancel context.CancelCauseFunc
+}
+
+func (b *cancelBody) Close() error { err := b.ReadCloser.Close(); b.cancel(nil); return err }

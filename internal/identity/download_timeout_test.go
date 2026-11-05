@@ -3,6 +3,7 @@ package identity
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -126,5 +127,95 @@ func TestOperationDeadlineIncludesIdentityWait(t *testing.T) {
 	active.finish(nil)
 	if active.entry.health.Failures != 0 || active.entry.proxy.health.Failures != 0 {
 		t.Fatal("identity wait penalized route")
+	}
+}
+
+type progressingMediaPrefix struct {
+	ctx       context.Context
+	remaining int
+}
+
+func (b *progressingMediaPrefix) Read(p []byte) (int, error) {
+	if b.remaining == 0 {
+		return 0, io.EOF
+	}
+	select {
+	case <-time.After(20 * time.Millisecond):
+	case <-b.ctx.Done():
+		return 0, b.ctx.Err()
+	}
+	n := min(len(p), 128, b.remaining)
+	for i := range n {
+		p[i] = 0
+	}
+	if b.remaining == 1024 {
+		copy(p, []byte{255, 216, 255})
+	}
+	b.remaining -= n
+	return n, nil
+}
+func (b *progressingMediaPrefix) Close() error { return nil }
+
+func TestMediaPrefixInspectionUsesIdleNotHeaderTimeout(t *testing.T) {
+	cfg, _ := testDatabase(t)
+	cfg.DownloadParts = 1
+	cfg.DownloadRetries = 1
+	cfg.DownloadHeaderTimeout = 10 * time.Millisecond
+	cfg.DownloadIdleTimeout = 100 * time.Millisecond
+	p := openTestPool(t, cfg, "")
+	active := mustAcquire(t, p, "")
+	id := active.entry.id
+	active.finish(nil)
+	p.clientFactory = func(s *tiktokapp.Session, _ *http.Client) *tiktokapp.Client {
+		return tiktokapp.NewClient(s, fixtureDoer(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Header: make(http.Header), ContentLength: 1024, Body: &progressingMediaPrefix{ctx: r.Context(), remaining: 1024}}, nil
+		}))
+	}
+	d := platform.NewDownloader(cfg, p)
+	defer d.Close()
+	file, err := d.Download(context.Background(), core.AssetContext{IdentityID: id, Kind: "image", UpstreamURL: "https://cdn.example/slow-prefix"}, 0)
+	file.Cleanup()
+	if err != nil {
+		t.Fatal("progressing prefix was treated as stalled headers", err)
+	}
+}
+
+func TestOperationMediaRepairsIdentityBeforeSpendingSourceRetries(t *testing.T) {
+	for _, failure := range []string{"invalid signature", "invalid device_id"} {
+		t.Run(failure, func(t *testing.T) {
+			cfg, _ := testDatabase(t)
+			cfg.DownloadParts = 1
+			cfg.DownloadRetries = 3
+			cfg.RetryDelay = 0
+			p := openTestPool(t, cfg, "")
+			active := mustAcquire(t, p, "")
+			id := active.entry.id
+			active.finish(nil)
+			fixture := newProtocolFixture(t, "", 0)
+			plays := 0
+			p.clientFactory = func(s *tiktokapp.Session, _ *http.Client) *tiktokapp.Client {
+				return tiktokapp.NewClient(s, fixtureDoer(func(r *http.Request) (*http.Response, error) {
+					if r.URL.Path == "/aweme/v1/play/" {
+						plays++
+						if fixture.seeds < 2 {
+							return fixtureResponse(403, []byte(`{"status_code":1,"status_msg":"`+failure+`"}`)), nil
+						}
+						return fixtureResponse(200, []byte{255, 216, 255, 0}), nil
+					}
+					return fixture.do(r)
+				}))
+			}
+			op := core.NewOperation(1)
+			ctx := core.WithOperation(context.Background(), op)
+			var progress []core.AttemptProgress
+			op.Observe(ctx, func(event core.AttemptProgress) { progress = append(progress, event) })
+			d := platform.NewDownloader(cfg, p)
+			defer d.Close()
+			file, err := d.Download(ctx, core.AssetContext{IdentityID: id, Kind: "image", UpstreamURL: "https://api19-va.tiktokv.com/aweme/v1/play/"}, 0)
+			file.Cleanup()
+			if err != nil || plays != 2 || op.Attempt() != 2 || len(progress) != 2 || progress[1].Stage != "identity_recovery" {
+				t.Fatal("source retries starved identity repair", err, plays, op.Attempt(), progress)
+			}
+		})
 	}
 }
