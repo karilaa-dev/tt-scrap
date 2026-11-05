@@ -84,6 +84,9 @@ func (t *TikTok) fetchMetadata(ctx context.Context, resolved core.TikTokResoluti
 	}
 	var err error
 	for attempt := 0; attempt < max(1, t.cfg.VideoInfoMaxRetries); attempt++ {
+		if attempt > 0 && !core.AllowRetry(ctx, "extraction") {
+			break
+		}
 		var result core.AppDetail
 		result, err = t.app.Detail(ctx, resolved.SourceID)
 		if err == nil {
@@ -94,7 +97,7 @@ func (t *TikTok) fetchMetadata(ctx context.Context, resolved core.TikTokResoluti
 			}
 			err = core.Upstream("TikTok app did not return the requested post")
 		}
-		if !retryable(err) || ctx.Err() != nil {
+		if !retryable(err) || !core.RetryAvailable(ctx) {
 			break
 		}
 		if attempt+1 < max(1, t.cfg.VideoInfoMaxRetries) {

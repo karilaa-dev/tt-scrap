@@ -1,0 +1,3 @@
+{"type":"attempt","attempt":2,"max_attempts":3,"stage":"admission"}
+{"type":"attempt","attempt":3,"max_attempts":3,"stage":"media"}
+{"type":"terminal","attempt":3,"max_attempts":3,"status":504,"outcome":"failed","error_code":"upstream_timeout","delivery_state":"uncommitted","safe_to_retry":true,"result":{"error":{"code":"upstream_timeout","message":"Upstream request timed out","request_id":"fixture"}}}

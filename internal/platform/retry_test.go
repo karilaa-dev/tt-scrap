@@ -63,3 +63,42 @@ func TestMediaRetriesUseExponentialJitterAndHonorDeadline(t *testing.T) {
 		}
 	})
 }
+
+func TestOperationTotalBudgetIncludesQueueAndRetryBackoff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := testConfig()
+		cfg.DownloadConcurrency = 1
+		cfg.DownloadRetries = 10
+		cfg.RetryDelay = time.Second
+		backend := &retryBackend{}
+		d := NewDownloader(cfg, backend)
+		defer d.Close()
+		release, err := d.gate.Acquire(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		op := core.NewOperation(1)
+		ctx, cancel := context.WithTimeout(core.WithOperation(context.Background(), op), 15*time.Second)
+		defer cancel()
+		began := time.Now()
+		go func() { time.Sleep(14 * time.Second); release() }()
+		_, err = d.Download(ctx, core.AssetContext{IdentityID: "pinned", UpstreamURL: "https://cdn.example/video"}, 0)
+		if err == nil || time.Since(began) != 15*time.Second || len(backend.starts) != 1 || op.Attempt() != 1 {
+			t.Fatal("queue/backoff reset the operation", err, time.Since(began), len(backend.starts), op.Attempt())
+		}
+	})
+}
+
+func TestOperationRetryAllowanceDoesNotMultiplyAcrossDownloads(t *testing.T) {
+	cfg := testConfig()
+	cfg.DownloadRetries = 10
+	backend := &retryBackend{}
+	d := NewDownloader(cfg, backend)
+	defer d.Close()
+	op := core.NewOperation(2)
+	ctx := core.WithOperation(context.Background(), op)
+	_, err := d.Download(ctx, core.AssetContext{IdentityID: "pinned", UpstreamURL: "https://cdn.example/video", AlternateURLs: []string{"https://cdn.example/2", "https://cdn.example/3", "https://cdn.example/4"}}, 0)
+	if err == nil || len(backend.starts) != 2 || op.Attempt() != 3 {
+		t.Fatal("nested attempts multiplied", err, len(backend.starts), op.Attempt())
+	}
+}

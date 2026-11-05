@@ -27,6 +27,7 @@ type Config struct {
 	MediaMemoryFileBytes, MediaMemoryBudgetBytes                                      int64
 	DownloadParts                                                                     int
 	UpstreamTimeout, ResolveTimeout, DownloadTimeout                                  time.Duration
+	DownloadHeaderTimeout, DownloadIdleTimeout                                        time.Duration
 	VideoInfoMaxRetries, ResolveRetries, DownloadRetries                              int
 	RetryDelay                                                                        time.Duration
 	RapidAPIKey, RapidAPIHost, RapidAPIBaseURL                                        string
@@ -54,6 +55,7 @@ func DefaultConfig() Config {
 		ExtractionConcurrency: 32, DownloadConcurrency: 64, HTTPMaxConnections: 128, MaxQueuedRequests: 1024,
 		MaxVideoDuration: 0, MediaMemoryFileBytes: 250 << 20, MediaMemoryBudgetBytes: 1 << 30, DownloadParts: 4,
 		UpstreamTimeout: 180 * time.Second, ResolveTimeout: 12 * time.Second, DownloadTimeout: 60 * time.Second,
+		DownloadHeaderTimeout: 10 * time.Second, DownloadIdleTimeout: 10 * time.Second,
 		VideoInfoMaxRetries: 3, ResolveRetries: 3, DownloadRetries: 3, RetryDelay: time.Second,
 		RapidAPIHost:    "instagram-downloader-download-instagram-stories-videos4.p.rapidapi.com",
 		RapidAPIBaseURL: "https://instagram-downloader-download-instagram-stories-videos4.p.rapidapi.com",
@@ -153,6 +155,8 @@ func ParseConfig(env map[string]string) (Config, error) {
 	duration("TIKTOK_APP_TIMEOUT_SECONDS", &c.UpstreamTimeout, .001, 600)
 	duration("URL_RESOLVE_TIMEOUT_SECONDS", &c.ResolveTimeout, .001, 120)
 	duration("UPSTREAM_DOWNLOAD_TIMEOUT_SECONDS", &c.DownloadTimeout, .001, 600)
+	duration("DOWNLOAD_HEADER_TIMEOUT_SECONDS", &c.DownloadHeaderTimeout, .001, 600)
+	duration("DOWNLOAD_IDLE_TIMEOUT_SECONDS", &c.DownloadIdleTimeout, .001, 600)
 	duration("DOWNLOAD_RETRY_BASE_DELAY", &c.RetryDelay, 0, 30)
 	duration("INSTAGRAM_APP_TIMEOUT_SECONDS", &c.InstagramAppTimeout, .001, 600)
 	duration("INSTAGRAM_REQUEST_TIMEOUT_SECONDS", &c.InstagramTimeout, .001, 60)

@@ -231,6 +231,10 @@ func (p *Pool) failedLocked(e *entry, err error) {
 	}
 	h := &e.health
 	code := "upstream_network_error"
+	var stall *core.DownloadAttemptTimeout
+	if errors.As(err, &stall) {
+		code = "upstream_timeout"
+	}
 	base := time.Second
 	if isNetwork {
 		h = &e.proxy.health
@@ -252,6 +256,7 @@ func (p *Pool) failedLocked(e *entry, err error) {
 		delay = typed.RetryAfter
 	}
 	h.CooldownUntil = max(h.CooldownUntil, now.Add(delay).UnixMilli())
+	p.log.Warn("identity route cooldown", "route_id", e.proxy.id, "scope", map[bool]string{true: "route", false: "identity"}[isNetwork], "error_code", code, "failures", h.Failures, "cooldown_ms", delay.Milliseconds())
 }
 func (l *lease) recover(err error) bool {
 	var failure *tiktokapp.UpstreamError
@@ -266,6 +271,9 @@ func (l *lease) recover(err error) bool {
 			return false
 		}
 	} else if failure.Recovery != tiktokapp.RecoveryRefresh {
+		return false
+	}
+	if !core.AllowRetry(l.ctx, "identity_recovery") {
 		return false
 	}
 	p, e := l.pool, l.entry

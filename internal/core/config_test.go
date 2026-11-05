@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestTikTokSessionIDConfiguration(t *testing.T) {
@@ -114,6 +115,31 @@ func TestMediaMemoryAndParallelPartSettings(t *testing.T) {
 		env := map[string]string{"TT_SCRAP_API_KEY": "test-key-sixteen-characters", "DB_URL": "postgresql://localhost/test", key: value}
 		if _, err := ParseConfig(env); err == nil || !strings.Contains(err.Error(), key) {
 			t.Errorf("%s=%s accepted: %v", key, value, err)
+		}
+	}
+}
+
+func TestDownloadStallTimeoutConfiguration(t *testing.T) {
+	for _, key := range []string{"DOWNLOAD_HEADER_TIMEOUT_SECONDS", "DOWNLOAD_IDLE_TIMEOUT_SECONDS"} {
+		for _, value := range []string{"0", "-1", "NaN", "Inf", "601", "bad", "0.05"} {
+			env := map[string]string{"TT_SCRAP_API_KEY": "test-key-sixteen-characters", "DB_URL": "postgresql://localhost/test", key: value}
+			cfg, err := ParseConfig(env)
+			if value != "0.05" {
+				if err == nil {
+					t.Errorf("accepted %s=%s", key, value)
+				}
+				continue
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := cfg.DownloadHeaderTimeout
+			if key == "DOWNLOAD_IDLE_TIMEOUT_SECONDS" {
+				got = cfg.DownloadIdleTimeout
+			}
+			if got != 50*time.Millisecond || cfg.DownloadTimeout != 60*time.Second {
+				t.Fatal("incorrect timeout configuration")
+			}
 		}
 	}
 }
