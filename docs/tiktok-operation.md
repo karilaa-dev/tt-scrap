@@ -24,8 +24,12 @@ streaming. A stream requires a budget header. Authentication errors remain JSON.
 Use exactly `application/x-ndjson` to opt in; ordinary JSON remains available.
 
 The bot starts a monotonic deadline **before its own queue**, subtracts elapsed
-wall time before every call, and passes the remaining milliseconds (round down).
-Do not make another call when none remain. Carry the last server attempt unchanged
+time and a **one-second terminal-response reserve** before every call, and passes
+the remaining work milliseconds (round down). The server accepts up to 15000 ms;
+tt-bot sends at most 14000 ms so cleanup and a conclusive terminal response can
+finish inside its 15-second user deadline. Do not make another call when only the
+reserve remains. A late or lost terminal still cannot establish retry safety.
+Carry the last server attempt unchanged
 into the next call; moving from resolution to extraction to delivery is not a retry.
 Do not run calls concurrently using independent copies of the cursor. The server
 starts one parent deadline at request admission; nested stages cannot extend it.
