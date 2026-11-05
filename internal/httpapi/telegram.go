@@ -313,6 +313,7 @@ func (s *telegramService) startThumbnail(ctx context.Context, item deliveryItem,
 	if item.Cover == nil || document || item.Kind == "image" || s.settings.ThumbnailWait <= 0 {
 		return nil
 	}
+	ctx = core.WithoutOperationRetries(ctx)
 	ctx, cancel := context.WithTimeout(ctx, s.settings.ThumbnailWait)
 	task := &thumbnailTask{done: make(chan struct{}), cancel: cancel}
 	go func() {
@@ -740,6 +741,9 @@ func (s *telegramService) sendStreamed(ctx context.Context, item deliveryItem, p
 		// upload the prepared media.
 		event.FailedStage = "upload"
 		return s.sendSingle(ctx, final, parameters, document, event)
+	}
+	if err := core.BeforeDeliveryCommit(ctx); err != nil {
+		return deliveryResult{}, err
 	}
 	close(current.release)
 	<-current.done

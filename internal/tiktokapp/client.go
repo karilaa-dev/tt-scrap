@@ -207,6 +207,7 @@ func (c *Client) requestWithAccount(ctx context.Context, original *url.URL, meth
 		if media && !appHost && c.mediaTransport != nil {
 			doer = c.mediaTransport
 		}
+		observeRoute(ctx, media && !appHost && c.mediaTransport != nil)
 		response, e := doer.Do(req)
 		if e != nil {
 			return nil, e

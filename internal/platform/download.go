@@ -37,6 +37,12 @@ const firstPart = 1 << 20
 const minPart = 1 << 20
 
 func NewDownloader(cfg core.Config, backend core.AppBackend, instagram ...core.InstagramBackend) *Downloader {
+	if cfg.DownloadHeaderTimeout <= 0 {
+		cfg.DownloadHeaderTimeout = core.DefaultConfig().DownloadHeaderTimeout
+	}
+	if cfg.DownloadIdleTimeout <= 0 {
+		cfg.DownloadIdleTimeout = core.DefaultConfig().DownloadIdleTimeout
+	}
 	d := &Downloader{cfg: cfg, app: backend, client: &http.Client{Transport: newTransport(cfg.HTTPMaxConnections)}, gate: core.NewLimiter(cfg.DownloadConcurrency, cfg.MaxQueuedRequests), store: spool.NewStore(cfg.TempDir, cfg.MediaMemoryFileBytes, cfg.MediaMemoryBudgetBytes), buffers: sync.Pool{New: func() any { buffer := make([]byte, 128<<10); return &buffer }}, newDigest: sha256.New}
 	if len(instagram) > 0 {
 		d.instagram = instagram[0]
@@ -90,6 +96,7 @@ func (d *Downloader) Download(ctx context.Context, asset core.AssetContext, maxB
 	return d.downloadAsset(ctx, asset, maxBytes, nil, nil, true)
 }
 func (d *Downloader) downloadAsset(ctx context.Context, asset core.AssetContext, maxBytes int64, open core.OpenAppMedia, started func(*core.Downloaded), checksum bool) (*core.Downloaded, error) {
+	ctx = core.WithDiagnosticLogger(ctx, core.DiagnosticLogger(ctx).With("transfer_id", core.NewID()))
 	var cancel context.CancelFunc
 	defer func() {
 		if cancel != nil {
@@ -102,7 +109,9 @@ func (d *Downloader) downloadAsset(ctx context.Context, asset core.AssetContext,
 	var downloaded *core.Downloaded
 	transfer := func(open core.OpenAppMedia) error {
 		// Identity waits must not occupy transfer slots or the download budget.
+		queued := time.Now()
 		release, err := d.gate.Acquire(ctx)
+		core.DiagnosticLogger(ctx).Debug("media download admission", "phase", "download_queue", "elapsed_ms", time.Since(queued).Milliseconds(), "error_code", downloadErrorCode(err))
 		if err != nil {
 			return err
 		}
@@ -137,7 +146,15 @@ func (d *Downloader) download(ctx context.Context, asset core.AssetContext, maxi
 		if e := ctx.Err(); e != nil {
 			return nil, networkError(ctx, e)
 		}
-		result, e := d.downloadOnce(ctx, asset, sources[attempt%len(sources)], maximum, open, started, checksum)
+		attemptCtx := core.WithDiagnosticLogger(ctx, core.DiagnosticLogger(ctx).With("attempt", attempt+1, "source_index", attempt%len(sources)))
+		began := time.Now()
+		if attempt > 0 && !core.AllowRetry(attemptCtx, "media") {
+			return nil, last
+		}
+		result, e := d.downloadOnce(attemptCtx, asset, sources[attempt%len(sources)], maximum, open, started, checksum)
+		if e != nil {
+			core.DiagnosticLogger(attemptCtx).Warn("media attempt failed", "elapsed_ms", time.Since(began).Milliseconds(), "error_code", downloadErrorCode(e))
+		}
 		if e == nil {
 			return result, nil
 		}
@@ -146,7 +163,11 @@ func (d *Downloader) download(ctx context.Context, asset core.AssetContext, maxi
 		if errors.As(e, &api) && (api.Code == "asset_too_large" || api.Code == "service_not_configured") {
 			return nil, e
 		}
+		if !core.RetryAvailable(ctx) {
+			return nil, last
+		}
 		if attempt+1 < max(len(sources), d.cfg.DownloadRetries) {
+			core.DiagnosticLogger(attemptCtx).Info("media retry", "next_source_index", (attempt+1)%len(sources))
 			if e = sleepContext(ctx, d.retryDelay(attempt)); e != nil {
 				return nil, networkError(ctx, e)
 			}
@@ -193,7 +214,7 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 	if ranged {
 		byteRange = "bytes=0-" + strconv.Itoa(firstPart-1)
 	}
-	res, e := d.open(ctx, asset, source, byteRange, "", open)
+	res, e := d.openTimed(ctx, asset, source, byteRange, "", open)
 	if e != nil {
 		return nil, networkError(ctx, e)
 	}
@@ -212,7 +233,7 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 			// Without a strong validator, later parts could come from a different
 			// file of the same size; fetch the whole file in one response instead.
 			res.Body.Close()
-			whole, e := d.open(ctx, asset, source, "", "", open)
+			whole, e := d.openTimed(ctx, asset, source, "", "", open)
 			if e != nil {
 				return nil, networkError(ctx, e)
 			}
@@ -285,6 +306,7 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 	announce := func() error {
 		mime = detectMedia(prefix, asset.Kind)
 		if mime == "" {
+			core.DiagnosticLogger(ctx).Warn("media validation failed", "phase", "validation", "reason", "unsupported_type")
 			return core.NewError("upstream_network_error", "Upstream returned unsupported media bytes", 502)
 		}
 		if asset.Kind == "video" && mime != "video/mp4" {
@@ -370,6 +392,7 @@ func (d *Downloader) downloadOnce(ctx context.Context, asset core.AssetContext, 
 	if asset.Kind == "video" {
 		width, height, e = mediaDimensions(data)
 		if e != nil {
+			core.DiagnosticLogger(ctx).Warn("media validation failed", "phase", "validation", "reason", "invalid_mp4")
 			return nil, core.NewError("upstream_network_error", "Upstream MP4 is invalid or incomplete", 502)
 		}
 	}
@@ -520,9 +543,16 @@ func (j *rangeJob) fetch(start, end int64) error {
 	var last error
 	for attempt := 0; attempt < max(1, j.d.cfg.DownloadRetries); attempt++ {
 		if attempt > 0 {
+			if !core.RetryAvailable(j.ctx) {
+				return last
+			}
+			core.DiagnosticLogger(j.ctx).Info("media range retry", "range_attempt", attempt+1)
 			if err := sleepContext(j.ctx, j.d.retryDelay(attempt-1)); err != nil {
 				return networkError(j.ctx, err)
 			}
+		}
+		if attempt > 0 && !core.AllowRetry(j.ctx, "media_range") {
+			return last
 		}
 		if last = j.fetchOnce(writer, j.sources[attempt%len(j.sources)], end); last == nil || last == errChanged {
 			return last
@@ -536,7 +566,7 @@ func (j *rangeJob) fetch(start, end int64) error {
 
 func (j *rangeJob) fetchOnce(writer *spool.Writer, source string, end int64) error {
 	offset := writer.Offset()
-	res, err := j.d.open(j.ctx, j.asset, source, "bytes="+strconv.FormatInt(offset, 10)+"-"+strconv.FormatInt(end-1, 10), j.pinned.etag, j.open)
+	res, err := j.d.openTimed(j.ctx, j.asset, source, "bytes="+strconv.FormatInt(offset, 10)+"-"+strconv.FormatInt(end-1, 10), j.pinned.etag, j.open)
 	if err != nil {
 		return networkError(j.ctx, err)
 	}

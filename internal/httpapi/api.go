@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"slices"
@@ -60,6 +61,7 @@ type response struct {
 	cleanup   func()
 	delivery  *DeliveryEvent
 	errorCode string
+	stream    func(http.ResponseWriter) (int, *DeliveryEvent, int64, string)
 }
 
 func NewHandler(dependencies Dependencies) http.Handler {
@@ -116,6 +118,7 @@ func errorResponse(err error, id string) response {
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	id := requestID(r)
+	r = r.WithContext(core.WithDiagnosticLogger(r.Context(), slog.Default().With("request_id", id)))
 	var result response
 	var written bool
 	defer func() {
@@ -127,8 +130,30 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write(result.data)
 		}
 	}()
-	var err error
-	result, err = h.route(w, r)
+	budgetRequest, stop, err := operationRequest(r)
+	defer stop()
+	if err == nil {
+		r = budgetRequest
+		if core.OperationFrom(r.Context()) != nil {
+			deadline, _ := r.Context().Deadline()
+			controller := http.NewResponseController(w)
+			_ = controller.SetReadDeadline(deadline)
+			defer func() { _ = controller.SetReadDeadline(time.Time{}) }()
+		}
+		result, err = h.route(w, r)
+	}
+	if result.stream != nil {
+		written = true
+		for key, values := range result.headers {
+			w.Header()[key] = values
+		}
+		w.Header().Set("X-Request-ID", id)
+		status, delivery, size, code := result.stream(w)
+		if h.dependencies.OnRequest != nil {
+			h.dependencies.OnRequest(RequestEvent{RequestID: id, Method: r.Method, Path: r.URL.Path, Status: status, WireStatus: 200, Duration: time.Since(started), DurationMS: float64(time.Since(started)) / float64(time.Millisecond), Bytes: size, ErrorCode: code, Delivery: delivery})
+		}
+		return
+	}
 	if err != nil {
 		delivery := result.delivery
 		// Only the request context's cancellation is a client or shutdown
@@ -144,6 +169,12 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		result = errorResponse(err, id)
 		result.delivery = delivery
+	}
+	if op := core.OperationFrom(r.Context()); op != nil {
+		terminal := operationTerminal(op, result, err)
+		result.headers.Set("X-TT-Operation-Attempt", strconv.Itoa(terminal.Attempt))
+		result.headers.Set("X-TT-Delivery-State", terminal.DeliveryState)
+		result.headers.Set("X-TT-Safe-To-Retry", strconv.FormatBool(terminal.SafeToRetry))
 	}
 	if result.cleanup != nil {
 		defer result.cleanup()
@@ -274,6 +305,13 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) (response, error
 	scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
 	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(d.Config.APIKey)) != 1 {
 		return response{}, core.NewError("authentication_required", "A valid bearer token is required", 401)
+	}
+	if r.Header.Get("Accept") == "application/x-ndjson" && operationPath(path) {
+		if core.OperationFrom(r.Context()) == nil {
+			return response{}, invalidRequest()
+		}
+		encoded, _ := json.Marshal(body)
+		return h.operationStream(r, encoded), nil
 	}
 	if token, ok := assetToken(path); ok {
 		decoded, err := url.PathUnescape(token)

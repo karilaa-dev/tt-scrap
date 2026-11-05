@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "tt-scrap",
-    "description": "Authenticated extraction, download, and direct Telegram-delivery API for TikTok and\nInstagram.\n\n## Client integration\n\nUse the origin that served this document as the API base URL. Every `/v1/*` request\nrequires `Authorization: Bearer <TT_SCRAP_API_KEY>`. `/openapi.json`, `/docs`, and\nhealth endpoints are public. API errors use `ErrorResponse`; keep `error.request_id`\nfor diagnostics and branch on the stable `error.code` rather than message text.\nEvery response also includes `X-Request-ID` and `Server-Timing: app;dur=<milliseconds>`;\nsend a caller-generated `X-Request-ID` to correlate the response with server logs.\n\n### TikTok information and downloads\n\nCall `resolveTikTokUrl` to turn a short share URL into its full TikTok post URL and\nnumeric `source_id` without extracting metadata or downloading media. This lets a\nclient check its own database before doing any extraction work.\n\nCall `extractTikTok` with a public TikTok URL. The response contains metadata and\nopaque `AssetDescriptor.download_url` paths instead of upstream CDN URLs. Resolve a\nrelative download path against the tt-scrap base URL, send the bearer token again,\nand consume it before `expires_at`. TikTok metadata and `extraction_id` are cached\nbriefly (60 seconds by default); asset tokens normally live longer. A repeated URL\nwithin the metadata TTL reuses extraction work unless `refresh=true`.\n\nTikTok uses the Android app API. Video selection uses API metadata only: highest\npixel resolution, then frame rate, then bitrate, with no CDN quality probes.\nVideos include their audio; downloads and Telegram delivery preserve the selected\nfile without re-encoding.\n\nCall `extractInstagram` with a post or reel URL to receive ordered image/video items,\nopaque asset paths, and available cover, dimensions, duration, engagement, music and\ncaption metadata. The Android app method is the default; the server can configure\nthe previous provider as `legacy` or as fallback. `method` identifies the successful\nmethod, and `source_id` remains the shortcode. Download media[].asset.download_url\nwith the API bearer token before expires_at. Its `extraction_id` can be passed\ndirectly to `deliverInstagramToTelegram` while cached, avoiding another Instagram\nAPI request.\n\n### Direct Telegram delivery\n\nCall `deliverTikTokToTelegram` or `deliverInstagramToTelegram`; the Telegram bot token\nis configured on tt-scrap and must not be sent by the client. TikTok `source` accepts\nexactly one of `url`, a recent `extraction_id`, or `video_id`; `video_id` is valid only\nwith `delivery=\"audio\"`. Instagram `source` accepts exactly one of `url` or a recent\n`extraction_id`. `refresh=true` cannot be combined with `extraction_id`.\n\nDelivery modes:\n\n* `media`: video via `sendVideo`; one slideshow image via `sendPhoto`; multiple\n  slideshow images via one or more `sendMediaGroup` calls.\n* `document`: video via `sendDocument`; slideshow images as document media groups.\n  Original image bytes are preserved, except that WebP images are sent as full-size\n  JPEG because Telegram rejects WebP documents in media groups. Video/photo technical\n  metadata is omitted.\n* `audio`: TikTok music via `sendAudio`, with inferred title, performer, duration,\n  filename, and a converted thumbnail when available.\n\nInstagram supports `media` and `document`. A mixed carousel is sent in source order\nas photo/video media groups; document mode sends every carousel item as a document.\n\n`telegram.chat_id` is required. Other Telegram fields are optional overrides. The\nclient must not provide managed multipart fields: `video`, `audio`, `photo`,\n`document`, `media`, `thumbnail`, or `cover`. Parameter validity depends on the\nchosen media and delivery mode; unsupported combinations return\n`telegram_parameter_not_supported`. A one-image TikTok slideshow accepts a caption\non its single photo or document; multi-image TikTok slideshows do not accept caption\nfields. Instagram carousel captions are attached to the first item of the first album\nbatch.\n\nFor one Telegram API call, tt-scrap returns Telegram's JSON and HTTP status directly,\nwith X-Telegram-Method identifying the actual Telegram method.\nFor several album batches, it returns `TelegramMultiDeliveryResponse` in order. HTTP\n207 means at least one earlier batch succeeded before a later failure. Do not\nautomatically retry an ambiguous delivery timeout or an entire partial delivery,\nbecause doing so can duplicate Telegram messages.\n\n### Slideshows and images\n\nTikTok slideshows and Instagram carousels are prepared fully before the first\nTelegram call, retain their original order, and are partitioned into valid albums of\n2-10 items. Static JPEG, PNG, and WebP pass through byte-for-byte. Only HEIC/HEIF\nphotos are converted asynchronously to baseline JPEG; other unsupported formats are\nrejected before upload. Document mode preserves original image formats, except WebP, which is converted to\nfull-size JPEG. Video and\naudio covers are normalized to Telegram-compatible JPEG thumbnails when possible.",
+    "description": "Authenticated extraction, download, and direct Telegram-delivery API for TikTok and\nInstagram.\n\n## Client integration\n\nUse the origin that served this document as the API base URL. Every `/v1/*` request\nrequires `Authorization: Bearer <TT_SCRAP_API_KEY>`. `/openapi.json`, `/docs`, and\nhealth endpoints are public. API errors use `ErrorResponse`; keep `error.request_id`\nfor diagnostics and branch on the stable `error.code` rather than message text.\nEvery response also includes `X-Request-ID` and `Server-Timing: app;dur=<milliseconds>`;\nsend a caller-generated `X-Request-ID` to correlate the response with server logs.\n\n### TikTok information and downloads\n\nCall `resolveTikTokUrl` to turn a short share URL into its full TikTok post URL and\nnumeric `source_id` without extracting metadata or downloading media. This lets a\nclient check its own database before doing any extraction work.\n\nCall `extractTikTok` with a public TikTok URL. The response contains metadata and\nopaque `AssetDescriptor.download_url` paths instead of upstream CDN URLs. Resolve a\nrelative download path against the tt-scrap base URL, send the bearer token again,\nand consume it before `expires_at`. TikTok metadata and `extraction_id` are cached\nbriefly (60 seconds by default); asset tokens normally live longer. A repeated URL\nwithin the metadata TTL reuses extraction work unless `refresh=true`.\n\nTikTok uses the Android app API. Video selection uses API metadata only: highest\npixel resolution, then frame rate, then bitrate, with no CDN quality probes.\nVideos include their audio; downloads and Telegram delivery preserve the selected\nfile without re-encoding.\n\nCall `extractInstagram` with a post or reel URL to receive ordered image/video items,\nopaque asset paths, and available cover, dimensions, duration, engagement, music and\ncaption metadata. The Android app method is the default; the server can configure\nthe previous provider as `legacy` or as fallback. `method` identifies the successful\nmethod, and `source_id` remains the shortcode. Download media[].asset.download_url\nwith the API bearer token before expires_at. Its `extraction_id` can be passed\ndirectly to `deliverInstagramToTelegram` while cached, avoiding another Instagram\nAPI request.\n\n### Direct Telegram delivery\n\nCall `deliverTikTokToTelegram` or `deliverInstagramToTelegram`; the Telegram bot token\nis configured on tt-scrap and must not be sent by the client. TikTok `source` accepts\nexactly one of `url`, a recent `extraction_id`, or `video_id`; `video_id` is valid only\nwith `delivery=\"audio\"`. Instagram `source` accepts exactly one of `url` or a recent\n`extraction_id`. `refresh=true` cannot be combined with `extraction_id`.\n\nDelivery modes:\n\n* `media`: video via `sendVideo`; one slideshow image via `sendPhoto`; multiple\n  slideshow images via one or more `sendMediaGroup` calls.\n* `document`: video via `sendDocument`; slideshow images as document media groups.\n  Original image bytes are preserved, except that WebP images are sent as full-size\n  JPEG because Telegram rejects WebP documents in media groups. Video/photo technical\n  metadata is omitted.\n* `audio`: TikTok music via `sendAudio`, with inferred title, performer, duration,\n  filename, and a converted thumbnail when available.\n\nInstagram supports `media` and `document`. A mixed carousel is sent in source order\nas photo/video media groups; document mode sends every carousel item as a document.\n\n`telegram.chat_id` is required. Other Telegram fields are optional overrides. The\nclient must not provide managed multipart fields: `video`, `audio`, `photo`,\n`document`, `media`, `thumbnail`, or `cover`. Parameter validity depends on the\nchosen media and delivery mode; unsupported combinations return\n`telegram_parameter_not_supported`. A one-image TikTok slideshow accepts a caption\non its single photo or document; multi-image TikTok slideshows do not accept caption\nfields. Instagram carousel captions are attached to the first item of the first album\nbatch.\n\nFor one Telegram API call, tt-scrap returns Telegram's JSON and HTTP status directly,\nwith X-Telegram-Method identifying the actual Telegram method.\nFor several album batches, it returns `TelegramMultiDeliveryResponse` in order. HTTP\n207 means at least one earlier batch succeeded before a later failure. Do not\nautomatically retry an ambiguous delivery timeout or an entire partial delivery,\nbecause doing so can duplicate Telegram messages.\n\n### Slideshows and images\n\nTikTok slideshows and Instagram carousels are prepared fully before the first\nTelegram call, retain their original order, and are partitioned into valid albums of\n2-10 items. Static JPEG, PNG, and WebP pass through byte-for-byte. Only HEIC/HEIF\nphotos are converted asynchronously to baseline JPEG; other unsupported formats are\nrejected before upload. Document mode preserves original image formats, except WebP, which is converted to\nfull-size JPEG. Video and\naudio covers are normalized to Telegram-compatible JPEG thumbnails when possible.\n\n### Shared TikTok operation budget and progress\n\nOpt in with X-TT-Operation-Budget-Ms (1..15000 remaining milliseconds) and X-TT-Operation-Attempt (1..3 continued cursor). The bot owns one monotonic 15-second total deadline across calls. Accept: application/x-ndjson streams ordered real preparation retry events and one terminal outcome. The backend owns the shared retry allowance; do not multiply client and backend retries. Ordinary JSON bodies are unchanged. Missing terminal results on invoked deliveries are always ambiguous and must not be blindly retried. See docs/tiktok-operation.md for the full contract.",
     "version": "1.3.5"
   },
   "paths": {
@@ -86,6 +86,41 @@
                 "schema": {
                   "$ref": "#/components/schemas/TikTokResolutionResponse"
                 }
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string",
+                  "description": "One JSON event per line. HTTP 200 is transport status; terminal.status is authoritative. See operation protocol for event schemas and ambiguity rules."
+                }
+              }
+            },
+            "headers": {
+              "X-TT-Operation-Attempt": {
+                "description": "Final cursor for opted-in JSON calls.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 3
+                }
+              },
+              "X-TT-Delivery-State": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "not_started",
+                    "uncommitted",
+                    "unknown",
+                    "confirmed",
+                    "rejected",
+                    "partial"
+                  ]
+                }
+              },
+              "X-TT-Safe-To-Retry": {
+                "description": "Duplicate safety only. Missing delivery outcome is unknown.",
+                "schema": {
+                  "type": "boolean"
+                }
               }
             }
           },
@@ -123,6 +158,40 @@
         "security": [
           {
             "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "X-TT-Operation-Budget-Ms",
+            "in": "header",
+            "required": false,
+            "description": "Remaining shared operation budget, including queues and retries; do not reset between calls.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 15000
+            }
+          },
+          {
+            "name": "X-TT-Operation-Attempt",
+            "in": "header",
+            "required": false,
+            "description": "Continue the final attempt from the previous call, without incrementing for a new stage. Requires budget header.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3,
+              "default": 1
+            }
+          },
+          {
+            "name": "Accept",
+            "in": "header",
+            "required": false,
+            "description": "Use application/x-ndjson with an operation budget for real attempt progress; otherwise existing JSON.",
+            "schema": {
+              "type": "string"
+            }
           }
         ]
       }
@@ -153,6 +222,41 @@
                 "schema": {
                   "$ref": "#/components/schemas/TikTokExtractionResponse"
                 }
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string",
+                  "description": "One JSON event per line. HTTP 200 is transport status; terminal.status is authoritative. See operation protocol for event schemas and ambiguity rules."
+                }
+              }
+            },
+            "headers": {
+              "X-TT-Operation-Attempt": {
+                "description": "Final cursor for opted-in JSON calls.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 3
+                }
+              },
+              "X-TT-Delivery-State": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "not_started",
+                    "uncommitted",
+                    "unknown",
+                    "confirmed",
+                    "rejected",
+                    "partial"
+                  ]
+                }
+              },
+              "X-TT-Safe-To-Retry": {
+                "description": "Duplicate safety only. Missing delivery outcome is unknown.",
+                "schema": {
+                  "type": "boolean"
+                }
               }
             }
           },
@@ -190,6 +294,40 @@
         "security": [
           {
             "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "X-TT-Operation-Budget-Ms",
+            "in": "header",
+            "required": false,
+            "description": "Remaining shared operation budget, including queues and retries; do not reset between calls.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 15000
+            }
+          },
+          {
+            "name": "X-TT-Operation-Attempt",
+            "in": "header",
+            "required": false,
+            "description": "Continue the final attempt from the previous call, without incrementing for a new stage. Requires budget header.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3,
+              "default": 1
+            }
+          },
+          {
+            "name": "Accept",
+            "in": "header",
+            "required": false,
+            "description": "Use application/x-ndjson with an operation budget for real attempt progress; otherwise existing JSON.",
+            "schema": {
+              "type": "string"
+            }
           }
         ]
       }
@@ -220,6 +358,41 @@
                 "schema": {
                   "$ref": "#/components/schemas/TikTokMusicResponse"
                 }
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string",
+                  "description": "One JSON event per line. HTTP 200 is transport status; terminal.status is authoritative. See operation protocol for event schemas and ambiguity rules."
+                }
+              }
+            },
+            "headers": {
+              "X-TT-Operation-Attempt": {
+                "description": "Final cursor for opted-in JSON calls.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 3
+                }
+              },
+              "X-TT-Delivery-State": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "not_started",
+                    "uncommitted",
+                    "unknown",
+                    "confirmed",
+                    "rejected",
+                    "partial"
+                  ]
+                }
+              },
+              "X-TT-Safe-To-Retry": {
+                "description": "Duplicate safety only. Missing delivery outcome is unknown.",
+                "schema": {
+                  "type": "boolean"
+                }
               }
             }
           },
@@ -257,6 +430,40 @@
         "security": [
           {
             "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "X-TT-Operation-Budget-Ms",
+            "in": "header",
+            "required": false,
+            "description": "Remaining shared operation budget, including queues and retries; do not reset between calls.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 15000
+            }
+          },
+          {
+            "name": "X-TT-Operation-Attempt",
+            "in": "header",
+            "required": false,
+            "description": "Continue the final attempt from the previous call, without incrementing for a new stage. Requires budget header.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3,
+              "default": 1
+            }
+          },
+          {
+            "name": "Accept",
+            "in": "header",
+            "required": false,
+            "description": "Use application/x-ndjson with an operation budget for real attempt progress; otherwise existing JSON.",
+            "schema": {
+              "type": "string"
+            }
           }
         ]
       }
@@ -294,6 +501,42 @@
                     }
                   ],
                   "title": "Response Delivertiktoktotelegram"
+                }
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string",
+                  "description": "One JSON event per line. HTTP 200 is transport status; terminal.status is authoritative. See operation protocol for event schemas and ambiguity rules."
+                },
+                "example": "{\"type\":\"attempt\",\"attempt\":1,\"max_attempts\":3,\"stage\":\"admission\"}\n{\"type\":\"attempt\",\"attempt\":2,\"max_attempts\":3,\"stage\":\"media\"}\n{\"type\":\"delivery_commit\",\"attempt\":2,\"max_attempts\":3,\"stage\":\"upload\"}\n{\"type\":\"terminal\",\"attempt\":2,\"max_attempts\":3,\"status\":200,\"outcome\":\"succeeded\",\"error_code\":\"\",\"delivery_state\":\"confirmed\",\"safe_to_retry\":false,\"result\":{\"ok\":true,\"result\":{\"message_id\":1,\"date\":1700000000,\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\",\"title\":\"Local fixture\"},\"video\":{\"file_id\":\"fixture-video-file-id\",\"file_unique_id\":\"fixture-video-unique-id\",\"width\":32,\"height\":24,\"duration\":1,\"mime_type\":\"video/mp4\",\"file_size\":131072}}}}\n"
+              }
+            },
+            "headers": {
+              "X-TT-Operation-Attempt": {
+                "description": "Final cursor for opted-in JSON calls.",
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 3
+                }
+              },
+              "X-TT-Delivery-State": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "not_started",
+                    "uncommitted",
+                    "unknown",
+                    "confirmed",
+                    "rejected",
+                    "partial"
+                  ]
+                }
+              },
+              "X-TT-Safe-To-Retry": {
+                "description": "Duplicate safety only. Missing delivery outcome is unknown.",
+                "schema": {
+                  "type": "boolean"
                 }
               }
             }
@@ -350,6 +593,40 @@
         "security": [
           {
             "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "X-TT-Operation-Budget-Ms",
+            "in": "header",
+            "required": false,
+            "description": "Remaining shared operation budget, including queues and retries; do not reset between calls.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 15000
+            }
+          },
+          {
+            "name": "X-TT-Operation-Attempt",
+            "in": "header",
+            "required": false,
+            "description": "Continue the final attempt from the previous call, without incrementing for a new stage. Requires budget header.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3,
+              "default": 1
+            }
+          },
+          {
+            "name": "Accept",
+            "in": "header",
+            "required": false,
+            "description": "Use application/x-ndjson with an operation budget for real attempt progress; otherwise existing JSON.",
+            "schema": {
+              "type": "string"
+            }
           }
         ]
       }

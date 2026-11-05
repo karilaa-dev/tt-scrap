@@ -96,6 +96,11 @@ func TestMultipartWithholdsFinal64KiBUntilReleased(t *testing.T) {
 }
 
 func TestStreamedVideoRecoveryKeepsTimelyThumbnail(t *testing.T) {
+	for _, stalled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stalled=%t", stalled), func(t *testing.T) { testStreamedVideoRecovery(t, stalled) })
+	}
+}
+func testStreamedVideoRecovery(t *testing.T, stalled bool) {
 	valid, invalid := streamVideo(128<<10, true), streamVideo(128<<10, false)
 	cover := jpegFixture(t)
 	uploading := make(chan struct{})
@@ -114,6 +119,10 @@ func TestStreamedVideoRecoveryKeepsTimelyThumbnail(t *testing.T) {
 			select {
 			case <-uploading:
 			case <-r.Context().Done():
+				return
+			}
+			if stalled {
+				<-r.Context().Done()
 				return
 			}
 			_, _ = w.Write(invalid[32<<10:])
@@ -172,6 +181,11 @@ func TestStreamedVideoRecoveryKeepsTimelyThumbnail(t *testing.T) {
 	cfg.ThumbnailWait = core.DefaultConfig().ThumbnailWait
 	cfg.DownloadRetries, cfg.RetryDelay, cfg.TelegramUploadConcurrency = 1, 0, 1
 	cfg.TempDir = t.TempDir()
+	if stalled {
+		cfg.DownloadIdleTimeout = time.Second
+		cfg.DownloadHeaderTimeout = time.Second
+		cfg.DownloadTimeout = 4 * time.Second
+	}
 	downloader := platform.NewDownloader(cfg, nil)
 	defer downloader.Close()
 	dependencies.Config, dependencies.Downloader = cfg, downloader
@@ -370,5 +384,36 @@ func TestVideoDimensionsComeFromDownloadedMedia(t *testing.T) {
 				t.Fatalf("status=%d dimensions=%v: %s", response.Code, got, response.Body.String())
 			}
 		})
+	}
+}
+
+func TestStreamedAmbiguousTelegramOutcomeIsNotRetried(t *testing.T) {
+	data := streamVideo(128<<10, true)
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+		w.Write(data)
+	}))
+	defer cdn.Close()
+	dependencies, tt, _, assets := fixture(t)
+	cfg := dependencies.Config
+	cfg.TelegramBotToken = "fixture"
+	cfg.DownloadParts = 1
+	cfg.DownloadRetries = 3
+	d := platform.NewDownloader(cfg, nil)
+	defer d.Close()
+	dependencies.Config, dependencies.Downloader = cfg, d
+	var calls atomic.Int32
+	dependencies.HTTPClient = deliveryDoer(func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		// The entire multipart body reached Telegram, but the response was lost.
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			t.Error(err)
+		}
+		return nil, io.ErrUnexpectedEOF
+	})
+	tt.extraction.Media = []core.AssetDescriptor{assets.Register(core.AssetContext{Kind: "video", Filename: "video.mp4", UpstreamURL: cdn.URL}, 0)}
+	response := request(NewHandler(dependencies), "POST", "/v1/tiktok/telegram-deliveries", `{"source":{"extraction_id":"saved"},"telegram":{"chat_id":1}}`, true)
+	if response.Code != 502 || calls.Load() != 1 || d.MemoryInUse() != 0 {
+		t.Fatalf("status=%d calls=%d retained=%d", response.Code, calls.Load(), d.MemoryInUse())
 	}
 }

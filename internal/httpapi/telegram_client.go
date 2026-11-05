@@ -92,6 +92,16 @@ func (c *telegramClient) call(ctx context.Context, method string, parameters fie
 	}
 	request.Header.Set("Content-Type", contentType)
 	request.ContentLength = length
+	held := false
+	for _, item := range uploads {
+		held = held || item.hold != nil
+	}
+	if !held {
+		if err := core.BeforeDeliveryCommit(ctx); err != nil {
+			return telegramCall{}, err
+		}
+	}
+	core.MarkDeliveryStarted(ctx)
 	response, err := c.client.Do(request)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -133,6 +143,17 @@ func (c *telegramClient) call(ctx context.Context, method string, parameters fie
 	resultType := response.Header.Get("Content-Type")
 	if resultType == "" {
 		resultType = "application/json"
+	}
+	if response.StatusCode >= 200 && response.StatusCode < 300 && ok {
+		core.MarkDeliveryConfirmed(ctx)
+	} else if object, valid := value.(map[string]any); valid {
+		// A malformed reply or upstream 5xx cannot prove the send was rejected.
+		rejected, present := object["ok"].(bool)
+		code, number := object["error_code"].(json.Number)
+		n, _ := code.Int64()
+		if present && !rejected && number && n >= 400 && n < 500 && response.StatusCode < 500 {
+			core.MarkDeliveryRejected(ctx)
+		}
 	}
 	return telegramCall{Method: method, Status: response.StatusCode, Body: data, ContentType: resultType, Value: value, OK: response.StatusCode >= 200 && response.StatusCode < 300 && ok}, nil
 }

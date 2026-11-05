@@ -88,6 +88,9 @@ func (t *TikTok) resolve(ctx context.Context, raw string, refresh bool) (core.Ti
 		defer release()
 		var last error
 		for attempt := 0; attempt < max(1, t.cfg.ResolveRetries); attempt++ {
+			if attempt > 0 && !core.AllowRetry(ctx, "resolution") {
+				break
+			}
 			var resolved string
 			resolved, last = t.followShareLink(ctx, raw)
 			if last == nil {
