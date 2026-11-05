@@ -81,6 +81,7 @@ func (b *mediaBatch) open(ctx context.Context, address string, headers http.Head
 	b.requests.Add(1)
 	b.mu.Unlock()
 	defer b.requests.Done()
+	optional := core.OperationRetriesDisabled(ctx)
 	requestCtx, cancel := context.WithCancel(ctx)
 	unlink := context.AfterFunc(b.ctx, cancel)
 
@@ -98,9 +99,11 @@ func (b *mediaBatch) open(ctx context.Context, address string, headers http.Head
 		accountingErr := b.attemptError(requestCtx, err, direct.Load())
 		unlink()
 		cancel()
-		b.mu.Lock()
-		b.recordLocked(accountingErr)
-		b.mu.Unlock()
+		if !optional {
+			b.mu.Lock()
+			b.recordLocked(accountingErr)
+			b.mu.Unlock()
+		}
 		public := publicError(err)
 		var failure *tiktokapp.UpstreamError
 		if core.OperationFrom(ctx) != nil && errors.As(err, &failure) && failure.Recovery != tiktokapp.RecoveryNone {
@@ -115,11 +118,15 @@ func (b *mediaBatch) open(ctx context.Context, address string, headers http.Head
 		unlink()
 		cancel()
 		b.mu.Lock()
-		if completed {
-			b.completed++
-		}
 		delete(b.bodies, body)
-		b.recordLocked(err)
+		// Optional thumbnails still share body cleanup and cookies, but cannot
+		// trigger whole-preparation recovery or mask a required media failure.
+		if !optional {
+			if completed {
+				b.completed++
+			}
+			b.recordLocked(err)
+		}
 		b.mu.Unlock()
 	}
 	b.mu.Lock()

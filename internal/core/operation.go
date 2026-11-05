@@ -36,6 +36,15 @@ func OperationFrom(ctx context.Context) *Operation {
 func WithoutOperationRetries(ctx context.Context) context.Context {
 	return context.WithValue(ctx, noRetryKey{}, true)
 }
+
+// OperationRetriesDisabled marks optional work whose failures must not consume
+// an operation attempt, including through a surrounding identity lease.
+// Legacy requests without an operation retain their existing recovery policy.
+func OperationRetriesDisabled(ctx context.Context) bool {
+	disabled, _ := ctx.Value(noRetryKey{}).(bool)
+	return disabled && OperationFrom(ctx) != nil
+}
+
 func (o *Operation) Observe(ctx context.Context, observe func(AttemptProgress)) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
