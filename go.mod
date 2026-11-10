@@ -9,7 +9,7 @@ require (
 	github.com/refraction-networking/utls v1.8.3-0.20261006222701-ff1b50fbbe9a
 	golang.org/x/image v0.47.0
 	golang.org/x/net v0.61.0
-	golang.org/x/sync v0.24.0
+	golang.org/x/sync v0.25.0
 )
 
 require (
