@@ -4,7 +4,7 @@ go 1.27.3
 
 require (
 	github.com/emmansun/gmsm v0.45.0
-	github.com/jackc/pgx/v5 v5.11.0
+	github.com/jackc/pgx/v5 v5.12.0
 	github.com/joho/godotenv v1.5.1
 	github.com/refraction-networking/utls v1.8.3-0.20261006222701-ff1b50fbbe9a
 	golang.org/x/image v0.47.0
